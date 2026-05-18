@@ -38,7 +38,9 @@ parallel without coordinating with each other.
 
 ## Project status
 
-**v0.1 in active development.** 174 tests pass; `cargo bench --bench main`
+**v0.1 in active development.** 176 tests pass (incl. property-based +
+crash-and-replay) and CI is green on ubuntu + macOS;
+`cargo bench --bench main`
 runs a side-by-side comparison with RocksDB (memory + persistent
 variants, both showing artisan **~3.5–5× faster** on small-metadata
 workloads — see [benches/README.md](benches/README.md)).
