@@ -99,7 +99,9 @@ pub fn longest_common_prefix(a: &[u8], b: &[u8]) -> usize {
 
 #[cfg(target_arch = "x86_64")]
 mod x86 {
-    use std::arch::x86_64::*;
+    use std::arch::x86_64::{
+        __m128i, _mm_cmpeq_epi8, _mm_loadu_si128, _mm_movemask_epi8, _mm_set1_epi8,
+    };
 
     /// Compare 16 bytes from `a` against 16 from `b`. Returns a
     /// 16-bit bitmask: bit `i` = 1 iff `a[i] == b[i]`. Caller
