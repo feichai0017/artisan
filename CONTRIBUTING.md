@@ -24,8 +24,9 @@ Persistent-backend tests rely on `O_DIRECT` (Linux) / `F_NOCACHE`
 (macOS); both work out of the box under the `tempfile` crate that
 the integration tests use.
 
-**Minimum supported Rust version: 1.79.** Bump it consciously — the
-`msrv` CI job will fail otherwise.
+**Minimum supported Rust version: 1.82.** Bump it consciously — the
+`msrv` CI job (which builds the library only — dev-dependencies
+routinely require a newer toolchain) will fail otherwise.
 
 ## Examples
 

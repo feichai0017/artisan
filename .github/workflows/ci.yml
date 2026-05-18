@@ -8,8 +8,6 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  # The `rocksdb` dev-dep pulls a C++ build that takes long enough
-  # to make caching worth it across the matrix runs.
   CARGO_INCREMENTAL: "0"
 
 jobs:
@@ -26,6 +24,19 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@v4
+
+      # `rocksdb` is a dev-dependency (criterion bench harness pulls
+      # it in for the apples-to-apples comparison). Its C++ build
+      # needs libclang + LLVM headers.
+      - name: Install LLVM (Ubuntu)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y clang libclang-dev
+
+      - name: Install LLVM (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install llvm
+          echo "LIBCLANG_PATH=$(brew --prefix llvm)/lib" >> "$GITHUB_ENV"
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -65,6 +76,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Install LLVM
+        run: sudo apt-get update && sudo apt-get install -y clang libclang-dev
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -90,6 +104,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      - name: Install LLVM
+        run: sudo apt-get update && sudo apt-get install -y clang libclang-dev
+
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
@@ -100,17 +118,18 @@ jobs:
 
   # --------------------------------------------------------------
   # MSRV — pin to the rust-version field in Cargo.toml. Keeps us
-  # honest about the floor we promise downstream users.
+  # honest about the floor we promise downstream users. We build
+  # the library only (no tests/benches/examples) because
+  # dev-dependencies routinely require newer Rust than the
+  # library surface itself does.
   # --------------------------------------------------------------
   msrv:
-    name: msrv (rust 1.79)
+    name: msrv (rust 1.82)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.79
+      - uses: dtolnay/rust-toolchain@1.82
       - uses: Swatinem/rust-cache@v2
 
-      - name: cargo build (msrv)
-        # Test code uses the latest stable's diagnostic features;
-        # build alone is the contract for MSRV.
-        run: cargo build --workspace --all-targets --locked
+      - name: cargo build (library only)
+        run: cargo build --lib --locked

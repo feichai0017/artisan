@@ -240,7 +240,9 @@ Required for the v0.1 tag:
 - [ ] Windows tier-1 (persistent backend currently Unix-only;
       `Tree::open` returns `NotYetImplemented` on Windows for the
       persistent path)
-- [x] **MSRV policy** — Rust 1.79, gated by the `msrv` CI job
+- [x] **MSRV policy** — Rust 1.82, gated by the `msrv` CI job
+      (library-only build; dev-dependencies routinely require a
+      newer toolchain than the library surface itself does)
 - [ ] Versioning policy (semver from v0.1.0 onwards)
 - [x] **CHANGELOG.md** (this release)
 - [x] **CONTRIBUTING.md** (build / test / commit-style guide)
