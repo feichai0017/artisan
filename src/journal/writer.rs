@@ -5,18 +5,23 @@
 //! 1. [`WalWriter::create`] for a fresh file or
 //!    [`WalWriter::open_existing`] to resume an existing one.
 //! 2. [`WalWriter::append`] for each `TxnOp` — bytes land in an
-//!    in-memory buffer and are not durable yet.
-//! 3. [`WalWriter::flush`] writes the buffered bytes through to
-//!    the OS and runs `sync_data` so the records are durable past
-//!    a power failure.
+//!    in-memory buffer. When the buffer crosses
+//!    [`AUTO_FLUSH_THRESHOLD`] (64 KB), `append` transparently
+//!    drains it to the OS via `write_all` (no `sync_data`). This
+//!    is group-commit: the WAL bytes reach the OS page cache in
+//!    big batches without the user-space buffer growing
+//!    unboundedly, but the per-record cost is still just an
+//!    in-memory copy.
+//! 3. [`WalWriter::flush`] drains whatever is still pending and
+//!    runs `sync_data` so every record so far is durable past a
+//!    power failure. This is the **durability boundary**.
 //! 4. Drop is a no-op — callers are responsible for the final
 //!    `flush` (the WAL semantic is "what's flushed is durable;
-//!    what's not is not").
+//!    what's been auto-drained to page cache survives a process
+//!    crash but not a power loss until you `flush`").
 //!
-//! `Tree::checkpoint` will eventually call
-//! [`WalWriter::truncate`] (Stage 5c) to trim records past the
-//! last durable blob commit. v0.1 starts the file fresh and grows
-//! it forever; the bound is the host filesystem.
+//! `Tree::checkpoint` calls [`WalWriter::truncate`] to trim
+//! records past the last durable blob commit.
 
 use std::fs::{File, OpenOptions};
 use std::io::Write;
@@ -28,6 +33,16 @@ use super::codec::{
     decode_file_header, encode_file_header, encode_record, FileHeader, FILE_HEADER_SIZE,
 };
 use super::txn_op::TxnOp;
+
+/// Append's in-memory buffer is auto-drained to the OS page
+/// cache once it crosses this many bytes. Drops user-space
+/// buffering pressure without forcing a `sync_data` per record.
+///
+/// 64 KB is a coarse pick: large enough that the per-record
+/// syscall overhead is amortised across hundreds of records,
+/// small enough that the worst-case in-flight loss on a crash
+/// is bounded.
+pub const AUTO_FLUSH_THRESHOLD: usize = 64 * 1024;
 
 /// Append-only WAL writer with explicit `flush`-for-durability.
 #[derive(Debug)]
@@ -127,39 +142,53 @@ impl WalWriter {
         self.bytes_written + self.pending.len() as u64
     }
 
-    /// Stage a single `TxnOp` for the next flush. The record is
-    /// encoded into the pending buffer in memory — no I/O.
+    /// Stage a single `TxnOp` for the next flush.
+    ///
+    /// The record is encoded into the pending buffer in memory.
+    /// If the buffer crosses [`AUTO_FLUSH_THRESHOLD`] the writer
+    /// transparently drains it to the OS via `write_all` (no
+    /// `sync_data`) — bounded user-space buffering, but per-op
+    /// cost stays at an in-memory copy.
     pub fn append(&mut self, op: &TxnOp, seq: u64) -> Result<()> {
-        let before = self.pending.len();
         encode_record(op, seq, &mut self.pending)?;
-        // The encoder grew the buffer by RECORD_OVERHEAD + body.
-        // (No-op if `before` is what we expect; the assert keeps
-        // the bytes-written counter honest under panics.)
-        debug_assert!(self.pending.len() >= before);
+        if self.pending.len() >= AUTO_FLUSH_THRESHOLD {
+            self.drain_to_os()?;
+        }
         Ok(())
     }
 
-    /// Write every staged record to the OS and `sync_data` so the
-    /// records persist across a power loss.
+    /// Drain pending bytes to the OS without forcing a sync.
+    /// After this call the bytes are in the page cache; survive
+    /// a process crash but not a power loss until `sync_data`
+    /// (i.e. `flush`) runs.
+    fn drain_to_os(&mut self) -> Result<()> {
+        if self.pending.is_empty() {
+            return Ok(());
+        }
+        self.file.write_all(&self.pending)?;
+        self.bytes_written += self.pending.len() as u64;
+        self.pending.clear();
+        Ok(())
+    }
+
+    /// Drain pending bytes to the OS and `sync_data` so every
+    /// record appended so far is durable past a power loss.
     ///
     /// On platforms where `sync_data` is a no-op (memory-only
     /// filesystems used in CI / tests), durability falls back to
     /// whatever the OS provides — the bytes still land in the
     /// page cache.
     pub fn flush(&mut self) -> Result<()> {
-        if self.pending.is_empty() {
-            return Ok(());
-        }
-        self.file.write_all(&self.pending)?;
+        self.drain_to_os()?;
         self.file.sync_data()?;
-        self.bytes_written += self.pending.len() as u64;
-        self.pending.clear();
         Ok(())
     }
 
     /// Drop pending records without writing them. Useful when a
     /// caller decides mid-batch to bail out (e.g. precondition
-    /// check failed). Records already `flush`ed are unaffected.
+    /// check failed). Records already `flush`ed or auto-drained
+    /// are unaffected — `discard_pending` only touches the
+    /// in-memory tail since the last drain.
     pub fn discard_pending(&mut self) {
         self.pending.clear();
     }

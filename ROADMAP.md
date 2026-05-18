@@ -12,7 +12,7 @@ workloads (both `memory` and `persistent` variants).
 
 Concurrency model is settled: per-blob `HybridLatch` (LeanStore
 3-mode) gives wait-free optimistic reads + per-blob exclusive
-writes with **no Tree-wide writer mutex**. 168 tests + a
+writes with **no Tree-wide writer mutex**. 169 tests + a
 4-readers × 1-writer concurrent stress test all green.
 
 The remaining v0.1 cuts are around **WAL persistence** (Stage 5b/5c
@@ -113,6 +113,12 @@ Required for the v0.1 tag:
       `next_seq` past every replayed record. `Tree::checkpoint`
       writes the BM root through to the backend, flushes, then
       atomically truncates the WAL to header-only.
+- [x] **Group-commit auto-flush** (Stage 5d) — once the
+      `WalWriter`'s pending buffer crosses 64 KB the bytes
+      drain to the OS page cache via `write_all` (no `sync_data`).
+      Bounds the in-memory buffer regardless of how long the
+      caller waits between `checkpoint()` calls; `flush()` is
+      still the durability boundary for `sync_data`.
 
 ### Storage backends
 

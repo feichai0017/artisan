@@ -12,7 +12,7 @@ use tempfile::tempdir;
 use artisan::journal::codec::{FILE_HEADER_SIZE, FORMAT_VERSION};
 use artisan::journal::reader::replay;
 use artisan::journal::txn_op::TxnOp;
-use artisan::journal::writer::WalWriter;
+use artisan::journal::writer::{WalWriter, AUTO_FLUSH_THRESHOLD};
 
 fn wal_path(dir: &tempfile::TempDir) -> PathBuf {
     dir.path().join("test.wal")
@@ -443,6 +443,72 @@ fn many_records_stream_round_trip() {
     assert_eq!(stats.records_seen, N);
     assert_eq!(stats.highest_seq, Some(N));
     assert_eq!(max_seq, N);
+}
+
+#[test]
+fn auto_flush_keeps_user_space_buffer_bounded() {
+    // Stress test the group-commit auto-flush: append records
+    // until the per-record cost would otherwise pile up an
+    // unbounded `Vec`. The file should grow past the auto-flush
+    // threshold while the in-memory buffer stays small between
+    // calls.
+    let dir = tempdir().unwrap();
+    let path = wal_path(&dir);
+
+    let mut w = WalWriter::create(&path, 0).unwrap();
+    // ~80 bytes per record means crossing the 64 KB threshold
+    // happens roughly every ~800 appends. Push 3× that to see
+    // the auto-flush fire multiple times.
+    let target_records = (AUTO_FLUSH_THRESHOLD / 80) * 3;
+    for i in 0..target_records as u64 {
+        w.append(
+            &TxnOp::Insert {
+                tree_id: 0,
+                seq: i + 1,
+                key: format!("k{i:06}").into_bytes(),
+                value: vec![0xAB; 32],
+                prev_value: None,
+            },
+            i + 1,
+        )
+        .unwrap();
+    }
+
+    // The file on disk should already have grown well past the
+    // header — the auto-flush is what drained the bytes there.
+    // (We don't call `flush()` ourselves.)
+    let on_disk_before_flush = fs::metadata(&path).unwrap().len();
+    assert!(
+        on_disk_before_flush > AUTO_FLUSH_THRESHOLD as u64,
+        "auto-flush should have pushed bytes to disk: on-disk = {on_disk_before_flush}",
+    );
+
+    // The pending tail since the last auto-drain is bounded
+    // by the threshold (the auto-flush triggers as soon as we
+    // cross, so the next-cycle pending starts at 0 and never
+    // exceeds threshold + one record's worth).
+    let pending_upper_bound = AUTO_FLUSH_THRESHOLD + 256;
+    let bytes_written_total = w.bytes_written();
+    let pending_size = bytes_written_total - on_disk_before_flush;
+    assert!(
+        pending_size <= pending_upper_bound as u64,
+        "pending tail should be bounded: {pending_size} bytes",
+    );
+
+    // Final flush ensures durability and the file holds every
+    // record we appended.
+    w.flush().unwrap();
+    drop(w);
+
+    let mut seen = Vec::new();
+    let (_h, stats) = replay(&path, |_, seq, _| {
+        seen.push(seq);
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(stats.records_seen, target_records as u64);
+    assert_eq!(stats.highest_seq, Some(target_records as u64));
+    assert_eq!(stats.torn_tail_at, None);
 }
 
 // Sanity: prevent the WAL writer from silently leaving the file

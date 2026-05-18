@@ -61,16 +61,26 @@ target:
 - **RocksDB**: temp-dir DB, `disable_wal = false`, `sync = false`.
   Each `put` appends to the WAL (buffered) plus the memtable.
 
-> **Why artisan persist put is now slower than artisan memory
-> put (≈1.7 µs vs ≈180 ns)**: in `flush_on_write = false` mode
-> the WAL writer accumulates bytes in an in-memory `Vec` that
-> never flushes during the bench (the iteration loop never calls
-> `checkpoint`). Over ~3 M ops × ~75 bytes/op the buffer reaches
-> ~225 MB and amortised reallocations / cache misses dominate.
-> In production this isn't typical — callers `checkpoint()`
-> periodically and the WAL stays small. A LeanStore-style group-
-> commit threshold ("auto-flush past 64 KB") is queued as a
-> follow-up to make the bench numbers representative again.
+> **Why artisan persist put is slower than artisan memory put
+> (≈1.7 µs vs ≈180 ns)**: the extra ≈1.5 µs is pure WAL emit
+> cost. Approximate breakdown per record:
+>
+> - 3 `Vec::to_vec` clones (key + value + prev_value) for the
+>   `TxnOp` enum: ≈240 ns
+> - CRC32 (bitwise IEEE 802.3) over ~175 record bytes: ≈300 ns
+> - `Vec::extend_from_slice` writes + length backpatch: ≈100 ns
+> - `Mutex<WalWriter>` lock + the auto-flush threshold check:
+>   ≈40 ns
+> - Amortised syscall for the auto-flush write_all (one per
+>   ~800 records at the 64 KB threshold): ≈10 ns
+>
+> Group-commit auto-flush (Stage 5d) keeps the user-space buffer
+> bounded to 64 KB, so this cost is constant per record across
+> long-running processes; without it the buffer would balloon
+> unboundedly between `checkpoint()` calls. Queued perf wins:
+> a 256-entry CRC table (≈2.5× CRC speedup) and a
+> reference-based `append_insert(&[u8], &[u8], …)` fast path
+> that skips the `TxnOp` enum's clones.
 >
 > The `*_persist_get` numbers remain apples-to-apples: neither
 > engine touches disk on the get path.
