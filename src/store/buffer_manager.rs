@@ -18,27 +18,41 @@
 //!
 //! ## Per-blob locking
 //!
-//! Each cached blob has its own `Mutex<AlignedBlobBuf>`. Reads
+//! Each cached blob has its own `RwLock<AlignedBlobBuf>`. Reads
 //! and writes on **different** blobs progress without
 //! coordinating — the only shared lock is on the cache's HashMap
 //! / LRU bookkeeping, which is held for very short windows.
-//! Concurrent ops on the **same** blob still serialise; full
-//! optimistic-concurrency reads via `HybridLatch` ship in Stage
-//! 6 phase 2 (which also rewires the walker to pin buffers
-//! directly).
+//! On the **same** blob, N readers can run concurrently while
+//! writers take exclusive. Full optimistic-concurrency reads via
+//! `HybridLatch` ship later in Stage 6 phase 2.
+//!
+//! ## Pin-and-operate
+//!
+//! Callers that want to operate on a blob without an intervening
+//! 512 KB memcpy use [`BufferManager::pin`] — it returns an
+//! `Arc<CachedBlob>` holding the buffer alive in cache. The
+//! `Arc`'s strong count keeps eviction at bay. From there:
+//!
+//! - [`CachedBlob::read`] → `RwLockReadGuard<AlignedBlobBuf>`,
+//!   wrap with `BlobFrameRef::wrap(guard.as_slice())` for zero-
+//!   copy traversal.
+//! - [`CachedBlob::write`] → `RwLockWriteGuard<AlignedBlobBuf>`,
+//!   wrap with `BlobFrame::wrap(guard.as_mut_slice())` for in-
+//!   place mutation. Don't forget to write-back via `write_blob`
+//!   afterwards so the inner backend sees the change.
 //!
 //! ## Eviction
 //!
 //! When the cache exceeds `capacity` blobs, the oldest unpinned
 //! entry is dropped (LRU policy). "Unpinned" means no outstanding
-//! `Arc<CachedBlob>` references outside the cache itself.
-//! Currently `BufferManager` doesn't hand out long-lived pins —
-//! every `read_blob`/`write_blob` finishes before returning — so
-//! eviction is always able to make progress. Stage 6 phase 2's
-//! pin-and-operate API will need explicit pin counters.
+//! `Arc<CachedBlob>` references outside the cache itself —
+//! `Arc::strong_count(entry) == 1` — so eviction skips entries
+//! currently being walked under a `pin()`. The cache may
+//! temporarily exceed `capacity` while every entry is pinned;
+//! it shrinks back as readers drop their handles.
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use crate::api::errors::Result;
 use crate::layout::BlobGuid;
@@ -58,10 +72,28 @@ struct BufferManagerState {
     lru: VecDeque<BlobGuid>,
 }
 
-/// A single cached blob — opaque to callers; access is gated by
-/// `BufferManager`'s `Backend` trait impl.
-struct CachedBlob {
-    buf: Mutex<AlignedBlobBuf>,
+/// A single cached blob. Callers obtain one via
+/// [`BufferManager::pin`] and then take a read/write guard on it
+/// to access the underlying 512 KB buffer with zero copies.
+///
+/// Holding the `Arc<CachedBlob>` prevents the entry from being
+/// evicted, so traversals that pin a blob can borrow into it for
+/// as long as the pin is alive.
+pub struct CachedBlob {
+    buf: RwLock<AlignedBlobBuf>,
+}
+
+impl CachedBlob {
+    /// Shared read access to the underlying buffer. N concurrent
+    /// readers across different threads progress in parallel.
+    pub fn read(&self) -> RwLockReadGuard<'_, AlignedBlobBuf> {
+        self.buf.read().expect("CachedBlob RwLock poisoned")
+    }
+
+    /// Exclusive write access to the underlying buffer.
+    pub fn write(&self) -> RwLockWriteGuard<'_, AlignedBlobBuf> {
+        self.buf.write().expect("CachedBlob RwLock poisoned")
+    }
 }
 
 impl BufferManager {
@@ -131,7 +163,7 @@ impl BufferManager {
             return;
         }
         let entry = Arc::new(CachedBlob {
-            buf: Mutex::new(contents.clone()),
+            buf: RwLock::new(contents.clone()),
         });
         state.cache.insert(guid, entry);
         state.lru.push_back(guid);
@@ -173,13 +205,75 @@ impl BufferManager {
             state.lru.remove(pos);
         }
     }
+
+    /// Pin a blob in cache and return an `Arc<CachedBlob>` over it.
+    ///
+    /// On a cache miss, the blob is loaded from the inner backend
+    /// into a fresh cache entry first. The returned `Arc` keeps the
+    /// entry alive (and unevictable) until it is dropped — callers
+    /// should hold pins only as long as they're actively traversing
+    /// or mutating, so eviction can make progress under pressure.
+    ///
+    /// From the returned handle, use [`CachedBlob::read`] for
+    /// shared access (compatible with `BlobFrameRef::wrap`) or
+    /// [`CachedBlob::write`] for exclusive access (compatible with
+    /// `BlobFrame::wrap`).
+    pub fn pin(&self, guid: BlobGuid) -> Result<Arc<CachedBlob>> {
+        if let Some(entry) = self.get_cached(guid) {
+            return Ok(entry);
+        }
+        // Cache miss — load from inner backend, then take a second
+        // lookup so the cache, not our scratch buffer, owns the
+        // canonical entry.
+        let mut scratch = AlignedBlobBuf::zeroed();
+        self.backend.read_blob(guid, &mut scratch)?;
+        self.insert_into_cache(guid, &scratch);
+        // Almost always cached now; if another thread evicted it
+        // in the gap, fall back to a fresh insert with our scratch.
+        if let Some(entry) = self.get_cached(guid) {
+            return Ok(entry);
+        }
+        // Pathological: insert raced with eviction. Build an
+        // entry directly from scratch and force-insert it.
+        let entry = Arc::new(CachedBlob {
+            buf: RwLock::new(scratch),
+        });
+        let mut state = self.state.lock().unwrap();
+        state.cache.insert(guid, entry.clone());
+        if let Some(pos) = state.lru.iter().position(|g| *g == guid) {
+            state.lru.remove(pos);
+        }
+        state.lru.push_back(guid);
+        Ok(entry)
+    }
+
+    /// Durably write the cached image of `guid` to the inner backend.
+    ///
+    /// Used by mutation paths after they've finished editing a
+    /// pinned buffer: pin → write-guard → mutate → drop guard →
+    /// `commit`. Acquires a shared read-guard on the cache entry,
+    /// so multiple commits on different blobs run concurrently and
+    /// in-flight readers on the same blob are not blocked.
+    ///
+    /// If `guid` is **not** in cache the call is a no-op — there
+    /// is nothing dirty to commit (the inner backend already has
+    /// the canonical bytes). This matches the natural use case of
+    /// `Tree::checkpoint` running on a freshly-opened tree before
+    /// any mutation has loaded the root into cache.
+    pub fn commit(&self, guid: BlobGuid) -> Result<()> {
+        if let Some(entry) = self.get_cached(guid) {
+            let buf = entry.read();
+            self.backend.write_blob(guid, &buf)?;
+        }
+        Ok(())
+    }
 }
 
 impl Backend for BufferManager {
     fn read_blob(&self, guid: BlobGuid, dst: &mut AlignedBlobBuf) -> Result<()> {
         // Cache hit?
         if let Some(entry) = self.get_cached(guid) {
-            let buf = entry.buf.lock().unwrap();
+            let buf = entry.read();
             dst.as_mut_slice().copy_from_slice(buf.as_slice());
             return Ok(());
         }
@@ -194,7 +288,7 @@ impl Backend for BufferManager {
         // cached image; either way, always write to the inner
         // backend in the same call so durability is unchanged.
         if let Some(entry) = self.get_cached(guid) {
-            let mut buf = entry.buf.lock().unwrap();
+            let mut buf = entry.write();
             buf.as_mut_slice().copy_from_slice(src.as_slice());
         }
         self.backend.write_blob(guid, src)

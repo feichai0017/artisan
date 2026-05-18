@@ -104,10 +104,94 @@ pub struct ExtentAllocOutcome {
     pub aligned_size: u32,
 }
 
+/// Read-only typed view over a `PAGE_SIZE`-byte buffer.
+///
+/// `BlobFrameRef` is `Copy` — pass it by value. Walker `lookup` /
+/// `descend` paths take `BlobFrameRef` so they work against a
+/// `&[u8]` borrowed from a `RwLock` read-guard (i.e., directly
+/// against the [`crate::BufferManager`]'s cached buffer with no
+/// per-op `memcpy`).
+///
+/// For mutating walker paths see [`BlobFrame`], which holds
+/// `&mut [u8]` instead.
+#[derive(Clone, Copy)]
+pub struct BlobFrameRef<'a> {
+    buf: &'a [u8],
+}
+
+impl<'a> BlobFrameRef<'a> {
+    /// Wrap an existing `PAGE_SIZE`-byte buffer.
+    #[must_use]
+    pub fn wrap(buf: &'a [u8]) -> Self {
+        assert_eq!(buf.len(), PAGE_SIZE as usize, "BlobFrameRef requires PAGE_SIZE buffer");
+        Self { buf }
+    }
+
+    /// View of the buffer's raw bytes.
+    #[must_use]
+    pub fn raw(&self) -> &'a [u8] {
+        self.buf
+    }
+
+    /// Const reference to the header.
+    #[must_use]
+    pub fn header(&self) -> &'a BlobHeader {
+        // SAFETY: buffer is PAGE_SIZE bytes, starts with a
+        // properly-aligned BlobHeader (4096 B; alignment satisfied
+        // by AlignedBlobBuf's 4 KB-aligned heap allocation).
+        unsafe { &*(self.buf.as_ptr() as *const BlobHeader) }
+    }
+
+    /// Read a 1-based slot table entry. `None` if out of range.
+    #[must_use]
+    pub fn slot_entry(&self, slot: u16) -> Option<SlotEntry> {
+        let h = self.header();
+        if slot == 0 || slot > h.num_slots {
+            return None;
+        }
+        let off = HEADER_SIZE as usize + (slot as usize - 1) * 4;
+        let raw_bytes = &self.buf[off..off + 4];
+        let raw = u32::from_le_bytes([raw_bytes[0], raw_bytes[1], raw_bytes[2], raw_bytes[3]]);
+        Some(SlotEntryRaw(raw).decode())
+    }
+
+    /// Resolve a slot to a const view of its body bytes.
+    #[must_use]
+    pub fn body_of_slot(&self, slot: u16) -> Option<&'a [u8]> {
+        let e = self.slot_entry(slot)?;
+        let ntype = e.node_type()?;
+        if ntype == NodeType::Invalid {
+            return None;
+        }
+        let off = e.byte_offset() as usize;
+        let size = size_of_node(ntype) as usize;
+        if off + size > self.buf.len() {
+            return None;
+        }
+        Some(&self.buf[off..off + size])
+    }
+
+    /// Raw byte view at an arbitrary offset (Leaf extents).
+    #[must_use]
+    pub fn bytes_at(&self, offset: u32, len: u32) -> Option<&'a [u8]> {
+        let o = offset as usize;
+        let l = len as usize;
+        let end = o.checked_add(l)?;
+        if end > self.buf.len() {
+            return None;
+        }
+        Some(&self.buf[o..end])
+    }
+}
+
 /// Typed view over a 524288-byte buffer formatted as a BlobFrame.
 ///
 /// `BlobFrame` does not own the buffer; the caller (BufferManager
 /// or a test) provides `&mut [u8]` of length `PAGE_SIZE`.
+///
+/// For read-only access (e.g. walker `lookup` against a
+/// `RwLock`-guarded `BufferManager` blob), use [`BlobFrameRef`]
+/// instead — it wraps `&[u8]` and is `Copy`.
 pub struct BlobFrame<'a> {
     /// Backing buffer (must be exactly `PAGE_SIZE` bytes).
     buf: &'a mut [u8],
@@ -123,6 +207,15 @@ impl<'a> BlobFrame<'a> {
     pub fn wrap(buf: &'a mut [u8]) -> Self {
         assert_eq!(buf.len(), PAGE_SIZE as usize, "BlobFrame requires PAGE_SIZE buffer");
         Self { buf }
+    }
+
+    /// Cheap conversion to a read-only [`BlobFrameRef`]. Useful
+    /// for forwarding into walker `lookup` / `descend` paths
+    /// (which take `BlobFrameRef` so they also work against
+    /// `RwLock`-guarded `BufferManager` slices).
+    #[must_use]
+    pub fn as_ref(&self) -> BlobFrameRef<'_> {
+        BlobFrameRef { buf: self.buf }
     }
 
     /// Initialize a fresh blob from a zeroed buffer.

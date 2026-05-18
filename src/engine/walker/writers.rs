@@ -1,0 +1,434 @@
+//! Write-side helpers — allocate fresh slots / extents in a
+//! [`BlobFrame`] and populate them with node bodies.
+//!
+//! Everything here is `pub(super)`, scoped to walker submodules.
+//! Pure mutation; no recursion into the walker's descent logic.
+
+use std::mem::size_of;
+
+use crate::api::errors::{Error, Result};
+use crate::engine::simd;
+use crate::layout::{
+    leaf_extent_size, Leaf, Node16, Node256, Node4, Node48, NodeType, Prefix, PREFIX_MAX_INLINE,
+};
+use crate::store::BlobFrame;
+
+use super::readers::{read_node16, read_node256, read_node4, read_node48, read_prefix};
+
+pub(super) fn write_struct_to_slot<T>(
+    frame: &mut BlobFrame<'_>,
+    slot: u16,
+    v: &T,
+) -> Result<()> {
+    let body = frame.body_of_slot_mut(slot).ok_or(Error::NodeCorrupt {
+        context: "write_struct_to_slot: body",
+    })?;
+    debug_assert_eq!(body.len(), size_of::<T>());
+    // SAFETY: layout types are #[repr(C)] POD; body sized and
+    // aligned per BlobFrame invariants.
+    let bytes = unsafe { std::slice::from_raw_parts(v as *const T as *const u8, size_of::<T>()) };
+    body.copy_from_slice(bytes);
+    Ok(())
+}
+
+pub(super) fn write_leaf(
+    frame: &mut BlobFrame<'_>,
+    key: &[u8],
+    value: &[u8],
+    seq: u64,
+) -> Result<u16> {
+    let ext_size = leaf_extent_size(key.len() as u32, value.len() as u32);
+    let ext = frame.alloc_extent(ext_size)?;
+    {
+        let s = frame
+            .bytes_at_mut(ext.byte_offset, ext_size)
+            .ok_or(Error::NodeCorrupt {
+                context: "write_leaf: extent out of range",
+            })?;
+        s[..2].copy_from_slice(&(key.len() as u16).to_le_bytes());
+        s[2..2 + key.len()].copy_from_slice(key);
+        s[2 + key.len()..2 + key.len() + value.len()].copy_from_slice(value);
+    }
+    let leaf_out = frame.alloc_node(NodeType::Leaf)?;
+    let leaf = Leaf::live(ext.byte_offset, value.len() as u16, seq);
+    write_struct_to_slot(frame, leaf_out.slot, &leaf)?;
+    Ok(leaf_out.slot)
+}
+
+/// Build a Prefix-node chain spanning `bytes`, ending at
+/// `child_slot`. `bytes` may exceed `PREFIX_MAX_INLINE`; if so,
+/// multiple chained Prefix nodes are allocated.
+pub(super) fn write_prefix_chain(
+    frame: &mut BlobFrame<'_>,
+    bytes: &[u8],
+    child_slot: u16,
+) -> Result<u16> {
+    debug_assert!(!bytes.is_empty(), "write_prefix_chain on empty bytes");
+    let mut next_child = child_slot;
+    let mut remaining = bytes;
+    let mut head = 0u16;
+    while !remaining.is_empty() {
+        let chunk_len = remaining.len().min(PREFIX_MAX_INLINE);
+        let chunk_start = remaining.len() - chunk_len;
+        let chunk = &remaining[chunk_start..];
+        let out = frame.alloc_node(NodeType::Prefix)?;
+        let p = Prefix::new(chunk, u32::from(next_child));
+        write_struct_to_slot(frame, out.slot, &p)?;
+        next_child = out.slot;
+        head = out.slot;
+        remaining = &remaining[..chunk_start];
+    }
+    Ok(head)
+}
+
+/// Build a fresh Node4 with the given `(byte, child_slot)` pairs.
+/// Keys are sorted ascending inside the Node4.
+pub(super) fn write_node4_with(
+    frame: &mut BlobFrame<'_>,
+    children: &[(u8, u32)],
+) -> Result<u16> {
+    debug_assert!(!children.is_empty() && children.len() <= 4);
+    let out = frame.alloc_node(NodeType::Node4)?;
+    let mut n = Node4::empty();
+    let mut sorted = children.to_vec();
+    sorted.sort_by_key(|(b, _)| *b);
+    n.count = sorted.len() as u8;
+    for (i, (b, c)) in sorted.iter().enumerate() {
+        n.keys[i] = *b;
+        n.children[i] = *c;
+    }
+    write_struct_to_slot(frame, out.slot, &n)?;
+    Ok(out.slot)
+}
+
+pub(super) fn set_prefix_child(
+    frame: &mut BlobFrame<'_>,
+    pfx_slot: u16,
+    new_child: u32,
+) -> Result<()> {
+    let mut p = read_prefix(frame.as_ref(), pfx_slot)?;
+    p.child = new_child;
+    write_struct_to_slot(frame, pfx_slot, &p)
+}
+
+// ---------- inner-node ops (find / update / add+grow) ----------
+
+pub(super) fn inner_find_child(
+    frame: &BlobFrame<'_>,
+    slot: u16,
+    ntype: NodeType,
+    byte: u8,
+) -> Result<Option<u16>> {
+    match ntype {
+        NodeType::Node4 => {
+            let n = read_node4(frame.as_ref(), slot)?;
+            let count = (n.count as usize).min(4);
+            for i in 0..count {
+                if n.keys[i] == byte {
+                    return Ok(Some(n.children[i] as u16));
+                }
+                if n.keys[i] > byte {
+                    break;
+                }
+            }
+            Ok(None)
+        }
+        NodeType::Node16 => {
+            let n = read_node16(frame.as_ref(), slot)?;
+            if let Some(i) = simd::node16_find_byte(&n.keys, n.count, byte) {
+                Ok(Some(n.children[i as usize] as u16))
+            } else {
+                Ok(None)
+            }
+        }
+        NodeType::Node48 => {
+            let n = read_node48(frame.as_ref(), slot)?;
+            let idx = n.index[byte as usize];
+            if idx == 0 {
+                Ok(None)
+            } else {
+                Ok(Some(n.children[idx as usize - 1] as u16))
+            }
+        }
+        NodeType::Node256 => {
+            let n = read_node256(frame.as_ref(), slot)?;
+            let s = n.children[byte as usize];
+            if s == 0 {
+                Ok(None)
+            } else {
+                Ok(Some(s as u16))
+            }
+        }
+        _ => Err(Error::NodeCorrupt {
+            context: "inner_find_child: not an inner node",
+        }),
+    }
+}
+
+pub(super) fn inner_update_child(
+    frame: &mut BlobFrame<'_>,
+    slot: u16,
+    ntype: NodeType,
+    byte: u8,
+    new_child: u32,
+) -> Result<()> {
+    match ntype {
+        NodeType::Node4 => {
+            let mut n = read_node4(frame.as_ref(), slot)?;
+            let count = (n.count as usize).min(4);
+            for i in 0..count {
+                if n.keys[i] == byte {
+                    n.children[i] = new_child;
+                    return write_struct_to_slot(frame, slot, &n);
+                }
+            }
+            Err(Error::NodeCorrupt {
+                context: "inner_update_child: byte not found in Node4",
+            })
+        }
+        NodeType::Node16 => {
+            let mut n = read_node16(frame.as_ref(), slot)?;
+            let count = (n.count as usize).min(16);
+            for i in 0..count {
+                if n.keys[i] == byte {
+                    n.children[i] = new_child;
+                    return write_struct_to_slot(frame, slot, &n);
+                }
+            }
+            Err(Error::NodeCorrupt {
+                context: "inner_update_child: byte not found in Node16",
+            })
+        }
+        NodeType::Node48 => {
+            let mut n = read_node48(frame.as_ref(), slot)?;
+            let idx = n.index[byte as usize];
+            if idx == 0 {
+                return Err(Error::NodeCorrupt {
+                    context: "inner_update_child: byte not found in Node48",
+                });
+            }
+            n.children[idx as usize - 1] = new_child;
+            write_struct_to_slot(frame, slot, &n)
+        }
+        NodeType::Node256 => {
+            let mut n = read_node256(frame.as_ref(), slot)?;
+            n.children[byte as usize] = new_child;
+            write_struct_to_slot(frame, slot, &n)
+        }
+        _ => Err(Error::NodeCorrupt {
+            context: "inner_update_child: not an inner node",
+        }),
+    }
+}
+
+/// Add `(byte, child_slot)` to an inner node, growing to the next
+/// NodeType variant if the current one is full. Returns the slot
+/// to be used as parent's child pointer (changes on growth).
+pub(super) fn inner_add_child(
+    frame: &mut BlobFrame<'_>,
+    slot: u16,
+    ntype: NodeType,
+    byte: u8,
+    new_child: u32,
+) -> Result<u16> {
+    match ntype {
+        NodeType::Node4 => {
+            let n = read_node4(frame.as_ref(), slot)?;
+            if n.count < 4 {
+                let mut new = n;
+                node4_insert_sorted(&mut new, byte, new_child);
+                write_struct_to_slot(frame, slot, &new)?;
+                Ok(slot)
+            } else {
+                let n16_slot = grow_node4_to_node16(frame, slot, n)?;
+                inner_add_child(frame, n16_slot, NodeType::Node16, byte, new_child)
+            }
+        }
+        NodeType::Node16 => {
+            let n = read_node16(frame.as_ref(), slot)?;
+            if n.count < 16 {
+                let mut new = n;
+                node16_insert_sorted(&mut new, byte, new_child);
+                write_struct_to_slot(frame, slot, &new)?;
+                Ok(slot)
+            } else {
+                let n48_slot = grow_node16_to_node48(frame, slot, n)?;
+                inner_add_child(frame, n48_slot, NodeType::Node48, byte, new_child)
+            }
+        }
+        NodeType::Node48 => {
+            let n = read_node48(frame.as_ref(), slot)?;
+            if n.count < 48 {
+                let mut new = n;
+                node48_insert(&mut new, byte, new_child)?;
+                write_struct_to_slot(frame, slot, &new)?;
+                Ok(slot)
+            } else {
+                let n256_slot = grow_node48_to_node256(frame, slot, n)?;
+                inner_add_child(frame, n256_slot, NodeType::Node256, byte, new_child)
+            }
+        }
+        NodeType::Node256 => {
+            let mut n = read_node256(frame.as_ref(), slot)?;
+            if n.children[byte as usize] != 0 {
+                return Err(Error::NodeCorrupt {
+                    context: "inner_add_child: byte already present on Node256",
+                });
+            }
+            n.children[byte as usize] = new_child;
+            if (n.count as u32) < 256 {
+                n.count += 1;
+            }
+            write_struct_to_slot(frame, slot, &n)?;
+            Ok(slot)
+        }
+        _ => Err(Error::NodeCorrupt {
+            context: "inner_add_child: not an inner node",
+        }),
+    }
+}
+
+fn node4_insert_sorted(n: &mut Node4, byte: u8, child: u32) {
+    let count = n.count as usize;
+    debug_assert!(count < 4);
+    let mut pos = count;
+    for i in 0..count {
+        if n.keys[i] > byte {
+            pos = i;
+            break;
+        }
+    }
+    let mut i = count;
+    while i > pos {
+        n.keys[i] = n.keys[i - 1];
+        n.children[i] = n.children[i - 1];
+        i -= 1;
+    }
+    n.keys[pos] = byte;
+    n.children[pos] = child;
+    n.count += 1;
+}
+
+fn node16_insert_sorted(n: &mut Node16, byte: u8, child: u32) {
+    let count = n.count as usize;
+    debug_assert!(count < 16);
+    let mut pos = count;
+    for i in 0..count {
+        if n.keys[i] > byte {
+            pos = i;
+            break;
+        }
+    }
+    let mut i = count;
+    while i > pos {
+        n.keys[i] = n.keys[i - 1];
+        n.children[i] = n.children[i - 1];
+        i -= 1;
+    }
+    n.keys[pos] = byte;
+    n.children[pos] = child;
+    n.count += 1;
+}
+
+fn node48_insert(n: &mut Node48, byte: u8, child: u32) -> Result<()> {
+    if n.index[byte as usize] != 0 {
+        return Err(Error::NodeCorrupt {
+            context: "node48_insert: byte already present",
+        });
+    }
+    for i in 0..48 {
+        if n.children[i] == 0 {
+            n.children[i] = child;
+            n.index[byte as usize] = (i + 1) as u8;
+            n.count += 1;
+            return Ok(());
+        }
+    }
+    Err(Error::NodeCorrupt {
+        context: "node48_insert: no free children[] slot despite count < 48",
+    })
+}
+
+// ---------- node growth ----------
+
+fn grow_node4_to_node16(
+    frame: &mut BlobFrame<'_>,
+    old_slot: u16,
+    old: Node4,
+) -> Result<u16> {
+    let out = frame.alloc_node(NodeType::Node16)?;
+    let mut n = Node16::empty();
+    n.count = old.count;
+    for i in 0..old.count as usize {
+        n.keys[i] = old.keys[i];
+        n.children[i] = old.children[i];
+    }
+    write_struct_to_slot(frame, out.slot, &n)?;
+    frame.free_node(old_slot)?;
+    Ok(out.slot)
+}
+
+fn grow_node16_to_node48(
+    frame: &mut BlobFrame<'_>,
+    old_slot: u16,
+    old: Node16,
+) -> Result<u16> {
+    let out = frame.alloc_node(NodeType::Node48)?;
+    let mut n = Node48::empty();
+    n.count = old.count;
+    for i in 0..old.count as usize {
+        n.children[i] = old.children[i];
+        n.index[old.keys[i] as usize] = (i + 1) as u8;
+    }
+    write_struct_to_slot(frame, out.slot, &n)?;
+    frame.free_node(old_slot)?;
+    Ok(out.slot)
+}
+
+fn grow_node48_to_node256(
+    frame: &mut BlobFrame<'_>,
+    old_slot: u16,
+    old: Node48,
+) -> Result<u16> {
+    let out = frame.alloc_node(NodeType::Node256)?;
+    let mut n = Node256::empty();
+    let mut count = 0u16;
+    for byte in 0..256usize {
+        let idx = old.index[byte];
+        if idx != 0 {
+            n.children[byte] = old.children[idx as usize - 1];
+            count += 1;
+        }
+    }
+    n.count = count.min(255) as u8;
+    write_struct_to_slot(frame, out.slot, &n)?;
+    frame.free_node(old_slot)?;
+    Ok(out.slot)
+}
+
+/// Shared collapse / writeback for the Node4 + Node16 arms whose
+/// `keys[]` array is sorted in-place; `surviving_byte` and
+/// `surviving_child` are `keys[0]` / `children[0]` (only consulted
+/// when `new_count == 1`).
+pub(super) fn finish_inner_with_sorted<T>(
+    frame: &mut BlobFrame<'_>,
+    slot: u16,
+    new_count: u8,
+    body: &T,
+    surviving_byte: u8,
+    surviving_child: u32,
+) -> Result<super::types::EraseSignal> {
+    use super::types::EraseSignal;
+    if new_count == 0 {
+        frame.free_node(slot)?;
+        return Ok(EraseSignal::SubtreeGone);
+    }
+    if new_count == 1 {
+        frame.free_node(slot)?;
+        let new_slot =
+            write_prefix_chain(frame, &[surviving_byte], surviving_child as u16)?;
+        return Ok(EraseSignal::Replaced(new_slot));
+    }
+    write_struct_to_slot(frame, slot, body)?;
+    Ok(EraseSignal::Unchanged)
+}

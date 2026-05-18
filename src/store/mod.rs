@@ -11,5 +11,7 @@ mod blob_frame;
 mod buffer_manager;
 pub mod backend;
 
-pub use blob_frame::{BlobFrame, AllocError, FreeError, AllocOutcome, ExtentAllocOutcome};
-pub use buffer_manager::BufferManager;
+pub use blob_frame::{
+    AllocError, AllocOutcome, BlobFrame, BlobFrameRef, ExtentAllocOutcome, FreeError,
+};
+pub use buffer_manager::{BufferManager, CachedBlob};

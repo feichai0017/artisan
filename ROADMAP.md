@@ -102,13 +102,24 @@ Required for the v0.1 tag:
 - [x] `HybridLatch` 3-mode primitive (used standalone in tests)
 - [x] `BufferManager` — LRU-bounded cache wrapping any Backend.
       Implements Backend itself (transparent drop-in). Per-blob
-      `Mutex<AlignedBlobBuf>` so concurrent ops on different
-      blobs progress in parallel.
-- [ ] Wire HybridLatch into the walker (insert takes exclusive,
-      lookup takes optimistic, escalates on restart) — Stage 6
-      phase 2. Requires `BlobFrameRef` for the read-only walker
-      paths, currently they take `&BlobFrame` (which holds
-      `&mut [u8]`).
+      `RwLock<AlignedBlobBuf>` so concurrent ops on different
+      blobs progress in parallel, and N readers can share a single
+      blob's buffer with zero coordination.
+- [x] `BlobFrameRef<'a>` + `BufferManager::pin(guid)` —
+      pin-and-operate read path. `Tree::get` walks each blob via
+      a shared read-guard with **no 512 KB memcpy per hop**; the
+      walker's lookup arms borrow into the pinned buffer (Stage 6
+      phase 2a).
+- [x] Walker insert/erase use `pin` + `BufferManager::commit`
+      throughout — `Tree::state.root_buf` removed, root + every
+      cross-blob hop operate in place against the BM-owned buffer
+      under exclusive `RwLock` write guards. Writers serialise
+      through a single `Mutex<()>` until per-blob HybridLatch
+      ships (Stage 6 phase 2c).
+- [ ] Wire HybridLatch into the walker — `pin_optimistic` returns
+      a version snapshot the walker validates after each hop;
+      escalates to shared (or restarts) on a torn read. Removes
+      the single writer mutex. Stage 6 phase 2b.
 - [ ] Cross-blob lock-coupling (`BlobNode` descent acquires the
       target blob's latch)
 - [x] MVCC seq counter bumped on writes (carried in Leaf body;

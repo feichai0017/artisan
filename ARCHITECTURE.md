@@ -267,17 +267,21 @@ the packed-image size, well below `PAGE_SIZE - SPILLOVER_RESERVATION`.
   collapse always wraps the surviving child in `Prefix([byte])` to
   preserve depth invariants. Mild space waste, compact reclaims it.
 
-## 5b. BufferManager (Stage 6 phase 1)
+## 5b. BufferManager (Stage 6 phase 1 + 2a + 2c)
 
 `BufferManager` sits between [`Tree`] and the underlying
 [`Backend`], caching recently-accessed blobs. It **itself
-implements `Backend`** — drop-in wrapper, no walker change.
+implements `Backend`** — drop-in wrapper for the write path —
+**and** exposes a `pin(guid)` API for zero-copy reads.
 
 ```
-Tree → Arc<dyn Backend>            ← BufferManager → Arc<dyn Backend>
-                                                       ↑
-                                              MemoryBackend or
-                                              PersistentBackend
+Tree → Arc<BufferManager> → Arc<dyn Backend>
+              │                    ↑
+              │           MemoryBackend or
+              │           PersistentBackend
+              │
+              ├── read path:  bm.pin(guid).read() ─► BlobFrameRef
+              └── write path: backend trait + cached write-through
 ```
 
 `Tree::open_with_backend` wraps the user-supplied backend
@@ -294,24 +298,49 @@ durability semantic without forcing callers to checkpoint.
 A later revision (Stage 6 phase 3) will add **write-back** mode
 with dirty tracking + a background checkpointer thread.
 
-### Per-blob locking
+### Per-blob locking — `RwLock<AlignedBlobBuf>`
 
-Each cached blob lives behind its own `Mutex<AlignedBlobBuf>`.
-Concurrent ops on **different** blobs don't contend; the cache's
-shared `HashMap`/LRU lock is held only for very short windows
-(insertions, eviction, LRU touches).
+Each cached blob lives behind its own `RwLock<AlignedBlobBuf>`.
+On **different** blobs, ops never contend; on the **same** blob,
+N readers run in parallel (only writers take exclusive). The
+cache's shared `HashMap`/LRU lock is held only for very short
+windows (insertions, eviction, LRU touches).
 
-The Tree's `write_lock` still serialises mutations through the
-walker — full optimistic concurrency requires the
-`BlobFrameRef` + walker refactor in Stage 6 phase 2.
+Full optimistic concurrency (read-only descent under a version
+snapshot that's validated post-hoc) wires `HybridLatch` over the
+RwLock in Stage 6 phase 2b.
+
+### Pin-and-operate (Stage 6 phase 2a + 2c)
+
+Every blob operated on by the walker — root **and** every
+cross-blob hop, for **both reads and writes** — is pinned in the
+BM via `BufferManager::pin(guid)`. The returned `Arc<CachedBlob>`
+keeps the entry alive (its `strong_count >= 2` skips LRU
+eviction); the walker borrows into the underlying buffer:
+
+| Operation | Guard | Wrap as            |
+|-----------|-------|--------------------|
+| Read      | `read()` → `RwLockReadGuard` | `BlobFrameRef::wrap(&[u8])` |
+| Write     | `write()` → `RwLockWriteGuard` | `BlobFrame::wrap(&mut [u8])` |
+
+After a write the walker calls `BufferManager::commit(guid)` to
+durably write the cached buffer through to the inner backend. No
+second 512 KB memcpy: `commit` takes a shared read-guard on the
+pinned cache entry and writes its bytes directly.
+
+This means `Tree` no longer keeps its own `state.root_buf` — the
+canonical in-memory image of the root blob lives in the BM cache,
+and both readers and writers reach it the same way. The Tree's
+only remaining synchronisation primitive is a `Mutex<()>`
+`write_lock` that serialises mutators against each other; readers
+never take it.
 
 ### LRU eviction
 
 When the cache exceeds `capacity` blobs the oldest *evictable*
 entry is dropped. "Evictable" = `Arc::strong_count(entry) == 1`
-(no outstanding pin outside the cache). The current BM doesn't
-hand out long-lived pins — every `read_blob`/`write_blob`
-finishes before returning — so eviction always makes progress.
+(no outstanding pin outside the cache). Pinned blobs are skipped
+until the pinning walker drops its handle.
 
 ## 6. Persistence + crash safety
 

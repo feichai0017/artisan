@@ -62,12 +62,24 @@ Done — algorithm core:
   (Linux `O_DIRECT`, macOS `F_NOCACHE`)
 - `BufferManager` LRU cache wrapping any backend (Stage 6 phase 1)
   — `TreeConfig::buffer_pool_size` drives capacity, per-blob
-  Mutex lets concurrent reads on different blobs progress
+  `RwLock` lets N readers share a single blob in parallel
+- Zero-copy `Tree::get` via `BufferManager::pin` + `BlobFrameRef`
+  (Stage 6 phase 2a) — read paths walk the cached buffer in place,
+  no 512 KB memcpy per cross-blob hop
+- Zero-copy `Tree::put` / `delete` / `rename` via
+  `BufferManager::pin` + `commit` (Stage 6 phase 2c) — mutations
+  also operate in place against the BM-owned buffer; `Tree` no
+  longer keeps a separate `state.root_buf`. Writers serialise
+  through a single `Mutex<()>` until HybridLatch ships
+- Walker split into focused submodules under `engine/walker/`
+  (types / readers / writers / lookup / insert / erase /
+  spillover / migrate / tests) — ten files under ~700 LOC each
+  rather than one ~3400-LOC blob
 
 Queued — see [ROADMAP.md](ROADMAP.md):
 
-- BufferManager pin/operate API + walker refactor + HybridLatch
-  optimistic reads (Stage 6 phase 2)
+- HybridLatch optimistic reads wired over the per-blob RwLock
+  (Stage 6 phase 2b) — removes the single writer mutex
 - WAL + crash recovery (Stage 5)
 - `Tree::range` / `Tree::txn` iterators
 - io_uring submission on the persistent backend (Stage 7)
