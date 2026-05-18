@@ -25,6 +25,7 @@ rand = "0.8"
 tempfile = "3"
 criterion = { version = "0.5", features = ["html_reports"] }
 rocksdb = { version = "0.23", default-features = false }
+proptest = { version = "1", default-features = false, features = ["std", "fork", "timeout"] }
 
 [features]
 default = []
@@ -41,6 +42,18 @@ inherits = "release"
 [[example]]
 name = "basic_kv"
 path = "examples/basic_kv.rs"
+
+[[example]]
+name = "filesystem_meta"
+path = "examples/filesystem_meta.rs"
+
+[[example]]
+name = "session_store"
+path = "examples/session_store.rs"
+
+[[example]]
+name = "s3_metadata"
+path = "examples/s3_metadata.rs"
 
 [[bench]]
 name = "main"
