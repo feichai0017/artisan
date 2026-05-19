@@ -276,9 +276,7 @@ pub fn merge_blob(
 }
 
 fn read_blob_node(frame: &BlobFrame<'_>, slot: u16) -> Result<BlobNode> {
-    let body = frame.body_of_slot(slot).ok_or(Error::NodeCorrupt {
-        context: "read_blob_node: body resolution failed",
-    })?;
+    let body = frame.body_of_slot(slot).ok_or(Error::node_corrupt("read_blob_node: body resolution failed"))?;
     Ok(*cast::<BlobNode>(body))
 }
 
@@ -301,20 +299,12 @@ fn clone_subtree(
     src_slot: u16,
     filter_tombstones: bool,
 ) -> Result<Option<u16>> {
-    let entry = src.slot_entry(src_slot).ok_or(Error::NodeCorrupt {
-        context: "clone_subtree: invalid src slot",
-    })?;
-    let ntype = entry.node_type().ok_or(Error::NodeCorrupt {
-        context: "clone_subtree: undecodable src ntype",
-    })?;
-    let body = src.body_of_slot(src_slot).ok_or(Error::NodeCorrupt {
-        context: "clone_subtree: src body resolution failed",
-    })?;
+    let entry = src.slot_entry(src_slot).ok_or(Error::node_corrupt("clone_subtree: invalid src slot"))?;
+    let ntype = entry.node_type().ok_or(Error::node_corrupt("clone_subtree: undecodable src ntype"))?;
+    let body = src.body_of_slot(src_slot).ok_or(Error::node_corrupt("clone_subtree: src body resolution failed"))?;
 
     match ntype {
-        NodeType::Invalid => Err(Error::NodeCorrupt {
-            context: "clone_subtree: NodeType::Invalid in source",
-        }),
+        NodeType::Invalid => Err(Error::node_corrupt("clone_subtree: NodeType::Invalid in source")),
         NodeType::EmptyRoot => {
             let out = dst.alloc_node(NodeType::EmptyRoot)?;
             Ok(Some(out.slot))
@@ -341,23 +331,17 @@ fn clone_leaf(
     }
     let hdr = src
         .bytes_at(src_leaf.key_offset, 2)
-        .ok_or(Error::NodeCorrupt {
-            context: "clone_leaf: extent header out of range",
-        })?;
+        .ok_or(Error::node_corrupt("clone_leaf: extent header out of range"))?;
     let key_len = u32::from(u16::from_le_bytes([hdr[0], hdr[1]]));
     let ext_total = leaf_extent_size(key_len, u32::from(src_leaf.value_size));
     let src_ext = src
         .bytes_at(src_leaf.key_offset, ext_total)
-        .ok_or(Error::NodeCorrupt {
-            context: "clone_leaf: extent body out of range",
-        })?
+        .ok_or(Error::node_corrupt("clone_leaf: extent body out of range"))?
         .to_vec();
 
     let dst_ext = dst.alloc_extent(ext_total)?;
     dst.bytes_at_mut(dst_ext.byte_offset, ext_total)
-        .ok_or(Error::NodeCorrupt {
-            context: "clone_leaf: dst extent out of range",
-        })?
+        .ok_or(Error::node_corrupt("clone_leaf: dst extent out of range"))?
         .copy_from_slice(&src_ext);
 
     let leaf_out = dst.alloc_node(NodeType::Leaf)?;
@@ -475,9 +459,7 @@ fn clone_node48(
             }
             let ci = idx as usize - 1;
             if ci >= 48 {
-                return Err(Error::NodeCorrupt {
-                    context: "clone_node48: index out of range",
-                });
+                return Err(Error::node_corrupt("clone_node48: index out of range"));
             }
             if let Some(new_child) = clone_subtree(src, dst, src_n.children[ci] as u16, true)? {
                 survivors.push((b as u8, u32::from(new_child)));

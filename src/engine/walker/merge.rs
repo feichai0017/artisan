@@ -70,9 +70,7 @@ fn try_merge_subtree(
 ) -> Result<u16> {
     let ntype = ntype_of(frame.as_ref(), slot)?;
     match ntype {
-        NodeType::Invalid => Err(Error::NodeCorrupt {
-            context: "try_merge_subtree: hit NodeType::Invalid",
-        }),
+        NodeType::Invalid => Err(Error::node_corrupt("try_merge_subtree: hit NodeType::Invalid")),
         NodeType::EmptyRoot | NodeType::Leaf => Ok(slot),
         NodeType::Prefix => merge_under_prefix(bm, frame, slot, stats, seq),
         NodeType::Node4 | NodeType::Node16 | NodeType::Node48 | NodeType::Node256 => {
@@ -135,9 +133,7 @@ fn merge_under_inner(
                 }
                 let ci = idx as usize - 1;
                 if ci >= 48 {
-                    return Err(Error::NodeCorrupt {
-                        context: "merge_under_inner: Node48 index out of range",
-                    });
+                    return Err(Error::node_corrupt("merge_under_inner: Node48 index out of range"));
                 }
                 out.push((b as u8, n.children[ci] as u16));
             }
@@ -154,9 +150,7 @@ fn merge_under_inner(
             out
         }
         _ => {
-            return Err(Error::NodeCorrupt {
-                context: "merge_under_inner: called on a non-inner NodeType",
-            })
+            return Err(Error::node_corrupt("merge_under_inner: called on a non-inner NodeType"))
         }
     };
 
@@ -180,14 +174,10 @@ fn merge_at_blob_node(
     // prefix_len fits. If `is_mergeable` returns false, the BlobNode
     // stays put.
     {
-        let body = frame.body_of_slot(bn_slot).ok_or(Error::NodeCorrupt {
-            context: "merge_at_blob_node: body resolution failed",
-        })?;
+        let body = frame.body_of_slot(bn_slot).ok_or(Error::node_corrupt("merge_at_blob_node: body resolution failed"))?;
         let bn = cast::<BlobNode>(body);
         if (bn.prefix_len as usize) > BLOB_MAX_INLINE {
-            return Err(Error::NodeCorrupt {
-                context: "merge_at_blob_node: prefix_len exceeds inline buffer",
-            });
+            return Err(Error::node_corrupt("merge_at_blob_node: prefix_len exceeds inline buffer"));
         }
     }
     stats.inspected += 1;

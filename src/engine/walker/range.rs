@@ -391,9 +391,7 @@ impl RangeIter {
             let top = self.stack.last().expect("stack non-empty");
             let guard = top.pin.read();
             let frame = BlobFrameRef::wrap(guard.as_slice());
-            let body = frame.body_of_slot(top.slot).ok_or(Error::NodeCorrupt {
-                context: "range::descend_blob_for_anchor: body resolution",
-            })?;
+            let body = frame.body_of_slot(top.slot).ok_or(Error::node_corrupt("range::descend_blob_for_anchor: body resolution"))?;
             let b = cast::<BlobNode>(body);
             let plen = (b.prefix_len as usize).min(BLOB_MAX_INLINE);
             (
@@ -464,6 +462,7 @@ impl RangeIter {
         Ok(true)
     }
 
+    #[allow(clippy::too_many_lines)] // single match over six NodeType variants — splitting hides the loop shape
     fn advance_to_next_leaf(&mut self) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
         loop {
             // Anchor stop: dropping below the anchor depth means we
@@ -479,12 +478,33 @@ impl RangeIter {
                 NodeType::Leaf => {
                     if top.next == 0 {
                         top.next = 1;
-                        let (key, value) = {
+                        let kv = {
                             let guard = top.pin.read();
                             let frame = BlobFrameRef::wrap(guard.as_slice());
-                            read_leaf_kv(frame, top.slot)?
+                            // Soft-deleted leaves stay physically in
+                            // the slot table (and their key/value
+                            // extent bytes stay allocated) until
+                            // `compact_blob` rebuilds the blob; range
+                            // iteration must skip them so a leaf
+                            // that was erased between snapshot and
+                            // iteration isn't emitted.
+                            let body = frame.body_of_slot(top.slot).ok_or_else(|| {
+                                crate::api::errors::Error::node_corrupt(
+                                    "advance_to_next_leaf: body resolution failed",
+                                )
+                            })?;
+                            let leaf = *super::cast::<crate::layout::Leaf>(body);
+                            if leaf.tombstone != 0 {
+                                None
+                            } else {
+                                Some(read_leaf_kv(frame, top.slot)?)
+                            }
                         };
-                        return Ok(Some((key, value)));
+                        if let Some((key, value)) = kv {
+                            return Ok(Some((key, value)));
+                        }
+                        // Tombstoned — fall through to pop_frame and
+                        // resume scanning.
                     }
                     self.pop_frame();
                 }
@@ -513,9 +533,7 @@ impl RangeIter {
                         let (child_guid, child_slot, p_bytes) = {
                             let guard = top.pin.read();
                             let frame = BlobFrameRef::wrap(guard.as_slice());
-                            let body = frame.body_of_slot(top.slot).ok_or(Error::NodeCorrupt {
-                                context: "range::advance: BlobNode body resolution",
-                            })?;
+                            let body = frame.body_of_slot(top.slot).ok_or(Error::node_corrupt("range::advance: BlobNode body resolution"))?;
                             let b = cast::<BlobNode>(body);
                             let plen = (b.prefix_len as usize).min(BLOB_MAX_INLINE);
                             (
@@ -656,9 +674,7 @@ fn find_inner_child_and_cursor(
             }
             let ci = idx as usize - 1;
             if ci >= 48 {
-                return Err(Error::NodeCorrupt {
-                    context: "range::find_inner_child: Node48 index out of range",
-                });
+                return Err(Error::node_corrupt("range::find_inner_child: Node48 index out of range"));
             }
             Ok(Some((n.children[ci] as u16, u16::from(byte) + 1)))
         }
@@ -670,9 +686,7 @@ fn find_inner_child_and_cursor(
             }
             Ok(Some((s as u16, u16::from(byte) + 1)))
         }
-        _ => Err(Error::NodeCorrupt {
-            context: "range::find_inner_child: not an inner node",
-        }),
+        _ => Err(Error::node_corrupt("range::find_inner_child: not an inner node")),
     }
 }
 
@@ -717,9 +731,7 @@ fn next_inner_child_from(
             let idx = n.index[b];
             let ci = idx as usize - 1;
             if ci >= 48 {
-                return Err(Error::NodeCorrupt {
-                    context: "range::next_inner_child: Node48 index out of range",
-                });
+                return Err(Error::node_corrupt("range::next_inner_child: Node48 index out of range"));
             }
             Ok(Some((b as u8, n.children[ci] as u16, (b + 1) as u16)))
         }
@@ -734,8 +746,6 @@ fn next_inner_child_from(
             let s = n.children[b];
             Ok(Some((b as u8, s as u16, (b + 1) as u16)))
         }
-        _ => Err(Error::NodeCorrupt {
-            context: "range::next_inner_child: not an inner node",
-        }),
+        _ => Err(Error::node_corrupt("range::next_inner_child: not an inner node")),
     }
 }

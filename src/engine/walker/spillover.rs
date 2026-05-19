@@ -113,15 +113,11 @@ pub(super) fn spillover_blob(
 /// spillover heuristic to pick the largest migration candidate.
 pub(super) fn count_subtree_nodes(frame: &BlobFrame<'_>, root: u16) -> Result<u32> {
     let ntype = ntype_of(frame.as_ref(), root)?;
-    let body = frame.body_of_slot(root).ok_or(Error::NodeCorrupt {
-        context: "count_subtree_nodes: body resolution failed",
-    })?;
+    let body = frame.body_of_slot(root).ok_or(Error::node_corrupt("count_subtree_nodes: body resolution failed"))?;
     let mut count: u32 = 1;
     match ntype {
         NodeType::Invalid => {
-            return Err(Error::NodeCorrupt {
-                context: "count_subtree_nodes: Invalid",
-            });
+            return Err(Error::node_corrupt("count_subtree_nodes: Invalid"));
         }
         NodeType::Leaf | NodeType::EmptyRoot | NodeType::Blob => {}
         NodeType::Prefix => {
@@ -279,9 +275,7 @@ fn pick_victim_subtree(frame: &BlobFrame<'_>, start_slot: u16) -> Result<Victim>
                         });
                     }
                     NodeType::Invalid => {
-                        return Err(Error::NodeCorrupt {
-                            context: "pick_victim_subtree: Prefix child Invalid",
-                        });
+                        return Err(Error::node_corrupt("pick_victim_subtree: Prefix child Invalid"));
                     }
                 }
             }
@@ -291,9 +285,7 @@ fn pick_victim_subtree(frame: &BlobFrame<'_>, start_slot: u16) -> Result<Victim>
                 ));
             }
             NodeType::Invalid => {
-                return Err(Error::NodeCorrupt {
-                    context: "pick_victim_subtree: Invalid",
-                });
+                return Err(Error::node_corrupt("pick_victim_subtree: Invalid"));
             }
         }
     }
@@ -343,16 +335,12 @@ pub(super) fn free_subtree(frame: &mut BlobFrame<'_>, root: u16) -> Result<()> {
     // following `frame.free_node` calls can't invalidate them.
     let body_copy = frame
         .body_of_slot(root)
-        .ok_or(Error::NodeCorrupt {
-            context: "free_subtree: body resolution failed",
-        })?
+        .ok_or(Error::node_corrupt("free_subtree: body resolution failed"))?
         .to_vec();
 
     match ntype {
         NodeType::Invalid => {
-            return Err(Error::NodeCorrupt {
-                context: "free_subtree: Invalid in source",
-            });
+            return Err(Error::node_corrupt("free_subtree: Invalid in source"));
         }
         NodeType::Leaf | NodeType::EmptyRoot | NodeType::Blob => {}
         NodeType::Prefix => {

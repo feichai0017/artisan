@@ -248,3 +248,19 @@ jobs:
 
       - name: cargo build (library only)
         run: cargo build --lib --locked
+
+  # --------------------------------------------------------------
+  # Supply-chain hygiene: `cargo deny check` fails the build on
+  # disallowed licenses, banned crates, RustSec advisories, and
+  # duplicate / unmaintained dependencies. Policy lives in
+  # `deny.toml` at the repo root.
+  # --------------------------------------------------------------
+  deny:
+    name: deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+          arguments: --all-features --locked

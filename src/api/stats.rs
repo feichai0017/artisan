@@ -71,6 +71,20 @@ pub struct TreeStats {
     /// (or `Tree::checkpoint`) to issue the actual
     /// `backend.delete_blob` + manifest re-sync.
     pub bm_pending_delete_count: usize,
+    /// Cumulative cache lookups served from BM cache without
+    /// going to the inner backend. Read by external observers to
+    /// derive a hit rate (`bm_cache_hits / (bm_cache_hits +
+    /// bm_cache_misses)`); higher is better.
+    pub bm_cache_hits: u64,
+    /// Cumulative cache lookups that fell through to
+    /// `inner_backend.read_blob` because the entry was absent or
+    /// evicted. Tracks cold-start + eviction churn.
+    pub bm_cache_misses: u64,
+    /// Cumulative wait-free read restarts in `Tree::get` — each
+    /// one means a concurrent writer lapped an optimistic
+    /// snapshot and the lookup walked the tree from scratch.
+    /// Spikes here indicate writer/reader contention.
+    pub bm_optimistic_restarts: u64,
     /// Background checkpointer telemetry, or `None` if the bg
     /// thread group isn't running (the default; opt in via
     /// [`crate::CheckpointConfig::enabled`]).

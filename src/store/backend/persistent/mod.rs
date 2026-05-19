@@ -301,15 +301,11 @@ impl Manifest {
         let mut hdr = [0u8; 24];
         f.read_exact(&mut hdr)?;
         if hdr[..8] != MANIFEST_MAGIC {
-            return Err(Error::NodeCorrupt {
-                context: "PersistentBackend::Manifest::magic",
-            });
+            return Err(Error::node_corrupt("PersistentBackend::Manifest::magic"));
         }
         let version = u16::from_le_bytes([hdr[8], hdr[9]]);
         if version != MANIFEST_VERSION {
-            return Err(Error::NodeCorrupt {
-                context: "PersistentBackend::Manifest::version",
-            });
+            return Err(Error::node_corrupt("PersistentBackend::Manifest::version"));
         }
         let count = u32::from_le_bytes([hdr[10], hdr[11], hdr[12], hdr[13]]) as usize;
         // hdr[14..16] reserved (zero).

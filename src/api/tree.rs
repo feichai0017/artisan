@@ -593,6 +593,16 @@ impl Tree {
         RangeBuilder::new(Arc::clone(&self.backend), self.root_guid)
     }
 
+    /// Shorthand for `tree.range().prefix(p)` — the
+    /// common-90%-of-queries case.
+    ///
+    /// Returns a [`RangeBuilder`] already anchored to `prefix`;
+    /// chain additional filters (`start_after`, `delimiter`)
+    /// before iterating.
+    pub fn scan_prefix(&self, prefix: &[u8]) -> RangeBuilder {
+        self.range().prefix(prefix)
+    }
+
     /// Drain the BM dirty map and synchronously push each entry
     /// to the inner backend via `write_through` (CAS-on-seq).
     ///
@@ -896,6 +906,9 @@ impl Tree {
         }
         let bm_dirty_count = self.backend.dirty_count();
         let bm_pending_delete_count = self.backend.pending_delete_count();
+        let bm_cache_hits = self.backend.cache_hits();
+        let bm_cache_misses = self.backend.cache_misses();
+        let bm_optimistic_restarts = self.backend.optimistic_restarts();
         let checkpointer = self.checkpointer.as_ref().map(|ck| CheckpointerStats {
             rounds_attempted: ck.rounds_attempted(),
             rounds_succeeded: ck.rounds_succeeded(),
@@ -914,6 +927,9 @@ impl Tree {
             blobs,
             bm_dirty_count,
             bm_pending_delete_count,
+            bm_cache_hits,
+            bm_cache_misses,
+            bm_optimistic_restarts,
             checkpointer,
         })
     }

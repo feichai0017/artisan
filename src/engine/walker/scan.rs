@@ -52,9 +52,7 @@ pub fn collect_blob_guids(bm: &BufferManager, root_guid: BlobGuid) -> Result<Vec
 fn scan_subtree(frame: BlobFrameRef<'_>, slot: u16, out: &mut Vec<BlobGuid>) -> Result<()> {
     let (ntype, body) = resolve_typed(frame, slot)?;
     match ntype {
-        NodeType::Invalid => Err(Error::NodeCorrupt {
-            context: "walker::scan::scan_subtree: hit NodeType::Invalid",
-        }),
+        NodeType::Invalid => Err(Error::node_corrupt("walker::scan::scan_subtree: hit NodeType::Invalid")),
         NodeType::EmptyRoot | NodeType::Leaf => Ok(()),
         NodeType::Prefix => {
             let p = cast::<Prefix>(body);
@@ -85,9 +83,7 @@ fn scan_subtree(frame: BlobFrameRef<'_>, slot: u16, out: &mut Vec<BlobGuid>) -> 
                 }
                 let ci = idx as usize - 1;
                 if ci >= 48 {
-                    return Err(Error::NodeCorrupt {
-                        context: "walker::scan::scan_subtree: Node48 index out of range",
-                    });
+                    return Err(Error::node_corrupt("walker::scan::scan_subtree: Node48 index out of range"));
                 }
                 scan_subtree(frame, n.children[ci] as u16, out)?;
             }
@@ -106,9 +102,7 @@ fn scan_subtree(frame: BlobFrameRef<'_>, slot: u16, out: &mut Vec<BlobGuid>) -> 
             let b = cast::<BlobNode>(body);
             let plen = b.prefix_len as usize;
             if plen > BLOB_MAX_INLINE {
-                return Err(Error::NodeCorrupt {
-                    context: "walker::scan::scan_subtree: BlobNode prefix_len exceeds inline",
-                });
+                return Err(Error::node_corrupt("walker::scan::scan_subtree: BlobNode prefix_len exceeds inline"));
             }
             out.push(b.child_blob_guid);
             Ok(())
@@ -159,9 +153,7 @@ pub fn refresh_blob_node_pointers(bm: &BufferManager, root_guid: BlobGuid) -> Re
             let mut guard = parent_pin.write();
             let mut frame = BlobFrame::wrap(guard.as_mut_slice());
             for (bn_slot, new_child_entry) in want {
-                let body = frame.body_of_slot(bn_slot).ok_or(Error::NodeCorrupt {
-                    context: "refresh_blob_node_pointers: body resolution failed",
-                })?;
+                let body = frame.body_of_slot(bn_slot).ok_or(Error::node_corrupt("refresh_blob_node_pointers: body resolution failed"))?;
                 let mut bn = *cast::<BlobNode>(body);
                 if bn.child_entry_ptr != new_child_entry {
                     bn.child_entry_ptr = new_child_entry;
@@ -188,9 +180,7 @@ fn collect_blob_nodes_with_slot(
 ) -> Result<()> {
     let (ntype, body) = resolve_typed(frame, slot)?;
     match ntype {
-        NodeType::Invalid => Err(Error::NodeCorrupt {
-            context: "collect_blob_nodes_with_slot: hit NodeType::Invalid",
-        }),
+        NodeType::Invalid => Err(Error::node_corrupt("collect_blob_nodes_with_slot: hit NodeType::Invalid")),
         NodeType::EmptyRoot | NodeType::Leaf => Ok(()),
         NodeType::Prefix => {
             let p = cast::<Prefix>(body);
@@ -221,9 +211,7 @@ fn collect_blob_nodes_with_slot(
                 }
                 let ci = idx as usize - 1;
                 if ci >= 48 {
-                    return Err(Error::NodeCorrupt {
-                        context: "collect_blob_nodes_with_slot: Node48 index out of range",
-                    });
+                    return Err(Error::node_corrupt("collect_blob_nodes_with_slot: Node48 index out of range"));
                 }
                 collect_blob_nodes_with_slot(frame, n.children[ci] as u16, out)?;
             }
@@ -242,9 +230,7 @@ fn collect_blob_nodes_with_slot(
             let b = cast::<BlobNode>(body);
             let plen = b.prefix_len as usize;
             if plen > BLOB_MAX_INLINE {
-                return Err(Error::NodeCorrupt {
-                    context: "collect_blob_nodes_with_slot: BlobNode prefix_len exceeds inline",
-                });
+                return Err(Error::node_corrupt("collect_blob_nodes_with_slot: BlobNode prefix_len exceeds inline"));
             }
             out.push((slot, b.child_blob_guid));
             Ok(())

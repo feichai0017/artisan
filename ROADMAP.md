@@ -377,11 +377,14 @@ by `~leaves_per_rollup` once fast-forward lands.
       round and Tree shutdown doesn't lose dirty cache state.
       `idle_interval` default is 100 ms, tuned via
       `tests/bench_checkpoint_sweep.rs`.
-- [ ] **Free-list retry/backoff subsystem** — under heap
-      exhaustion, the per-NodeType LIFO chains today fail-fast.
-      The original ancestor has a backoff path
-      (`free_list is {} sleep 10ms retry={}`); adding it would
-      buy resilience under stress.
+- [~] **Free-list retry/backoff subsystem** — partial. Cache-
+      overflow eviction (`insert_into_cache`) now retries with
+      `thread::yield_now()` when every cache entry is pinned, so
+      transient pin pressure no longer overflows the cache
+      immediately. The per-NodeType in-blob alloc path still
+      fail-fasts on `OutOfSpace` — meaningful retry there needs
+      cross-thread coordination that the single-writer-per-blob
+      model doesn't expose.
 - [x] **Adaptive buffer-pool eviction** — both paths (inline
       overflow + bg sweep) are driven by the same
       `clock_tick` / `last_touched` tick mechanism. Inline
@@ -401,31 +404,33 @@ by `~leaves_per_rollup` once fast-forward lands.
       `spillover`, `merge_blob`, `compact_blob`, WAL truncate,
       checkpoint round summary, and eviction sweeps. Cost-free
       when the feature is off (cfg-gated).
-- [~] **Extended `Tree::stats`** — partial. `TreeStats` now
-      carries `bm_dirty_count` + an `Option<CheckpointerStats>`
-      with the 6 bg counters (rounds_attempted /
-      rounds_succeeded / blobs_flushed / merges_total /
-      truncates / evictions). Free-list health, cache hit rate,
-      and latch contention counters are still TODO.
+- [~] **Extended `Tree::stats`** — mostly done. `TreeStats` now
+      carries `bm_dirty_count`, `bm_pending_delete_count`,
+      `bm_cache_hits`, `bm_cache_misses`, `bm_optimistic_restarts`,
+      and an `Option<CheckpointerStats>` with the 6 background
+      counters. Latch-contention and per-NodeType free-list
+      health counters are still TODO.
 
 ### Ergonomics + diagnostics
 
-- [ ] **Richer `Error::NodeCorrupt`** — currently carries only a
-      `&'static str` context; add `blob_guid` + `slot` so a
-      caller's bug-report has actionable detail without us
-      needing to instrument.
-- [ ] **`Tree::scan_prefix(p)` shorthand** for the common
-      `tree.range().prefix(p)` case — cosmetic but tightens the
-      90% query.
-- [ ] **Property tests for `txn` + `range` semantics** — extend
-      `tests/properties.rs`'s `HashMap` oracle to cover batch
-      transactions and range queries.
+- [x] **Richer `Error::NodeCorrupt`** — `Error::NodeCorrupt` now
+      carries optional `blob_guid` + `slot` fields. Construct via
+      `Error::node_corrupt(ctx)` and enrich via
+      `.with_blob_guid(g)` / `.with_slot(s)`; the buffer manager
+      and walker cross-blob arms attach the GUID automatically.
+- [x] **`Tree::scan_prefix(p)` shorthand** — one-line wrapper
+      delegating to `tree.range().prefix(p)`.
+- [x] **Property tests for `txn` + `range` semantics** —
+      `tests/properties.rs` now covers batch transactions, full
+      `range()` enumeration, and `scan_prefix(p)`, each
+      cross-checked against a `BTreeMap` oracle. Caught the
+      tombstone-leaf range-iteration bug that's also fixed.
 
 ### Polish
 
-- [ ] **`cargo deny check` in CI** — wire `deny.toml` into the
-      `.github/workflows/ci.yml` matrix so license drift /
-      RustSec advisories fail the build.
+- [x] **`cargo deny check` in CI** — the `deny` job runs
+      `cargo deny check --all-features --locked` via the
+      `EmbarkStudios/cargo-deny-action` GitHub action.
 - [ ] **PGO build profile docs** — measure + document the
       `cargo pgo` gain on `objstore_get` / `*_list`. Probably
       worth 10-15 % on hot paths.

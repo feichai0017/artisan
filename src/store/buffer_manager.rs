@@ -187,6 +187,12 @@ pub struct BufferManager {
     /// Uses `Relaxed` ordering throughout — strict happens-before
     /// isn't required, only "more recent stamps look more recent".
     clock: AtomicU64,
+    /// Telemetry counters — incremented on the hot path, read by
+    /// [`crate::Tree::stats`] for observability. All `Relaxed`;
+    /// they're approximate metrics, not synchronisation aids.
+    cache_hits: AtomicU64,
+    cache_misses: AtomicU64,
+    optimistic_restarts: AtomicU64,
 }
 
 /// A single cached blob. Callers obtain one via
@@ -353,6 +359,9 @@ impl BufferManager {
             dirty: Mutex::new(HashMap::new()),
             pending_deletes: Mutex::new(HashMap::new()),
             clock: AtomicU64::new(1),
+            cache_hits: AtomicU64::new(0),
+            cache_misses: AtomicU64::new(0),
+            optimistic_restarts: AtomicU64::new(0),
         }
     }
 
@@ -411,6 +420,36 @@ impl BufferManager {
         self.cache.len()
     }
 
+    /// Cumulative cache lookup hits (`get_cached` found the entry
+    /// without consulting the inner backend). Relaxed-ordered;
+    /// reads are observability-only.
+    #[must_use]
+    pub fn cache_hits(&self) -> u64 {
+        self.cache_hits.load(Ordering::Relaxed)
+    }
+
+    /// Cumulative cache lookup misses — every miss is followed by
+    /// an `inner_backend.read_blob` and an `insert_into_cache`.
+    #[must_use]
+    pub fn cache_misses(&self) -> u64 {
+        self.cache_misses.load(Ordering::Relaxed)
+    }
+
+    /// Cumulative optimistic-read restarts. Bumped by the lookup
+    /// walker every time a `validate()` after a wait-free read
+    /// returns `false` — a concurrent writer lapped the snapshot
+    /// and the walk has to restart from the root.
+    #[must_use]
+    pub fn optimistic_restarts(&self) -> u64 {
+        self.optimistic_restarts.load(Ordering::Relaxed)
+    }
+
+    /// Bump the optimistic-restart counter. Called from the
+    /// lookup walker on `validate()` failure.
+    pub(crate) fn note_optimistic_restart(&self) {
+        self.optimistic_restarts.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Drop every cached entry. The inner backend is untouched.
     /// Useful for tests and to release memory under pressure.
     pub fn clear(&self) {
@@ -421,9 +460,13 @@ impl BufferManager {
 
     /// Internal: look up `guid` in the cache. On a hit, stamps
     /// the entry's `last_touched` with the current clock tick so
-    /// the eviction thread treats this hit as fresh.
+    /// the eviction thread treats this hit as fresh. Bumps the
+    /// `cache_hits` / `cache_misses` telemetry counter accordingly.
     fn get_cached(&self, guid: BlobGuid) -> Option<Arc<CachedBlob>> {
-        let entry = self.cache.get(&guid)?;
+        let Some(entry) = self.cache.get(&guid) else {
+            self.cache_misses.fetch_add(1, Ordering::Relaxed);
+            return None;
+        };
         let arc = Arc::clone(entry.value());
         // Drop the shard read guard before touching the atomic —
         // not strictly required (the atomic is independent) but
@@ -431,6 +474,7 @@ impl BufferManager {
         drop(entry);
         let tick = self.clock.fetch_add(1, Ordering::Relaxed);
         arc.last_touched.store(tick, Ordering::Relaxed);
+        self.cache_hits.fetch_add(1, Ordering::Relaxed);
         Some(arc)
     }
 
@@ -454,14 +498,35 @@ impl BufferManager {
         // Inline overflow eviction. With the background eviction
         // thread running, capacity overflow is a rare burst
         // event — the bg sweep keeps it well below capacity in
-        // steady state. The loop bounds itself by the number of
-        // entries we walk (so it always terminates).
-        let mut spins = self.cache.len();
-        while self.cache.len() > self.capacity && spins > 0 {
-            if !self.try_evict_lru() {
+        // steady state.
+        //
+        // The retry-with-yield loop tolerates the transient case
+        // where every cache entry is currently pinned (every
+        // `Arc::strong_count > 1`). Yielding gives concurrent
+        // readers / writers a chance to drop their pins so the
+        // next `try_evict_lru` finds a victim. If after the
+        // retry budget the cache still can't shrink, we let it
+        // exceed capacity rather than failing the load — the
+        // background sweep will catch up. `RETRY_BUDGET` is a
+        // small constant (8) so we don't spin for long under
+        // pathological pin pressure.
+        const RETRY_BUDGET: u32 = 8;
+        let mut retries_left = RETRY_BUDGET;
+        let mut entry_spins = self.cache.len();
+        while self.cache.len() > self.capacity {
+            if self.try_evict_lru() {
+                // Made progress — refresh the per-entry budget
+                // (we only want to bound the total work, not
+                // give up after one stuck victim).
+                entry_spins = self.cache.len();
+                continue;
+            }
+            if retries_left == 0 || entry_spins == 0 {
                 break;
             }
-            spins -= 1;
+            std::thread::yield_now();
+            retries_left -= 1;
+            entry_spins = entry_spins.saturating_sub(1);
         }
     }
 

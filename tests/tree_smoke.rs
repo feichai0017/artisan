@@ -1261,3 +1261,40 @@ fn range_delim_fast_forward_yields_every_distinct_common_prefix() {
         .collect();
     assert_eq!(rollups, expected, "rollups must come back in lex order");
 }
+
+#[test]
+fn range_skips_tombstoned_leaves() {
+    // Regression for a range-iter bug uncovered by the
+    // `range_iteration_matches_oracle` property test:
+    // `erase` soft-deletes leaves by flipping the `tombstone`
+    // byte; the leaf body + extent stay allocated until
+    // `compact_blob` rebuilds the blob. Range iteration walks
+    // every reachable leaf — without a `leaf.tombstone == 0`
+    // check it would emit the soft-deleted leaves and surface
+    // phantom keys that `Tree::get` correctly says don't exist.
+    //
+    // The strict-prefix shape (`k` ⊂ `kk`) is the trigger: the
+    // ART rewires the prefix chain on rename + insert and the
+    // old `kk` leaf survives in the slot table tombstoned.
+    let tree = Tree::open(TreeConfig::memory()).unwrap();
+    tree.put(b"kk", b"B").unwrap();
+    tree.rename(b"kk", b"k", false).unwrap();
+    // `get` already agreed kk was gone — this exercises the
+    // range iter specifically.
+    assert!(tree.get(b"kk").unwrap().is_none());
+    let actual = collect_keys(tree.range());
+    assert_eq!(
+        actual,
+        vec![b"k".to_vec()],
+        "range must skip tombstoned leaves; got {actual:?}",
+    );
+
+    // Same shape via explicit delete + reinsert.
+    let tree = Tree::open(TreeConfig::memory()).unwrap();
+    tree.put(b"foo", b"1").unwrap();
+    tree.put(b"foobar", b"2").unwrap();
+    tree.delete(b"foobar").unwrap();
+    tree.put(b"foo", b"3").unwrap();
+    let actual = collect_keys(tree.range());
+    assert_eq!(actual, vec![b"foo".to_vec()]);
+}

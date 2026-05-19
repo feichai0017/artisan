@@ -79,6 +79,7 @@ pub fn lookup_multi(
             // Validate AFTER consuming any borrowed data from the
             // frame so a torn read can't escape past this point.
             if !guard.validate() {
+                bm.note_optimistic_restart();
                 continue 'restart;
             }
             match result {
@@ -103,6 +104,7 @@ pub fn lookup_multi(
             let frame = BlobFrameRef::wrap(guard.as_slice());
             let result = lookup_at(frame, start_slot, key, depth);
             if !guard.validate() {
+                bm.note_optimistic_restart();
                 continue 'restart;
             }
             match result {
@@ -129,9 +131,7 @@ fn descend<'a>(
 ) -> Result<LookupResult<'a>> {
     let (ntype, body) = resolve_typed(frame, slot)?;
     match ntype {
-        NodeType::Invalid => Err(Error::NodeCorrupt {
-            context: "walker::descend: hit NodeType::Invalid",
-        }),
+        NodeType::Invalid => Err(Error::node_corrupt("walker::descend: hit NodeType::Invalid")),
         NodeType::EmptyRoot => Ok(LookupResult::NotFound),
         NodeType::Leaf => leaf_check(frame, body, key, depth),
         NodeType::Prefix => prefix_descend(frame, body, key, depth),
@@ -147,9 +147,7 @@ fn blob_descend<'a>(body: &[u8], key: &[u8], depth: usize) -> Result<LookupResul
     let b = cast::<BlobNode>(body);
     let plen = b.prefix_len as usize;
     if plen > BLOB_MAX_INLINE {
-        return Err(Error::NodeCorrupt {
-            context: "walker::blob_descend: prefix_len exceeds inline buffer",
-        });
+        return Err(Error::node_corrupt("walker::blob_descend: prefix_len exceeds inline buffer"));
     }
     if depth + plen > key.len() {
         return Ok(LookupResult::NotFound);
@@ -190,9 +188,7 @@ fn prefix_descend<'a>(
     let p = cast::<Prefix>(body);
     let plen = p.prefix_len as usize;
     if plen > p.bytes.len() {
-        return Err(Error::NodeCorrupt {
-            context: "walker::prefix_descend: prefix_len exceeds inline buffer",
-        });
+        return Err(Error::node_corrupt("walker::prefix_descend: prefix_len exceeds inline buffer"));
     }
     if depth + plen > key.len() {
         return Ok(LookupResult::NotFound);
@@ -259,9 +255,7 @@ fn node48_descend<'a>(
     }
     let ci = idx as usize - 1;
     if ci >= 48 {
-        return Err(Error::NodeCorrupt {
-            context: "walker::node48_descend: child index out of range",
-        });
+        return Err(Error::node_corrupt("walker::node48_descend: child index out of range"));
     }
     descend(frame, n.children[ci] as u16, key, depth + 1)
 }

@@ -1,5 +1,6 @@
 //! Top-level error type.
 
+use crate::layout::BlobGuid;
 use crate::store::{AllocError, FreeError};
 
 /// Result alias used throughout the crate.
@@ -36,9 +37,24 @@ pub enum Error {
     NotYetImplemented(&'static str),
     /// A blob's slot table or header is corrupt — recovery
     /// should bail out rather than silently misbehave.
+    ///
+    /// Construct via [`Error::node_corrupt`] and optionally
+    /// enrich with [`Error::with_blob_guid`] / [`Error::with_slot`]
+    /// when the surrounding code path knows the affected blob
+    /// or slot. The buffer manager and walker entry points
+    /// automatically attach blob context where they have it.
     NodeCorrupt {
-        /// Where the corruption was detected.
+        /// Static description of where the corruption was detected.
         context: &'static str,
+        /// GUID of the blob that exposed the corruption, when
+        /// the propagating code path knows it. `None` for low-
+        /// level helpers that don't have blob context (e.g. raw
+        /// `BlobFrame::wrap` on a stack buffer).
+        blob_guid: Option<BlobGuid>,
+        /// Slot inside `blob_guid` that exposed the corruption,
+        /// when applicable. `None` for header / body-level
+        /// problems.
+        slot: Option<u16>,
     },
     /// WAL replay encountered a TxnOp whose `sanity_info`
     /// validation failed — record magic mismatch, CRC32 mismatch,
@@ -61,6 +77,48 @@ pub enum Error {
     DstExists,
 }
 
+impl Error {
+    /// Construct a [`Error::NodeCorrupt`] with the given static
+    /// context but no blob / slot metadata. Layers higher in the
+    /// stack (buffer manager, walker entry points) typically
+    /// enrich the error via [`Self::with_blob_guid`] /
+    /// [`Self::with_slot`] before it surfaces to the caller.
+    #[must_use]
+    pub const fn node_corrupt(context: &'static str) -> Self {
+        Self::NodeCorrupt {
+            context,
+            blob_guid: None,
+            slot: None,
+        }
+    }
+
+    /// Attach a `blob_guid` to a [`Self::NodeCorrupt`] error
+    /// without overwriting one set by a deeper layer. No-op for
+    /// other variants — safe to chain unconditionally on any
+    /// `Error` value.
+    #[must_use]
+    pub fn with_blob_guid(mut self, guid: BlobGuid) -> Self {
+        if let Self::NodeCorrupt { blob_guid, .. } = &mut self {
+            if blob_guid.is_none() {
+                *blob_guid = Some(guid);
+            }
+        }
+        self
+    }
+
+    /// Attach a `slot` index to a [`Self::NodeCorrupt`] error
+    /// without overwriting one set by a deeper layer.
+    #[must_use]
+    pub fn with_slot(mut self, slot_index: u16) -> Self {
+        if let Self::NodeCorrupt { slot, .. } = &mut self {
+            if slot.is_none() {
+                *slot = Some(slot_index);
+            }
+        }
+        self
+    }
+}
+
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -72,7 +130,22 @@ impl std::fmt::Display for Error {
                 write!(f, "value too long ({len} bytes; max {})", u16::MAX)
             }
             Self::NotYetImplemented(where_) => write!(f, "not yet implemented: {where_}"),
-            Self::NodeCorrupt { context } => write!(f, "node corrupt at {context}"),
+            Self::NodeCorrupt {
+                context,
+                blob_guid,
+                slot,
+            } => {
+                write!(f, "node corrupt at {context}")?;
+                if let Some(g) = blob_guid {
+                    // First 4 bytes is enough to disambiguate in
+                    // logs without dumping the full 16-byte tag.
+                    write!(f, " (blob={:02x?})", &g[..4])?;
+                }
+                if let Some(s) = slot {
+                    write!(f, " (slot={s})")?;
+                }
+                Ok(())
+            }
             Self::ReplaySanityFailed {
                 context,
                 record_offset,
