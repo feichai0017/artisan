@@ -323,12 +323,26 @@ Required for the v0.1 tag:
 
 ## Not on the roadmap
 
-The library deliberately stays single-node. Things outside scope:
+The library is **a metadata engine**, period. Single-node, embed-in-
+your-process, Unix-only. Out of scope:
 
 - **Windows support**: holt is Unix-only by design — the persistent
   backend rides `O_DIRECT` on Linux and `F_NOCACHE` on macOS, and
   there is no Windows analog this project wants to maintain. The
   crate `compile_error!`s on Windows targets.
+- **Object-storage frontend / S3 layer**: the upstream that
+  inspired holt's algorithm core wrapped its ART in an S3-style
+  RPC server (PUT/GET/LIST inode handlers, multi-tenant bucket
+  registry, RPC worker pool, distributed checkpointer with a BSS
+  client). holt does **not** reproduce any of that. The
+  alignment-with-upstream effort is bounded to the **metadata
+  engine** (ART core, blob layout, WAL, latching, range iterator).
+  TxnOp variants holt journals (`NewTree`, `RmTree`,
+  `RenameObject`, `Rename`, `MemMarker`) carry the same wire
+  shape as the upstream so a future RPC layer could re-use the
+  format, but holt itself ships no multi-root registry, no
+  bucket namespace, no RPC dispatcher, no `SplitMemOp` /
+  `MergeMemOp` post-replay-ack reconciliation twins.
 - **Replication / consensus**: build it above this. We expose hooks
   (change feed, snapshot transfer) but don't implement Raft.
 - **Network server**: this is a library. Wrap it in your gRPC /

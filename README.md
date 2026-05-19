@@ -116,10 +116,13 @@ contract.
 
 ## Not on the roadmap
 
-holt is single-node + Unix-only by design. Out of scope:
+holt is **just the metadata engine** — single-node, embed-in-
+your-process, Unix-only. Out of scope:
 
 - **Windows** — `compile_error!`s the crate (Unix `O_DIRECT` /
   `F_NOCACHE` has no Windows analog worth carrying).
+- **Object-storage frontend / S3 layer** — no RPC server, no
+  multi-tenant bucket registry, no distributed checkpointer.
 - **SQL / vector / full-text** — combine with a domain-appropriate
   engine (`+ FAISS` for vectors, `+ Tantivy` for full-text).
 - **Replication / consensus** — build above; we'll expose hooks
