@@ -78,11 +78,7 @@ impl Backend for FailpointBackend {
     fn read_blob(&self, guid: holt::BlobGuid, dst: &mut AlignedBlobBuf) -> holt::Result<()> {
         self.inner.read_blob(guid, dst)
     }
-    fn write_blob(
-        &self,
-        guid: holt::BlobGuid,
-        src: &AlignedBlobBuf,
-    ) -> holt::Result<()> {
+    fn write_blob(&self, guid: holt::BlobGuid, src: &AlignedBlobBuf) -> holt::Result<()> {
         let n = self.write_calls.fetch_add(1, Ordering::SeqCst) + 1;
         let armed = self.fail_write_at.load(Ordering::SeqCst);
         if n == armed {
@@ -269,7 +265,10 @@ fn dirty_write_failure_is_retried_next_round() {
 
     // First checkpoint: the next write_blob fails.
     let r1 = tree.checkpoint();
-    assert!(r1.is_err(), "first checkpoint should surface failpoint write error");
+    assert!(
+        r1.is_err(),
+        "first checkpoint should surface failpoint write error"
+    );
 
     // Tree internal dirty set should still have the entry so
     // the next checkpoint retries.
@@ -283,10 +282,7 @@ fn dirty_write_failure_is_retried_next_round() {
     assert_eq!(tree.stats().unwrap().bm_dirty_count, 0);
 
     // Verify the value is durable.
-    assert_eq!(
-        tree.get(b"k1").unwrap().as_deref(),
-        Some(&b"v1"[..]),
-    );
+    assert_eq!(tree.get(b"k1").unwrap().as_deref(), Some(&b"v1"[..]),);
 }
 
 #[test]

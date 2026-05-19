@@ -708,12 +708,8 @@ fn bench_scale_get_workload(
             |b, &kc| {
                 b.iter(|| {
                     let (k, _) = &pairs[(rng.next_u32() as usize) % kc];
-                    let mut stmt = conn
-                        .prepare_cached("SELECT v FROM kv WHERE k = ?")
-                        .unwrap();
-                    let _: Vec<u8> = stmt
-                        .query_row(params![k.as_slice()], |r| r.get(0))
-                        .unwrap();
+                    let mut stmt = conn.prepare_cached("SELECT v FROM kv WHERE k = ?").unwrap();
+                    let _: Vec<u8> = stmt.query_row(params![k.as_slice()], |r| r.get(0)).unwrap();
                     black_box(());
                 });
             },

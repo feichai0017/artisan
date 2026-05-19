@@ -184,7 +184,8 @@ pub(super) fn run_round(shared: &Arc<Shared>) -> Result<()> {
             }
             shared.bm.restore_dirty(failed);
             shared.bm.restore_pending_deletes(pending);
-            return Err(Error::Internal("checkpoint: I/O worker channel closed mid-round",
+            return Err(Error::Internal(
+                "checkpoint: I/O worker channel closed mid-round",
             ));
         }
         completions.push((*guid, *txn_id, rx));
@@ -227,7 +228,8 @@ pub(super) fn run_round(shared: &Arc<Shared>) -> Result<()> {
         .is_err()
     {
         shared.bm.restore_pending_deletes(pending);
-        return Err(Error::Internal("checkpoint: I/O worker channel closed before Sync",
+        return Err(Error::Internal(
+            "checkpoint: I/O worker channel closed before Sync",
         ));
     }
     match sync_rx.recv() {
@@ -239,7 +241,8 @@ pub(super) fn run_round(shared: &Arc<Shared>) -> Result<()> {
         }
         Err(_) => {
             shared.bm.restore_pending_deletes(pending);
-            return Err(Error::Internal("checkpoint: I/O worker dropped Sync completion",
+            return Err(Error::Internal(
+                "checkpoint: I/O worker dropped Sync completion",
             ));
         }
     }
@@ -254,7 +257,9 @@ pub(super) fn run_round(shared: &Arc<Shared>) -> Result<()> {
     //      write and only then processes its child's deletion.
     if had_dirty_failure {
         shared.bm.restore_pending_deletes(pending);
-        return Err(Error::Internal("checkpoint: dirty write failed — pending deletes deferred to next round"));
+        return Err(Error::Internal(
+            "checkpoint: dirty write failed — pending deletes deferred to next round",
+        ));
     }
 
     // 6. Apply pending deletes — `pending` was already drained in
@@ -307,7 +312,8 @@ pub(super) fn run_round(shared: &Arc<Shared>) -> Result<()> {
             .is_err()
         {
             shared.bm.restore_pending_deletes(restore_applied());
-            return Err(Error::Internal("checkpoint: I/O worker channel closed before Sync (deletes)",
+            return Err(Error::Internal(
+                "checkpoint: I/O worker channel closed before Sync (deletes)",
             ));
         }
         match sync_rx2.recv() {
@@ -319,7 +325,8 @@ pub(super) fn run_round(shared: &Arc<Shared>) -> Result<()> {
             }
             Err(_) => {
                 shared.bm.restore_pending_deletes(restore_applied());
-                return Err(Error::Internal("checkpoint: I/O worker dropped Sync (deletes) completion",
+                return Err(Error::Internal(
+                    "checkpoint: I/O worker dropped Sync (deletes) completion",
                 ));
             }
         }

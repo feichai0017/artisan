@@ -131,15 +131,36 @@ fn put_latency_under_bg_checkpoint_and_compact_interference() {
     println!("│ put latency under bg checkpoint + compact contention │");
     println!("├─────────────────────────────────────────────────────┤");
     println!("│ writers          : {N_WRITERS:>30} │");
-    println!("│ workload         : {:>30} │", format!("{WORKLOAD_SECS} s"));
+    println!(
+        "│ workload         : {:>30} │",
+        format!("{WORKLOAD_SECS} s")
+    );
     println!("│ ops              : {n:>30} │");
     println!("│ throughput       : {:>27.0} ops/s │", throughput);
-    println!("│ mean             : {:>27.2} µs │", merged.mean() / 1_000.0);
-    println!("│ p50              : {:>27.2} µs │", merged.value_at_quantile(0.50) as f64 / 1_000.0);
-    println!("│ p95              : {:>27.2} µs │", merged.value_at_quantile(0.95) as f64 / 1_000.0);
-    println!("│ p99              : {:>27.2} µs │", merged.value_at_quantile(0.99) as f64 / 1_000.0);
-    println!("│ p99.9            : {:>27.2} µs │", merged.value_at_quantile(0.999) as f64 / 1_000.0);
-    println!("│ max              : {:>27.2} µs │", merged.max() as f64 / 1_000.0);
+    println!(
+        "│ mean             : {:>27.2} µs │",
+        merged.mean() / 1_000.0
+    );
+    println!(
+        "│ p50              : {:>27.2} µs │",
+        merged.value_at_quantile(0.50) as f64 / 1_000.0
+    );
+    println!(
+        "│ p95              : {:>27.2} µs │",
+        merged.value_at_quantile(0.95) as f64 / 1_000.0
+    );
+    println!(
+        "│ p99              : {:>27.2} µs │",
+        merged.value_at_quantile(0.99) as f64 / 1_000.0
+    );
+    println!(
+        "│ p99.9            : {:>27.2} µs │",
+        merged.value_at_quantile(0.999) as f64 / 1_000.0
+    );
+    println!(
+        "│ max              : {:>27.2} µs │",
+        merged.max() as f64 / 1_000.0
+    );
     println!("└─────────────────────────────────────────────────────┘\n");
 
     // Smoke-level assertion: bg checkpoint + compact running

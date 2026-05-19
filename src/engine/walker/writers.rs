@@ -16,7 +16,9 @@ use crate::store::BlobFrame;
 use super::readers::{read_node16, read_node256, read_node4, read_node48, read_prefix};
 
 pub(super) fn write_struct_to_slot<T>(frame: &mut BlobFrame<'_>, slot: u16, v: &T) -> Result<()> {
-    let body = frame.body_of_slot_mut(slot).ok_or(Error::node_corrupt("write_struct_to_slot: body"))?;
+    let body = frame
+        .body_of_slot_mut(slot)
+        .ok_or(Error::node_corrupt("write_struct_to_slot: body"))?;
     debug_assert_eq!(body.len(), size_of::<T>());
     // SAFETY: layout types are #[repr(C)] POD; body sized and
     // aligned per BlobFrame invariants.
@@ -171,7 +173,9 @@ pub(super) fn inner_update_child(
                     return write_struct_to_slot(frame, slot, &n);
                 }
             }
-            Err(Error::node_corrupt("inner_update_child: byte not found in Node4"))
+            Err(Error::node_corrupt(
+                "inner_update_child: byte not found in Node4",
+            ))
         }
         NodeType::Node16 => {
             let mut n = read_node16(frame.as_ref(), slot)?;
@@ -182,13 +186,17 @@ pub(super) fn inner_update_child(
                     return write_struct_to_slot(frame, slot, &n);
                 }
             }
-            Err(Error::node_corrupt("inner_update_child: byte not found in Node16"))
+            Err(Error::node_corrupt(
+                "inner_update_child: byte not found in Node16",
+            ))
         }
         NodeType::Node48 => {
             let mut n = read_node48(frame.as_ref(), slot)?;
             let idx = n.index[byte as usize];
             if idx == 0 {
-                return Err(Error::node_corrupt("inner_update_child: byte not found in Node48"));
+                return Err(Error::node_corrupt(
+                    "inner_update_child: byte not found in Node48",
+                ));
             }
             n.children[idx as usize - 1] = new_child;
             write_struct_to_slot(frame, slot, &n)
@@ -252,7 +260,9 @@ pub(super) fn inner_add_child(
         NodeType::Node256 => {
             let mut n = read_node256(frame.as_ref(), slot)?;
             if n.children[byte as usize] != 0 {
-                return Err(Error::node_corrupt("inner_add_child: byte already present on Node256"));
+                return Err(Error::node_corrupt(
+                    "inner_add_child: byte already present on Node256",
+                ));
             }
             n.children[byte as usize] = new_child;
             // Node256 capacity is 256 but `count` is u8 (max 255).
@@ -321,7 +331,9 @@ fn node48_insert(n: &mut Node48, byte: u8, child: u32) -> Result<()> {
             return Ok(());
         }
     }
-    Err(Error::node_corrupt("node48_insert: no free children[] slot despite count < 48"))
+    Err(Error::node_corrupt(
+        "node48_insert: no free children[] slot despite count < 48",
+    ))
 }
 
 // ---------- node growth ----------

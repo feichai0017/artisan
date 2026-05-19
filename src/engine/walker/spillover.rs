@@ -113,7 +113,9 @@ pub(super) fn spillover_blob(
 /// spillover heuristic to pick the largest migration candidate.
 pub(super) fn count_subtree_nodes(frame: &BlobFrame<'_>, root: u16) -> Result<u32> {
     let ntype = ntype_of(frame.as_ref(), root)?;
-    let body = frame.body_of_slot(root).ok_or(Error::node_corrupt("count_subtree_nodes: body resolution failed"))?;
+    let body = frame.body_of_slot(root).ok_or(Error::node_corrupt(
+        "count_subtree_nodes: body resolution failed",
+    ))?;
     let mut count: u32 = 1;
     match ntype {
         NodeType::Invalid => {
@@ -275,7 +277,9 @@ fn pick_victim_subtree(frame: &BlobFrame<'_>, start_slot: u16) -> Result<Victim>
                         });
                     }
                     NodeType::Invalid => {
-                        return Err(Error::node_corrupt("pick_victim_subtree: Prefix child Invalid"));
+                        return Err(Error::node_corrupt(
+                            "pick_victim_subtree: Prefix child Invalid",
+                        ));
                     }
                 }
             }

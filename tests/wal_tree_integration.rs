@@ -105,9 +105,7 @@ fn replay_then_checkpoint_then_reopen_preserves_data() {
         // Sanity: WAL replay restored the cached state.
         for i in 0..50u32 {
             assert_eq!(
-                tree.get(format!("k{i:03}").as_bytes())
-                    .unwrap()
-                    .as_deref(),
+                tree.get(format!("k{i:03}").as_bytes()).unwrap().as_deref(),
                 Some(format!("v-{i}").as_bytes()),
             );
         }
@@ -628,7 +626,8 @@ fn spillover_new_blobs_deferred_to_backend_until_checkpoint() {
 
     let final_blobs = inner.list_blobs().unwrap();
     assert_eq!(
-        final_blobs.len() as u32, stats.blob_count,
+        final_blobs.len() as u32,
+        stats.blob_count,
         "after checkpoint, inner backend has every reachable blob",
     );
 
@@ -727,10 +726,7 @@ fn compact_does_not_leak_pre_wal_state_to_backend() {
 
     // Sanity: value still readable through the freshly-flushed
     // backend.
-    assert_eq!(
-        tree.get(b"key").unwrap().as_deref(),
-        Some(&b"value"[..]),
-    );
+    assert_eq!(tree.get(b"key").unwrap().as_deref(), Some(&b"value"[..]),);
 }
 
 #[test]
@@ -1130,8 +1126,8 @@ fn concurrent_writers_and_bg_checkpoint_preserve_acked_ops() {
 
 #[test]
 fn concurrent_writers_and_manual_checkpoints_preserve_acked_ops() {
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
     use std::thread;
     use std::time::Duration;
 

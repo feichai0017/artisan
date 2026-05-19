@@ -144,7 +144,9 @@ pub(super) fn insert_at(
 ) -> Result<InsertReturn> {
     let ntype = ntype_of(frame.as_ref(), slot)?;
     match ntype {
-        NodeType::Invalid => Err(Error::node_corrupt("walker::insert_at: hit NodeType::Invalid")),
+        NodeType::Invalid => Err(Error::node_corrupt(
+            "walker::insert_at: hit NodeType::Invalid",
+        )),
         NodeType::EmptyRoot => insert_into_empty_root(frame, slot, key, value, seq),
         NodeType::Leaf => insert_into_leaf(frame, slot, key, value, depth, seq),
         NodeType::Prefix => insert_into_prefix(bm, frame, slot, key, value, depth, seq),
@@ -202,7 +204,9 @@ fn insert_into_leaf(
         // `Leaf::live` always pins `tombstone = 0` so both write
         // paths naturally clear the bit in the new leaf body.
         let existing_leaf = {
-            let body = frame.body_of_slot(leaf_slot).ok_or(Error::node_corrupt("insert_into_leaf: body resolution failed"))?;
+            let body = frame.body_of_slot(leaf_slot).ok_or(Error::node_corrupt(
+                "insert_into_leaf: body resolution failed",
+            ))?;
             *cast::<Leaf>(body)
         };
         let was_tombstoned = existing_leaf.tombstone != 0;
@@ -222,7 +226,9 @@ fn insert_into_leaf(
             let region =
                 frame
                     .bytes_at_mut(value_offset, value_room)
-                    .ok_or(Error::node_corrupt("insert_into_leaf: extent value range out of bounds"))?;
+                    .ok_or(Error::node_corrupt(
+                        "insert_into_leaf: extent value range out of bounds",
+                    ))?;
             region[..new_value.len()].copy_from_slice(new_value);
             for b in &mut region[new_value.len()..] {
                 *b = 0;
@@ -420,12 +426,16 @@ fn insert_at_blob_node(
     let bn = {
         let body = parent_frame
             .body_of_slot(bn_slot)
-            .ok_or(Error::node_corrupt("insert_at_blob_node: body resolution failed"))?;
+            .ok_or(Error::node_corrupt(
+                "insert_at_blob_node: body resolution failed",
+            ))?;
         *cast::<BlobNode>(body)
     };
     let plen = bn.prefix_len as usize;
     if plen > BLOB_MAX_INLINE {
-        return Err(Error::node_corrupt("insert_at_blob_node: prefix_len exceeds inline buffer"));
+        return Err(Error::node_corrupt(
+            "insert_at_blob_node: prefix_len exceeds inline buffer",
+        ));
     }
     if depth + plen > key.len() || key[depth..depth + plen] != bn.bytes[..plen] {
         return Err(Error::NotYetImplemented(

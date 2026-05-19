@@ -294,13 +294,7 @@ impl Tree {
         // not a safe input to the checkpoint round.
         let outcome = if let Some(wal) = &self.wal {
             let mut w = wal.lock().unwrap();
-            let outcome = engine::insert_multi(
-                &self.backend,
-                &self.root_pin,
-                &padded,
-                value,
-                seq,
-            )?;
+            let outcome = engine::insert_multi(&self.backend, &self.root_pin, &padded, value, seq)?;
             self.backend.mark_dirty(self.root_guid, seq);
             // Fast-path: append the Insert record directly from
             // borrowed refs — skips the `TxnOp::Insert` enum's
@@ -314,13 +308,7 @@ impl Tree {
             // No WAL — no checkpoint round to race with on the
             // wal-lock axis. `memory_flush_on_write` (if set) flushes
             // dirty + pending-delete sets inline before returning.
-            let outcome = engine::insert_multi(
-                &self.backend,
-                &self.root_pin,
-                &padded,
-                value,
-                seq,
-            )?;
+            let outcome = engine::insert_multi(&self.backend, &self.root_pin, &padded, value, seq)?;
             self.backend.mark_dirty(self.root_guid, seq);
             if self.cfg.memory_flush_on_write {
                 self.flush_dirty_inline()?;
@@ -640,8 +628,7 @@ impl Tree {
     /// flush).
     fn flush_dirty_inline(&self) -> Result<()> {
         let snap = self.backend.snapshot_dirty();
-        let mut failed: std::collections::HashMap<BlobGuid, u64> =
-            std::collections::HashMap::new();
+        let mut failed: std::collections::HashMap<BlobGuid, u64> = std::collections::HashMap::new();
         let mut first_err: Option<Error> = None;
         for (guid, expected_seq) in snap {
             // `snapshot_bytes` clones the cached image under a
@@ -684,8 +671,7 @@ impl Tree {
     /// remaining entries stay queued for the next attempt.
     fn flush_pending_deletes_inline(&self) -> Result<()> {
         let pending = self.backend.snapshot_pending_deletes();
-        let mut failed: std::collections::HashMap<BlobGuid, u64> =
-            std::collections::HashMap::new();
+        let mut failed: std::collections::HashMap<BlobGuid, u64> = std::collections::HashMap::new();
         let mut first_err: Option<Error> = None;
         for (guid, seq) in pending {
             if let Err(e) = self.backend.execute_pending_delete(guid) {

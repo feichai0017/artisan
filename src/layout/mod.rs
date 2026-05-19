@@ -14,9 +14,7 @@ mod prefix;
 mod slot;
 
 pub use blob_node::{BlobNode, BLOB_MAX_INLINE};
-pub use header::{
-    BlobGuid, BlobHeader, DATA_AREA_START, HEADER_SIZE, MAX_SLOTS, PAGE_SIZE,
-};
+pub use header::{BlobGuid, BlobHeader, DATA_AREA_START, HEADER_SIZE, MAX_SLOTS, PAGE_SIZE};
 pub use leaf::{leaf_extent_size, Leaf};
 pub use node::{size_of_node, NodeType, SIZE_BY_TYPE};
 pub use nodes::{Node16, Node256, Node4, Node48};

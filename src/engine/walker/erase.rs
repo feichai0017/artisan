@@ -115,7 +115,9 @@ pub(super) fn erase_at(
 ) -> Result<EraseReturn> {
     let ntype = ntype_of(frame.as_ref(), slot)?;
     match ntype {
-        NodeType::Invalid => Err(Error::node_corrupt("walker::erase_at: hit NodeType::Invalid")),
+        NodeType::Invalid => Err(Error::node_corrupt(
+            "walker::erase_at: hit NodeType::Invalid",
+        )),
         NodeType::EmptyRoot => Ok(EraseReturn {
             signal: EraseSignal::Unchanged,
             previous: None,
@@ -156,7 +158,9 @@ fn erase_at_leaf(frame: &mut BlobFrame<'_>, leaf_slot: u16, key: &[u8]) -> Resul
         });
     }
     let leaf = {
-        let body = frame.body_of_slot(leaf_slot).ok_or(Error::node_corrupt("erase_at_leaf: body resolution failed"))?;
+        let body = frame
+            .body_of_slot(leaf_slot)
+            .ok_or(Error::node_corrupt("erase_at_leaf: body resolution failed"))?;
         *cast::<Leaf>(body)
     };
     if leaf.tombstone != 0 {
@@ -301,7 +305,9 @@ fn inner_remove_child_and_collapse(
                     break;
                 }
             }
-            let i = idx.ok_or(Error::node_corrupt("inner_remove_child_and_collapse: byte not present (Node4)"))?;
+            let i = idx.ok_or(Error::node_corrupt(
+                "inner_remove_child_and_collapse: byte not present (Node4)",
+            ))?;
             for j in i..count - 1 {
                 n.keys[j] = n.keys[j + 1];
                 n.children[j] = n.children[j + 1];
@@ -321,7 +327,9 @@ fn inner_remove_child_and_collapse(
                     break;
                 }
             }
-            let i = idx.ok_or(Error::node_corrupt("inner_remove_child_and_collapse: byte not present (Node16)"))?;
+            let i = idx.ok_or(Error::node_corrupt(
+                "inner_remove_child_and_collapse: byte not present (Node16)",
+            ))?;
             for j in i..count - 1 {
                 n.keys[j] = n.keys[j + 1];
                 n.children[j] = n.children[j + 1];
@@ -344,7 +352,9 @@ fn inner_remove_child_and_collapse(
             let mut n = read_node48(frame.as_ref(), slot)?;
             let ci = n.index[byte as usize];
             if ci == 0 {
-                return Err(Error::node_corrupt("inner_remove_child_and_collapse: byte not present (Node48)"));
+                return Err(Error::node_corrupt(
+                    "inner_remove_child_and_collapse: byte not present (Node48)",
+                ));
             }
             n.children[(ci as usize) - 1] = 0;
             n.index[byte as usize] = 0;
@@ -380,7 +390,9 @@ fn inner_remove_child_and_collapse(
         NodeType::Node256 => {
             let mut n = read_node256(frame.as_ref(), slot)?;
             if n.children[byte as usize] == 0 {
-                return Err(Error::node_corrupt("inner_remove_child_and_collapse: byte not present (Node256)"));
+                return Err(Error::node_corrupt(
+                    "inner_remove_child_and_collapse: byte not present (Node256)",
+                ));
             }
             n.children[byte as usize] = 0;
             n.count = n.count.saturating_sub(1);
@@ -412,7 +424,9 @@ fn inner_remove_child_and_collapse(
             write_struct_to_slot(frame, slot, &n)?;
             Ok(EraseSignal::Unchanged)
         }
-        _ => Err(Error::node_corrupt("inner_remove_child_and_collapse: not an inner node")),
+        _ => Err(Error::node_corrupt(
+            "inner_remove_child_and_collapse: not an inner node",
+        )),
     }
 }
 
@@ -445,12 +459,16 @@ fn erase_at_blob_node(
     let bn = {
         let body = parent_frame
             .body_of_slot(bn_slot)
-            .ok_or(Error::node_corrupt("erase_at_blob_node: body resolution failed"))?;
+            .ok_or(Error::node_corrupt(
+                "erase_at_blob_node: body resolution failed",
+            ))?;
         *cast::<BlobNode>(body)
     };
     let plen = bn.prefix_len as usize;
     if plen > BLOB_MAX_INLINE {
-        return Err(Error::node_corrupt("erase_at_blob_node: prefix_len exceeds inline buffer"));
+        return Err(Error::node_corrupt(
+            "erase_at_blob_node: prefix_len exceeds inline buffer",
+        ));
     }
 
     if depth + plen > key.len() || key[depth..depth + plen] != bn.bytes[..plen] {

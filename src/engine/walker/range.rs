@@ -393,7 +393,9 @@ impl RangeIter {
             let top = self.stack.last().expect("stack non-empty");
             let guard = top.pin.read();
             let frame = BlobFrameRef::wrap(guard.as_slice());
-            let body = frame.body_of_slot(top.slot).ok_or(Error::node_corrupt("range::descend_blob_for_anchor: body resolution"))?;
+            let body = frame.body_of_slot(top.slot).ok_or(Error::node_corrupt(
+                "range::descend_blob_for_anchor: body resolution",
+            ))?;
             let b = cast::<BlobNode>(body);
             let plen = (b.prefix_len as usize).min(BLOB_MAX_INLINE);
             (
@@ -535,7 +537,9 @@ impl RangeIter {
                         let (child_guid, child_slot, p_bytes) = {
                             let guard = top.pin.read();
                             let frame = BlobFrameRef::wrap(guard.as_slice());
-                            let body = frame.body_of_slot(top.slot).ok_or(Error::node_corrupt("range::advance: BlobNode body resolution"))?;
+                            let body = frame.body_of_slot(top.slot).ok_or(Error::node_corrupt(
+                                "range::advance: BlobNode body resolution",
+                            ))?;
                             let b = cast::<BlobNode>(body);
                             let plen = (b.prefix_len as usize).min(BLOB_MAX_INLINE);
                             (
@@ -676,7 +680,9 @@ fn find_inner_child_and_cursor(
             }
             let ci = idx as usize - 1;
             if ci >= 48 {
-                return Err(Error::node_corrupt("range::find_inner_child: Node48 index out of range"));
+                return Err(Error::node_corrupt(
+                    "range::find_inner_child: Node48 index out of range",
+                ));
             }
             Ok(Some((n.children[ci] as u16, u16::from(byte) + 1)))
         }
@@ -688,7 +694,9 @@ fn find_inner_child_and_cursor(
             }
             Ok(Some((s as u16, u16::from(byte) + 1)))
         }
-        _ => Err(Error::node_corrupt("range::find_inner_child: not an inner node")),
+        _ => Err(Error::node_corrupt(
+            "range::find_inner_child: not an inner node",
+        )),
     }
 }
 
@@ -733,7 +741,9 @@ fn next_inner_child_from(
             let idx = n.index[b];
             let ci = idx as usize - 1;
             if ci >= 48 {
-                return Err(Error::node_corrupt("range::next_inner_child: Node48 index out of range"));
+                return Err(Error::node_corrupt(
+                    "range::next_inner_child: Node48 index out of range",
+                ));
             }
             Ok(Some((b as u8, n.children[ci] as u16, (b + 1) as u16)))
         }
@@ -748,6 +758,8 @@ fn next_inner_child_from(
             let s = n.children[b];
             Ok(Some((b as u8, s as u16, (b + 1) as u16)))
         }
-        _ => Err(Error::node_corrupt("range::next_inner_child: not an inner node")),
+        _ => Err(Error::node_corrupt(
+            "range::next_inner_child: not an inner node",
+        )),
     }
 }
