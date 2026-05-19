@@ -199,6 +199,7 @@ impl Tree {
         let checkpointer = crate::checkpoint::Checkpointer::spawn(
             Arc::clone(&bm),
             wal.clone(),
+            root_guid,
             cfg.checkpoint.clone(),
         )
         .map(Arc::new);

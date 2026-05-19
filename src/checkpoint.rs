@@ -86,9 +86,11 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use crate::api::errors::Result;
+use crate::engine;
 use crate::journal::writer::WalWriter;
+use crate::layout::BlobGuid;
 use crate::store::backend::Backend;
-use crate::store::BufferManager;
+use crate::store::{BlobFrame, BufferManager};
 
 /// Background checkpointer policy + cadence.
 ///
@@ -120,6 +122,19 @@ pub struct CheckpointConfig {
     /// pathological". For a single-root workload, the dirty
     /// count is usually ≤ 1, so the timer dominates.
     pub dirty_blob_threshold: usize,
+    /// Run the tree-wide merge pass at the start of each round.
+    /// When `true`, every round walks every reachable blob and
+    /// folds any mergeable child back into its parent (same
+    /// predicate as [`crate::Tree::compact`]'s merge phase).
+    /// Cheap when nothing's mergeable; expensive on large
+    /// multi-blob trees where most rounds would have nothing to
+    /// do.
+    ///
+    /// Default `true` — the whole point of the v0.2
+    /// checkpointer is to keep the blob tree in equilibrium
+    /// against split/merge pressure without requiring
+    /// `Tree::compact` calls.
+    pub auto_merge: bool,
 }
 
 impl Default for CheckpointConfig {
@@ -128,6 +143,7 @@ impl Default for CheckpointConfig {
             enabled: false,
             idle_interval: Duration::from_millis(200),
             dirty_blob_threshold: 16,
+            auto_merge: true,
         }
     }
 }
@@ -149,12 +165,16 @@ struct Shared {
     stop: AtomicBool,
     bm: Arc<BufferManager>,
     wal: Option<Arc<Mutex<WalWriter>>>,
+    /// GUID of the tree root — entry point for the merge-pass
+    /// `engine::collect_blob_guids` walk.
+    root_guid: BlobGuid,
     cfg: CheckpointConfig,
     // Telemetry — read by `Checkpointer` accessors, written only
     // by the thread.
     rounds_attempted: AtomicU64,
     rounds_succeeded: AtomicU64,
     blobs_flushed: AtomicU64,
+    merges_total: AtomicU64,
     truncates: AtomicU64,
     last_dirty_count: AtomicUsize,
 }
@@ -174,6 +194,7 @@ impl Checkpointer {
     pub(crate) fn spawn(
         bm: Arc<BufferManager>,
         wal: Option<Arc<Mutex<WalWriter>>>,
+        root_guid: BlobGuid,
         cfg: CheckpointConfig,
     ) -> Option<Self> {
         if !cfg.enabled {
@@ -183,10 +204,12 @@ impl Checkpointer {
             stop: AtomicBool::new(false),
             bm,
             wal,
+            root_guid,
             cfg,
             rounds_attempted: AtomicU64::new(0),
             rounds_succeeded: AtomicU64::new(0),
             blobs_flushed: AtomicU64::new(0),
+            merges_total: AtomicU64::new(0),
             truncates: AtomicU64::new(0),
             last_dirty_count: AtomicUsize::new(0),
         });
@@ -245,6 +268,14 @@ impl Checkpointer {
     #[must_use]
     pub(crate) fn truncates(&self) -> u64 {
         self.shared.truncates.load(Ordering::Relaxed)
+    }
+
+    /// Cumulative count of `BlobNode` crossings folded back into
+    /// their parent across every merge pass.
+    #[allow(dead_code)]
+    #[must_use]
+    pub(crate) fn merges_total(&self) -> u64 {
+        self.shared.merges_total.load(Ordering::Relaxed)
     }
 }
 
@@ -305,13 +336,34 @@ fn run(shared: &Arc<Shared>) {
 fn run_round(shared: &Arc<Shared>) -> Result<()> {
     shared.rounds_attempted.fetch_add(1, Ordering::Relaxed);
 
+    // 0. Optional tree-wide merge pass — fold mergeable child
+    //    blobs back into their parents *before* the snapshot so
+    //    any mutations land on this round's flush.
+    let merged = if shared.cfg.auto_merge {
+        match run_merge_pass(shared) {
+            Ok(n) => n,
+            Err(e) => {
+                eprintln!("holt: checkpoint merge pass failed: {e}");
+                0
+            }
+        }
+    } else {
+        0
+    };
+    shared
+        .merges_total
+        .fetch_add(merged, Ordering::Relaxed);
+
     // 1. Snapshot the dirty set. Concurrent writers' new
-    //    `mark_dirty` calls land in a fresh empty map.
+    //    `mark_dirty` calls land in a fresh empty map. The merge
+    //    pass above either (a) added entries via the cache-write
+    //    path or (b) drained entries via inline `bm.commit` —
+    //    see `run_merge_pass` for which.
     let snap = shared.bm.snapshot_dirty();
     let snap_count = snap.len();
     shared.last_dirty_count.store(snap_count, Ordering::Relaxed);
 
-    if snap.is_empty() {
+    if snap.is_empty() && merged == 0 {
         // Even with nothing to flush, count as a successful
         // round — the metric tracks "thread is alive and
         // making progress" not "actual work done".
@@ -376,6 +428,42 @@ fn run_round(shared: &Arc<Shared>) -> Result<()> {
     Ok(())
 }
 
+/// Tree-wide merge pass — walk every reachable blob, fold any
+/// mergeable `BlobNode` child back into its parent, and
+/// synchronously commit the parent.
+///
+/// Returns the number of children folded across this pass.
+/// Errors are propagated; the caller decides whether to bail
+/// the round or just log + continue. Per-blob commit happens
+/// inline (rather than via `mark_dirty` + the main flush path)
+/// because the merge's manifest changes (`bm.delete_blob`) must
+/// land before `backend.flush` at the end of the round —
+/// `bm.commit` is the path that actually moves bytes from cache
+/// into the backend's data file.
+fn run_merge_pass(shared: &Arc<Shared>) -> Result<u64> {
+    let parents = engine::collect_blob_guids(shared.bm.as_ref(), shared.root_guid)?;
+    let mut merged_total = 0u64;
+    for guid in parents {
+        // A merge earlier in the loop may have deleted this blob
+        // (when it was a mergeable child elsewhere). Skip.
+        if !shared.bm.has_blob(guid)? {
+            continue;
+        }
+        let pin = shared.bm.pin(guid)?;
+        let stats = {
+            let mut guard = pin.write();
+            let mut frame = BlobFrame::wrap(guard.as_mut_slice());
+            engine::try_merge_children(shared.bm.as_ref(), &mut frame)?
+        };
+        drop(pin);
+        if stats.merged > 0 {
+            shared.bm.commit(guid)?;
+            merged_total += u64::from(stats.merged);
+        }
+    }
+    Ok(merged_total)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -387,20 +475,48 @@ mod tests {
         Arc::new(BufferManager::new(Arc::new(MemoryBackend::new()), 8))
     }
 
+    // Tests that don't construct a real Tree skip the merge pass —
+    // `collect_blob_guids` would try to pin a non-existent root.
+    fn no_merge_cfg() -> CheckpointConfig {
+        CheckpointConfig {
+            auto_merge: false,
+            ..CheckpointConfig::enabled()
+        }
+    }
+
+    /// Sentinel root_guid for tests that don't open a real tree.
+    const TEST_ROOT_GUID: BlobGuid = [0; 16];
+
+    fn make_shared(bm: Arc<BufferManager>, cfg: CheckpointConfig) -> Arc<Shared> {
+        Arc::new(Shared {
+            stop: AtomicBool::new(false),
+            bm,
+            wal: None,
+            root_guid: TEST_ROOT_GUID,
+            cfg,
+            rounds_attempted: AtomicU64::new(0),
+            rounds_succeeded: AtomicU64::new(0),
+            blobs_flushed: AtomicU64::new(0),
+            merges_total: AtomicU64::new(0),
+            truncates: AtomicU64::new(0),
+            last_dirty_count: AtomicUsize::new(0),
+        })
+    }
+
     #[test]
     fn disabled_config_spawns_nothing() {
         let bm = make_bm();
         let cfg = CheckpointConfig::default();
         assert!(!cfg.enabled);
-        let ck = Checkpointer::spawn(bm, None, cfg);
+        let ck = Checkpointer::spawn(bm, None, TEST_ROOT_GUID, cfg);
         assert!(ck.is_none());
     }
 
     #[test]
     fn spawn_and_drop_is_leak_free() {
         let bm = make_bm();
-        let cfg = CheckpointConfig::enabled();
-        let ck = Checkpointer::spawn(bm, None, cfg).expect("spawn");
+        let cfg = no_merge_cfg();
+        let ck = Checkpointer::spawn(bm, None, TEST_ROOT_GUID, cfg).expect("spawn");
         // Give the thread a tick to wake at least once.
         thread::sleep(Duration::from_millis(50));
         drop(ck);
@@ -418,18 +534,9 @@ mod tests {
         bm.mark_dirty([0x42; 16], 10);
         assert_eq!(bm.dirty_count(), 1);
 
-        // Run a single round synchronously (no thread).
-        let shared = Arc::new(Shared {
-            stop: AtomicBool::new(false),
-            bm: Arc::clone(&bm),
-            wal: None,
-            cfg: CheckpointConfig::enabled(),
-            rounds_attempted: AtomicU64::new(0),
-            rounds_succeeded: AtomicU64::new(0),
-            blobs_flushed: AtomicU64::new(0),
-            truncates: AtomicU64::new(0),
-            last_dirty_count: AtomicUsize::new(0),
-        });
+        // Run a single round synchronously (no thread). Disable
+        // auto-merge because the test bm has no real root blob.
+        let shared = make_shared(Arc::clone(&bm), no_merge_cfg());
         run_round(&shared).unwrap();
 
         assert_eq!(bm.dirty_count(), 0, "round should drain dirty set");
@@ -442,17 +549,7 @@ mod tests {
     #[test]
     fn empty_round_is_noop_but_counts() {
         let bm = make_bm();
-        let shared = Arc::new(Shared {
-            stop: AtomicBool::new(false),
-            bm,
-            wal: None,
-            cfg: CheckpointConfig::enabled(),
-            rounds_attempted: AtomicU64::new(0),
-            rounds_succeeded: AtomicU64::new(0),
-            blobs_flushed: AtomicU64::new(0),
-            truncates: AtomicU64::new(0),
-            last_dirty_count: AtomicUsize::new(0),
-        });
+        let shared = make_shared(bm, no_merge_cfg());
         run_round(&shared).unwrap();
         assert_eq!(shared.rounds_succeeded.load(Ordering::Relaxed), 1);
         assert_eq!(shared.blobs_flushed.load(Ordering::Relaxed), 0);
@@ -461,11 +558,11 @@ mod tests {
     #[test]
     fn wake_short_circuits_idle_wait() {
         let bm = make_bm();
-        let mut cfg = CheckpointConfig::enabled();
+        let mut cfg = no_merge_cfg();
         // Long idle so we know the wake — not the timer —
         // produced the round.
         cfg.idle_interval = Duration::from_secs(10);
-        let ck = Checkpointer::spawn(bm.clone(), None, cfg).expect("spawn");
+        let ck = Checkpointer::spawn(bm.clone(), None, TEST_ROOT_GUID, cfg).expect("spawn");
 
         // Mark dirty + wake; expect a round to drain it well under
         // the configured idle.
