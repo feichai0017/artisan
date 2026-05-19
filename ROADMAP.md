@@ -347,26 +347,36 @@ by `~leaves_per_rollup` once fast-forward lands.
 
 ### Durability + background work
 
-- [x] **Async checkpoint thread** — one thread,
-      round-driven via [`CheckpointConfig`]. Each round
-      (1) folds mergeable child blobs back into parents,
-      (2) snapshots the BM dirty set + flushes WAL,
-      (3) commits each blob to backend, (4) `fdatasync`s the
-      backend, (5) atomically truncates the WAL when no racing
-      writer has re-dirtied. Default `enabled = false`
-      (opt-in until v0.3 promotes it on by default). Final
-      synchronous round runs in `Checkpointer::Drop` so the
-      window between the last bg round and Tree shutdown
-      doesn't lose dirty cache state.
+- [x] **3-thread background checkpointer** — round-driven planner
+      + dedicated I/O worker + cold-blob eviction, plus a
+      bounded `crossbeam-channel` queue between planner and I/O.
+      Each planner round (1) folds mergeable child blobs back
+      into parents, (2) snapshots the BM dirty set + flushes
+      WAL, (3) submits `IoTask::Flush` per dirty blob to the I/O
+      thread + waits completions, (4) submits `IoTask::Sync`,
+      (5) atomically truncates the WAL when no racing writer
+      re-dirtied. Eviction thread runs independently against a
+      `clock_tick` / `last_touched` cold-entry detector. Default
+      `enabled = false` (opt-in until v0.3 promotes it on by
+      default). Final synchronous round runs in
+      `Checkpointer::Drop` so the window between the last bg
+      round and Tree shutdown doesn't lose dirty cache state.
+      `idle_interval` default is 100 ms, tuned via
+      `tests/bench_checkpoint_sweep.rs`.
 - [ ] **Free-list retry/backoff subsystem** — under heap
       exhaustion, the per-NodeType LIFO chains today fail-fast.
       The original ancestor has a backoff path
       (`free_list is {} sleep 10ms retry={}`); adding it would
       buy resilience under stress.
-- [ ] **Adaptive buffer-pool eviction** — touched-recently scan,
-      not strict LRU. The current LRU `VecDeque` does an O(n)
-      remove on every pin's touch; with `buffer_pool_size > 128`
-      this starts to bite.
+- [~] **Adaptive buffer-pool eviction** — partial. Background
+      eviction thread (v0.2 C1) drops cold entries against a
+      `clock_tick` / `last_touched` tick threshold instead of
+      strict LRU. Inline `try_evict_lru` on capacity overflow
+      still walks the `VecDeque<BlobGuid>` though; for the
+      common case where the bg eviction thread keeps the pool
+      below capacity, this never fires. Strict-LRU removal
+      will go when `buffer_pool_size > 128` becomes the typical
+      configuration.
 
 ### Observability
 
@@ -374,13 +384,17 @@ by `~leaves_per_rollup` once fast-forward lands.
       traces. Hooks for: put / get / delete / rename throughput,
       spillover / merge / compact counts, cache hit rate, WAL
       flush latency, optimistic-read restart count.
-- [ ] **Tracing spans** — `tracing` crate spans on `spillover`,
-      `merge_blob`, `compact_blob`, WAL flush, BM evict — lets
-      downstream apps correlate holt's internal events with
-      their own request traces.
-- [ ] **Extended `Tree::stats`** — expose free-list health
-      (chains length, gap_space distribution), cache hit rate,
-      latch contention counters.
+- [x] **Tracing events** — `feature = "tracing"` (off by default)
+      gates structured `tracing::info!` / `debug!` calls on
+      `spillover`, `merge_blob`, `compact_blob`, WAL truncate,
+      checkpoint round summary, and eviction sweeps. Cost-free
+      when the feature is off (cfg-gated).
+- [~] **Extended `Tree::stats`** — partial. `TreeStats` now
+      carries `bm_dirty_count` + an `Option<CheckpointerStats>`
+      with the 6 bg counters (rounds_attempted /
+      rounds_succeeded / blobs_flushed / merges_total /
+      truncates / evictions). Free-list health, cache hit rate,
+      and latch contention counters are still TODO.
 
 ### Ergonomics + diagnostics
 

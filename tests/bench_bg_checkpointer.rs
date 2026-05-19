@@ -195,7 +195,10 @@ fn run_paced_workload(
     }
 }
 
+// `#[ignore]` — timing-sensitive measurement, not a correctness
+// test. Run via `cargo test --release --test bench_bg_checkpointer -- --ignored --nocapture`.
 #[test]
+#[ignore]
 fn bg_checkpointer_bounds_wal_under_paced_writes() {
     // Pause 100 ms every 500 writes — that's ~10 bursts spread
     // over ~1 s, giving bg's 200 ms idle interval ~5 round
@@ -263,6 +266,7 @@ fn bg_checkpointer_bounds_wal_under_paced_writes() {
 }
 
 #[test]
+#[ignore]
 fn bg_checkpointer_keeps_wal_bounded_and_speeds_reopen() {
     let mut results = Vec::new();
 

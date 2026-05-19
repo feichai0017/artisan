@@ -6,6 +6,34 @@ versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added — observability
+
+- **`tracing` feature flag** (off by default). When enabled,
+  the rare-but-important events fire structured `tracing` calls
+  with named fields:
+  - `holt::checkpoint` — `info!("round complete", dirty_snapshot,
+    blobs_flushed, blobs_failed, merged, truncated_wal,
+    elapsed_us)`
+  - `holt::engine::spillover` — `debug!` on each fresh child blob
+  - `holt::engine::merge` — `debug!` on each child folded into parent
+  - `holt::engine::compact` — `debug!` on each in-place rebuild
+  - `holt::wal` — `info!` on truncate
+  - `holt::checkpoint::eviction` — `debug!` on each non-empty sweep
+
+  All call sites are `#[cfg(feature = "tracing")]`-gated so users
+  who don't enable the feature pay zero runtime cost.
+
+- **`Tree::stats` extended** with bg-checkpointer + dirty-set
+  counters:
+  - `TreeStats::bm_dirty_count` — current count of unflushed blobs
+  - `TreeStats::checkpointer: Option<CheckpointerStats>` — when bg
+    is running, returns cumulative `rounds_attempted` /
+    `rounds_succeeded` / `blobs_flushed` / `merges_total` /
+    `truncates` / `evictions` counters.
+
+  `CheckpointerStats` is re-exported at the crate root for
+  convenience.
+
 ### Added — I/O backend
 
 - **`io-uring` feature flag** (Linux only). When enabled,

@@ -20,6 +20,11 @@ categories = ["database-implementations", "data-structures", "filesystem"]
 # used by the v0.2 background checkpointer threads (planner / I/O /
 # eviction). Std's `mpsc` lacks bounded sends and `select!`.
 crossbeam-channel = "0.5"
+# Structured event emission on `spillover` / `merge_blob` /
+# `compact_blob` / WAL flush / checkpoint round. Optional so
+# users who don't run a `tracing` subscriber don't pay any
+# closure-construction cost.
+tracing = { version = "0.1", default-features = false, optional = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
@@ -47,6 +52,13 @@ default = []
 # stays on the pread/pwrite path). Adds the `io-uring` crate as a
 # build dep.
 io-uring = ["dep:io-uring"]
+# Enables `tracing` instrumentation on the rare-but-important
+# events: spillover, merge_blob, compact_blob, WAL flush /
+# truncate, checkpoint round start/end, BM evict. Subscribers
+# receive structured fields (blob_guid, byte counts, durations);
+# users who don't enable a subscriber pay zero runtime cost
+# beyond the cfg-gated span constructor.
+tracing = ["dep:tracing"]
 # Future: "metrics" for prometheus, "mvcc" for snapshot isolation.
 
 [profile.release]

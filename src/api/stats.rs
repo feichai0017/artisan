@@ -59,4 +59,43 @@ pub struct TreeStats {
     pub total_tombstones: u64,
     /// Per-blob breakdown in BFS order from the root.
     pub blobs: Vec<BlobStats>,
+    /// Number of blobs currently dirty in the BufferManager —
+    /// modified in cache but not yet flushed to backend. With the
+    /// background checkpointer enabled this stays bounded by the
+    /// checkpoint cadence; without it, it tracks the user's
+    /// explicit `Tree::checkpoint` schedule.
+    pub bm_dirty_count: usize,
+    /// Background checkpointer telemetry, or `None` if the bg
+    /// thread group isn't running (the default; opt in via
+    /// [`crate::CheckpointConfig::enabled`]).
+    pub checkpointer: Option<CheckpointerStats>,
+}
+
+/// Snapshot of the v0.2 background checkpointer's accumulated
+/// counters. Returned inside [`TreeStats::checkpointer`] when the
+/// bg thread group is enabled. All counters are cumulative since
+/// the threads were spawned.
+#[derive(Debug, Clone, Copy)]
+pub struct CheckpointerStats {
+    /// Rounds the planner has started — succeeded + failed
+    /// combined. Empty rounds (no dirty entries, nothing to
+    /// merge) still increment.
+    pub rounds_attempted: u64,
+    /// Rounds that completed without an error path. A successful
+    /// round can still have done no flush work — see
+    /// [`Self::blobs_flushed`] for actual durability progress.
+    pub rounds_succeeded: u64,
+    /// Cumulative number of blob commits the I/O thread has
+    /// processed across all rounds.
+    pub blobs_flushed: u64,
+    /// Total `BlobNode` crossings folded back into their parents
+    /// across every merge pass.
+    pub merges_total: u64,
+    /// WAL `truncate` calls — once per round where the planner
+    /// observed `dirty_count == 0` under the WAL lock after
+    /// flushing.
+    pub truncates: u64,
+    /// Cache entries the eviction thread has dropped because
+    /// they were cold + non-dirty + held only by the cache.
+    pub evictions: u64,
 }

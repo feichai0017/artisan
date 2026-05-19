@@ -52,6 +52,17 @@ pub(super) struct UringContext {
     fd: types::Fd,
 }
 
+impl std::fmt::Debug for UringContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Don't dump the ring — would print SQ/CQ internals;
+        // the fd alone is enough to identify which backend file
+        // this context drives.
+        f.debug_struct("UringContext")
+            .field("fd", &self.fd.0)
+            .finish_non_exhaustive()
+    }
+}
+
 impl UringContext {
     /// Build a fresh ring bound to `file`'s descriptor. Fails with
     /// `io::Error` if `IORING_SETUP_*` is rejected by the kernel

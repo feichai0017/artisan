@@ -35,7 +35,7 @@ use std::sync::{Arc, Mutex};
 
 use super::config::{Storage, TreeConfig};
 use super::errors::{Error, Result};
-use super::stats::{BlobStats, TreeStats};
+use super::stats::{BlobStats, CheckpointerStats, TreeStats};
 use crate::engine;
 use crate::engine::RangeBuilder;
 use crate::journal::reader::replay;
@@ -638,6 +638,15 @@ impl Tree {
             total_tombstones += u64::from(s.tombstone_leaf_cnt);
             blobs.push(s);
         }
+        let bm_dirty_count = self.backend.dirty_count();
+        let checkpointer = self.checkpointer.as_ref().map(|ck| CheckpointerStats {
+            rounds_attempted: ck.rounds_attempted(),
+            rounds_succeeded: ck.rounds_succeeded(),
+            blobs_flushed: ck.blobs_flushed(),
+            merges_total: ck.merges_total(),
+            truncates: ck.truncates(),
+            evictions: ck.evictions(),
+        });
         Ok(TreeStats {
             blob_count: blobs.len() as u32,
             total_space_used,
@@ -646,6 +655,8 @@ impl Tree {
             total_compactions,
             total_tombstones,
             blobs,
+            bm_dirty_count,
+            checkpointer,
         })
     }
 

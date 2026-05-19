@@ -81,6 +81,15 @@ pub(super) fn spillover_blob(bm: &BufferManager, frame: &mut BlobFrame<'_>) -> R
         }
     }
 
+    #[cfg(feature = "tracing")]
+    tracing::debug!(
+        target: "holt::engine::spillover",
+        new_child_guid = ?&new_guid[..4],
+        victim_slot = victim.victim_slot,
+        bn_slot = bn_alloc.slot,
+        "spillover: migrated subtree to fresh child blob",
+    );
+
     Ok(bn_alloc.slot)
 }
 

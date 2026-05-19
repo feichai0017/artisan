@@ -280,6 +280,10 @@ impl WalWriter {
         // unlinked old inode; reopen against the new file.
         self.file = OpenOptions::new().append(true).open(&self.path)?;
         self.bytes_written = FILE_HEADER_SIZE as u64;
+
+        #[cfg(feature = "tracing")]
+        tracing::info!(target: "holt::wal", "wal truncated to header-only");
+
         Ok(())
     }
 }

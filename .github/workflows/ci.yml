@@ -119,14 +119,14 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: cargo build (lib + tests, io-uring on)
-        run: cargo build --lib --tests --features io-uring --locked
+      - name: cargo build (lib + tests, io-uring + tracing on)
+        run: cargo build --lib --tests --features "io-uring tracing" --locked
 
-      - name: cargo test (lib + integration, io-uring on)
-        run: cargo test --lib --tests --features io-uring --locked
+      - name: cargo test (lib + integration, io-uring + tracing on)
+        run: cargo test --lib --tests --features "io-uring tracing" --locked
 
-      - name: cargo clippy (io-uring on)
-        run: cargo clippy --lib --tests --features io-uring --locked -- -D warnings
+      - name: cargo clippy (io-uring + tracing on)
+        run: cargo clippy --lib --tests --features "io-uring tracing" --locked -- -D warnings
 
   # --------------------------------------------------------------
   # `cargo doc` — fails on broken intra-doc links / missing docs

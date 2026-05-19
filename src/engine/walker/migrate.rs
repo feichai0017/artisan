@@ -138,6 +138,15 @@ pub fn compact_blob(buf: &mut AlignedBlobBuf) -> Result<()> {
     }
 
     buf.as_mut_slice().copy_from_slice(new_buf.as_slice());
+
+    #[cfg(feature = "tracing")]
+    tracing::debug!(
+        target: "holt::engine::compact",
+        blob_guid = ?&blob_guid[..4],
+        compact_times = old_compact_times.saturating_add(1),
+        "compact_blob: in-place rebuild complete",
+    );
+
     Ok(())
 }
 
@@ -236,6 +245,15 @@ pub fn merge_blob(
 
     parent_frame.free_node(parent_bn_slot)?;
     bm.delete_blob(child_guid)?;
+
+    #[cfg(feature = "tracing")]
+    tracing::debug!(
+        target: "holt::engine::merge",
+        child_guid = ?&child_guid[..4],
+        parent_bn_slot = parent_bn_slot,
+        inlined_root = inlined_root,
+        "merge_blob: folded child into parent + deleted",
+    );
 
     Ok(inlined_root)
 }

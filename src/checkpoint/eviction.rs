@@ -44,6 +44,15 @@ pub(super) fn run(shared: &Arc<Shared>) {
         }
         let evicted = run_scan(shared);
         shared.evictions.fetch_add(evicted, Ordering::Relaxed);
+
+        #[cfg(feature = "tracing")]
+        if evicted > 0 {
+            tracing::debug!(
+                target: "holt::checkpoint::eviction",
+                evicted = evicted,
+                "eviction scan complete",
+            );
+        }
     }
 }
 

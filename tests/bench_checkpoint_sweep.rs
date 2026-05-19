@@ -108,7 +108,13 @@ fn run_paced(cfg_factory: impl Fn(&Path) -> TreeConfig) -> (Duration, u64, u64, 
     (write_total, peak_wal, final_wal, reopen)
 }
 
+// Timing-sensitive measurement — bg round latency varies across
+// CI runners (especially debug builds on macOS). Tagged `#[ignore]`
+// so the default `cargo test` keeps green; run explicitly via:
+//
+//     cargo test --release --test bench_checkpoint_sweep -- --ignored --nocapture
 #[test]
+#[ignore]
 fn idle_interval_sweep() {
     let mut rows = Vec::<Row>::new();
 

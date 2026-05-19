@@ -83,8 +83,13 @@ pub(super) fn run_round(shared: &Arc<Shared>) -> Result<()> {
 
     if snap.is_empty() && merged == 0 {
         shared.rounds_succeeded.fetch_add(1, Ordering::Relaxed);
+        #[cfg(feature = "tracing")]
+        tracing::trace!(target: "holt::checkpoint", "round skipped — nothing dirty");
         return Ok(());
     }
+
+    #[cfg(feature = "tracing")]
+    let round_start = std::time::Instant::now();
 
     // 2. WAL flush.
     if let Some(wal) = &shared.wal {
@@ -189,6 +194,23 @@ pub(super) fn run_round(shared: &Arc<Shared>) -> Result<()> {
     }
 
     shared.rounds_succeeded.fetch_add(1, Ordering::Relaxed);
+
+    #[cfg(feature = "tracing")]
+    {
+        let elapsed = round_start.elapsed();
+        let truncated = failed.is_empty() && shared.wal.is_some() && shared.bm.dirty_count() == 0;
+        tracing::info!(
+            target: "holt::checkpoint",
+            dirty_snapshot = snap_count,
+            blobs_flushed = snap_count - failed.len(),
+            blobs_failed = failed.len(),
+            merged = merged,
+            truncated_wal = truncated,
+            elapsed_us = elapsed.as_micros() as u64,
+            "round complete",
+        );
+    }
+
     Ok(())
 }
 
