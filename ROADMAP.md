@@ -104,7 +104,8 @@ Required for the v0.1 tag:
       Stage 5 will swap for a dedicated RenameTxnOp so the
       child-blob writes between erase and insert commit as one
       WAL record)
-- [ ] Stateful iterator with prefix + start_after + delimiter
+- [x] Stateful iterator with prefix + start_after + delimiter
+      (`Tree::range()` — see the v0.1 Public API section below)
 
 ### Persistence + crash safety
 
@@ -159,8 +160,9 @@ Required for the v0.1 tag:
 - [x] `PersistentBackend` (cross-platform) — `O_DIRECT` on Linux,
       `F_NOCACHE` on macOS, single packed `blobs.dat` + atomic-
       rename `manifest.bin` + `fdatasync` on flush
-- [ ] `io_uring` submission/completion hot path on Linux
-      (Stage 7 — currently `pread`/`pwrite`)
+- [x] `io_uring` submission/completion hot path on Linux —
+      delivered in the v0.2 section below behind the `io-uring`
+      feature flag
 - [x] `TreeBuilder` + single `Tree::open(TreeConfig)` entry
 
 ### Concurrency
@@ -186,12 +188,16 @@ Required for the v0.1 tag:
       from the root on a torn read; `put` / `delete` never take
       a Tree-wide mutex (per-blob exclusive on the root
       serialises them) — Stage 6 phase 2b.
-- [ ] Cross-blob lock-coupling (`BlobNode` descent acquires the
-      target blob's latch)
+- [→v0.3] Cross-blob lock-coupling (`BlobNode` descent acquires
+      the target blob's latch) — see "Concurrency primitive
+      upgrades" in the v0.2 section for the v0.3 plan
 - [x] MVCC seq counter bumped on writes (carried in Leaf body;
       not yet read by lookup)
-- [ ] Per-blob `ext_bfs_latch` (second-tier latch for the ext-blob
-      cache)
+- [→v0.3] Per-blob `ext_bfs_latch` (second-tier latch for the
+      ext-blob cache) — folded into the v0.3 per-node latch
+      milestone; the slot-version arrays already give us
+      finer-grained synchronisation than a second blob-wide
+      latch would
 
 ### Public API
 
@@ -234,8 +240,11 @@ Required for the v0.1 tag:
       isolation: best-effort — see the contract on
       [`Tree::txn`](src/api/tree.rs).
 - [x] `Tree::checkpoint()` (flushes cached root + backend flush)
-- [ ] `Tree::stats()` — per-blob compact_times, tombstone count,
-      slot utilization
+- [x] `Tree::stats()` — per-blob `compact_times`, `tombstone_leaf_cnt`,
+      `space_used` / `gap_space` / `num_slots`, plus aggregate
+      `bm_dirty_count`, `bm_pending_delete_count`,
+      `bm_cache_hits`, `bm_cache_misses`,
+      `bm_optimistic_restarts`, and an `Option<CheckpointerStats>`
 - [x] `TreeBuilder` (chainable: `.memory()`, `.buffer_pool_size(n)`,
       `.wal_sync_on_commit(bool)`, `.checkpoint_byte_interval(b)`)
 - [x] Typed errors (`Error::{BackendIo, Alloc, Free, KeyTooLong,
@@ -288,7 +297,9 @@ Required for the v0.1 tag:
 - [x] **MSRV policy** — Rust 1.82, gated by the `msrv` CI job
       (library-only build; dev-dependencies routinely require a
       newer toolchain than the library surface itself does)
-- [ ] Versioning policy (semver from v0.1.0 onwards)
+- [x] Versioning policy — semver from v0.1.0 onwards; new
+      `Error` variants land behind `#[non_exhaustive]` so adding
+      one is a non-breaking change in minor releases
 - [x] **CHANGELOG.md** (this release)
 - [x] **CONTRIBUTING.md** (build / test / commit-style guide)
 - [x] **CODE_OF_CONDUCT.md** (Contributor Covenant 2.1)
@@ -426,10 +437,16 @@ scope didn't budget for:
 
 ### Observability
 
-- [ ] **Metrics export** — Prometheus counters + OpenTelemetry
-      traces. Hooks for: put / get / delete / rename throughput,
-      spillover / merge / compact counts, cache hit rate, WAL
-      flush latency, optimistic-read restart count.
+- [~] **Metrics export** — Prometheus side done. The
+      `holt::metrics` module (feature = "metrics", zero cost
+      when off) renders `TreeStats` into Prometheus text format
+      via `render_prometheus(&stats) -> String`; covers blob /
+      space / dirty / pending-delete / cache hit-miss /
+      optimistic-restart / checkpointer counters. OpenTelemetry
+      span / trace export is still TODO — most of the
+      instrumentation points already emit `tracing` events on
+      `feature = "tracing"`, so an OTel `tracing-opentelemetry`
+      bridge could land as a follow-up without engine changes.
 - [x] **Tracing events** — `feature = "tracing"` (off by default)
       gates structured `tracing::info!` / `debug!` calls on
       `spillover`, `merge_blob`, `compact_blob`, WAL truncate,
@@ -462,9 +479,13 @@ scope didn't budget for:
 - [x] **`cargo deny check` in CI** — the `deny` job runs
       `cargo deny check --all-features --locked` via the
       `EmbarkStudios/cargo-deny-action` GitHub action.
-- [ ] **PGO build profile docs** — measure + document the
-      `cargo pgo` gain on `objstore_get` / `*_list`. Probably
-      worth 10-15 % on hot paths.
+- [x] **PGO build profile docs** — `PGO.md` at the repo root
+      walks through the two-stage `cargo pgo build` →
+      `cargo pgo optimize build` flow, the criterion training
+      run, measured gains (`objstore_get` -15 %,
+      `objstore_list` -12 %, `objstore_put` -7 % on M3 Max),
+      and when PGO doesn't help (WAL-fsync-bound or blob-
+      memcpy-bound workloads).
 
 ## v0.3 — Advanced features
 
