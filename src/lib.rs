@@ -122,6 +122,7 @@ pub mod journal;
 pub mod layout;
 pub mod store;
 
+pub(crate) mod checkpoint;
 pub(crate) mod concurrency;
 pub(crate) mod engine;
 
@@ -146,6 +147,10 @@ pub use api::stats::{BlobStats, TreeStats};
 
 // Single-record batched transactions.
 pub use api::txn::TxnBatch;
+
+// Background checkpointer policy (v0.2). The `Checkpointer`
+// handle itself is crate-internal; users opt in via this config.
+pub use checkpoint::CheckpointConfig;
 
 // Backend trait + bundled backends + zero-copy blob buffer.
 pub use store::backend::{AlignedBlobBuf, Backend, MemoryBackend, PersistentBackend};

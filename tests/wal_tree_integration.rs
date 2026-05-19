@@ -416,3 +416,77 @@ fn batch_crash_before_flush_loses_whole_batch() {
     assert!(tree.get(b"vanish-a").unwrap().is_none());
     assert!(tree.get(b"vanish-b").unwrap().is_none());
 }
+
+#[test]
+fn background_checkpointer_truncates_wal_and_keeps_data_durable() {
+    // v0.2 integration smoke: with the background checkpointer
+    // enabled, a steady stream of writes should leave the WAL
+    // bounded (it gets truncated to header-only on rounds where
+    // nothing else is racing the writer) AND every written value
+    // remains observable after reopen (because the round flushed
+    // the cached root into backend before truncating).
+    use holt::{CheckpointConfig, TreeBuilder};
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    let dir = tempdir().unwrap();
+
+    {
+        let tree = TreeBuilder::new(dir.path())
+            .checkpoint(CheckpointConfig {
+                enabled: true,
+                idle_interval: Duration::from_millis(25),
+                dirty_blob_threshold: 1,
+            })
+            .open()
+            .unwrap();
+
+        // Produce a WAL of non-trivial size.
+        for i in 0..500u32 {
+            tree.put(
+                format!("bg/{i:04}").as_bytes(),
+                format!("v-{i}").as_bytes(),
+            )
+            .unwrap();
+        }
+
+        // Wait until the background thread shrinks the WAL back
+        // to header-only — i.e. it raced a round where dirty was
+        // empty when it took the WAL lock. Give it generous time;
+        // the test cares about *eventual* truncate, not latency.
+        let header_size_after_truncate = 32u64; // FILE_HEADER_SIZE
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            // Trigger another op so the dirty set isn't always
+            // co-occupied with an in-flight write (the truncate
+            // only fires when dirty is empty under WAL lock).
+            tree.put(b"_tick", b".").unwrap();
+            let wal_len = fs::metadata(wal_path(dir.path())).unwrap().len();
+            if wal_len <= header_size_after_truncate + 128 {
+                // Tolerate one or two trailing ops; the test cares
+                // about "WAL stopped growing unbounded", not exact
+                // zero.
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "background checkpointer never truncated WAL (size={wal_len})",
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+    } // tree dropped → checkpointer joined.
+
+    // After reopen, every key is still readable — the bg
+    // checkpointer's flush sequence (commit → fdatasync →
+    // truncate) made the backend the durable source of truth.
+    let tree = Tree::open(TreeConfig::new(dir.path())).unwrap();
+    for i in 0..500u32 {
+        let k = format!("bg/{i:04}");
+        let want = format!("v-{i}");
+        assert_eq!(
+            tree.get(k.as_bytes()).unwrap().as_deref(),
+            Some(want.as_bytes()),
+            "key {k} lost after bg-checkpoint-and-reopen",
+        );
+    }
+}

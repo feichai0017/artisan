@@ -79,6 +79,12 @@ pub struct Tree {
     /// WAL handle — `Some` for persistent trees, `None` for
     /// memory trees (logging an in-memory engine has no point).
     wal: Option<Arc<Mutex<WalWriter>>>,
+    /// Background checkpointer handle. `Some` iff
+    /// `cfg.checkpoint.enabled`. Shared via `Arc` so the thread
+    /// shuts down on the **last** `Tree` clone's drop, not the
+    /// first.
+    #[allow(dead_code)]
+    checkpointer: Option<Arc<crate::checkpoint::Checkpointer>>,
 }
 
 impl std::fmt::Debug for Tree {
@@ -187,6 +193,16 @@ impl Tree {
         // shares the pin via `Arc::clone`.
         let root_pin = bm.pin(root_guid)?;
 
+        // Spawn the v0.2 background checkpointer if opted-in.
+        // `Checkpointer::spawn` returns `None` for disabled
+        // configs, so the `Option` chain stays clean.
+        let checkpointer = crate::checkpoint::Checkpointer::spawn(
+            Arc::clone(&bm),
+            wal.clone(),
+            cfg.checkpoint.clone(),
+        )
+        .map(Arc::new);
+
         Ok(Self {
             cfg,
             backend: bm,
@@ -195,6 +211,7 @@ impl Tree {
             rename_lock: Arc::new(Mutex::new(())),
             next_seq: Arc::new(AtomicU64::new(next_seq)),
             wal,
+            checkpointer,
         })
     }
 

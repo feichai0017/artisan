@@ -6,6 +6,7 @@ use std::sync::Arc;
 use super::config::{Storage, TreeConfig};
 use super::tree::Tree;
 use crate::api::errors::Result;
+use crate::checkpoint::CheckpointConfig;
 use crate::store::backend::Backend;
 
 /// Fluent constructor for [`Tree`].
@@ -59,6 +60,18 @@ impl TreeBuilder {
     /// Bytes appended to the WAL before triggering a checkpoint.
     pub fn checkpoint_byte_interval(mut self, bytes: u64) -> Self {
         self.cfg.checkpoint_byte_interval = bytes;
+        self
+    }
+
+    /// Background checkpointer policy (v0.2).
+    ///
+    /// Default is disabled — callers drive
+    /// [`Tree::checkpoint`] synchronously. Pass
+    /// [`CheckpointConfig::enabled`] (or any config with
+    /// `enabled = true`) to spawn the background thread that
+    /// drains the dirty set + truncates the WAL.
+    pub fn checkpoint(mut self, cfg: CheckpointConfig) -> Self {
+        self.cfg.checkpoint = cfg;
         self
     }
 

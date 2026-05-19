@@ -9,6 +9,8 @@
 
 use std::path::PathBuf;
 
+use crate::checkpoint::CheckpointConfig;
+
 /// Where the tree's data lives.
 ///
 /// `Persistent` is the production target. `Memory` is for tests,
@@ -74,6 +76,11 @@ pub struct TreeConfig {
     /// WAL is the per-op durability path and the blob image only
     /// flushes at `Tree::checkpoint`. See [`Self::wal_sync_on_commit`].
     pub flush_on_write: bool,
+    /// Background checkpointer policy (v0.2). Default disabled —
+    /// callers drive [`crate::Tree::checkpoint`] synchronously.
+    /// Enable via [`CheckpointConfig::enabled`] or
+    /// [`crate::TreeBuilder::checkpoint`].
+    pub checkpoint: CheckpointConfig,
 }
 
 impl TreeConfig {
@@ -88,6 +95,7 @@ impl TreeConfig {
             wal_sync_on_commit: false,
             checkpoint_byte_interval: 16 * 1024 * 1024,
             flush_on_write: true,
+            checkpoint: CheckpointConfig::default(),
         }
     }
 
@@ -100,6 +108,7 @@ impl TreeConfig {
             wal_sync_on_commit: false,
             checkpoint_byte_interval: 16 * 1024 * 1024,
             flush_on_write: true,
+            checkpoint: CheckpointConfig::default(),
         }
     }
 
