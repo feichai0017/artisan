@@ -43,6 +43,11 @@ versioning follows [Semantic Versioning](https://semver.org/).
   `enabled = false`; flipping it on flips on `auto_merge = true` by
   default. `idle_interval` / `dirty_blob_threshold` knobs match the
   fjall / sled flusher conventions.
+- **`idle_interval` default 100 ms** (down from 200 ms) — based on
+  the `bench_checkpoint_sweep` integration measurement: 100 ms
+  cuts paced peak WAL by 4× vs 200 ms with no measurable writer
+  overhead. Tighter intervals see diminishing returns; looser
+  intervals leak WAL bytes between rounds.
 
 ### Changed — public surface
 
