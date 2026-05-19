@@ -139,11 +139,25 @@ pub(super) fn run_round(shared: &Arc<Shared>) -> Result<()> {
     let mut failed: HashMap<BlobGuid, u64> = HashMap::new();
 
     for (guid, txn_id) in &snap {
-        // If the blob isn't in cache (eviction raced us, or it was
-        // never loaded), skip — `mark_dirty` should never have
-        // fired on an uncached blob, but be defensive.
+        // A drained dirty entry **must** have a cache image —
+        // that's invariant **I1** (dirty ⟺ cache newer than
+        // backend). If `snapshot_bytes` returns `None`, the cache
+        // image was evicted while the dirty entry survived: a
+        // silent data-loss path (the BM's `try_evict_lru` /
+        // `try_evict_cold` are supposed to skip dirty entries,
+        // but a regression there is exactly the bug class this
+        // check catches). Restore everything drained and bail
+        // loud — better than silently truncating the WAL when
+        // the next round sees `dirty == 0`.
         let Some(bytes) = shared.bm.snapshot_bytes(*guid) else {
-            continue;
+            for (g, t) in &snap {
+                failed.entry(*g).or_insert(*t);
+            }
+            shared.bm.restore_dirty(failed);
+            shared.bm.restore_pending_deletes(pending);
+            return Err(Error::Internal(
+                "checkpoint: dirty entry lost cache image — invariant I1 violated",
+            ));
         };
         let (tx, rx) = bounded(1);
         let task = IoTask::Flush {

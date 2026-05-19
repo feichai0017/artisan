@@ -830,15 +830,36 @@ impl Tree {
         };
 
         // Phase 2: per-blob write_through with CAS-on-seq.
+        //
+        // A drained dirty entry **must** have a cache image —
+        // invariant I1 (dirty ⟺ cache newer than backend). If
+        // `snapshot_bytes` returns `None`, the BM's eviction
+        // policy regressed and dropped a dirty cache image; that
+        // would otherwise be a silent data-loss path (the next
+        // checkpoint sees `dirty == 0` and truncates the WAL).
+        // Restore both snapshots and bail loud.
         let mut dirty_failed: HashMap<BlobGuid, u64> = HashMap::new();
         let mut first_dirty_err: Option<Error> = None;
         for (guid, expected_seq) in &snap_dirty {
-            if let Some(bytes) = self.backend.snapshot_bytes(*guid) {
-                if let Err(e) = self.backend.write_through(*guid, &bytes, *expected_seq) {
-                    dirty_failed.insert(*guid, *expected_seq);
-                    if first_dirty_err.is_none() {
-                        first_dirty_err = Some(e);
-                    }
+            let Some(bytes) = self.backend.snapshot_bytes(*guid) else {
+                let restore_dirty: HashMap<BlobGuid, u64> = snap_dirty
+                    .iter()
+                    .filter(|(g, _)| !dirty_failed.contains_key(*g))
+                    .map(|(g, s)| (*g, *s))
+                    .collect();
+                self.backend.restore_dirty(restore_dirty);
+                if !dirty_failed.is_empty() {
+                    self.backend.restore_dirty(dirty_failed);
+                }
+                self.backend.restore_pending_deletes(snap_pending);
+                return Err(Error::Internal(
+                    "checkpoint: dirty entry lost cache image — invariant I1 violated",
+                ));
+            };
+            if let Err(e) = self.backend.write_through(*guid, &bytes, *expected_seq) {
+                dirty_failed.insert(*guid, *expected_seq);
+                if first_dirty_err.is_none() {
+                    first_dirty_err = Some(e);
                 }
             }
         }

@@ -534,34 +534,80 @@ impl BufferManager {
 
     /// Internal: walk the cache for the entry with the oldest
     /// `last_touched` tick whose `Arc::strong_count == 1` (i.e.
-    /// no outside pin) and evict it. Returns `true` if an entry
-    /// was dropped.
+    /// no outside pin) and whose dirty / pending-delete bookkeeping
+    /// is empty, and evict it. Returns `true` if an entry was
+    /// dropped.
     ///
     /// O(n) in the cache size, but called only on insert overflow
     /// — the background eviction thread handles steady-state
     /// reclaim with its own tick-driven cadence.
+    ///
+    /// **Dirty / pending-delete check is load-bearing** for the
+    /// `dirty ⟺ cache image newer than backend` (invariant I1)
+    /// and `pending-delete ⟺ cache image must outlive the
+    /// manifest unlink` properties. Without this check, an inline
+    /// overflow can drop a cache image while its dirty entry stays
+    /// in the dirty map — the next checkpoint's `snapshot_bytes`
+    /// returns `None` for that guid and (pre-fix) silently skipped
+    /// it; in memory mode the cache mutation was lost outright,
+    /// in persistent mode the WAL truncate gate stuck closed
+    /// forever. Matches `try_evict_cold`'s guard for the bg sweep.
     fn try_evict_lru(&self) -> bool {
+        // Snapshot the dirty + pending-delete key sets under one
+        // lock acquisition each, then scan the cache against the
+        // snapshots. Holding the locks across the whole cache walk
+        // would serialise reads against any concurrent writer.
+        // Snapshotting and then re-validating under the per-shard
+        // remove_if guard keeps the hot path lock-free.
+        let dirty_snap: std::collections::HashSet<BlobGuid> = {
+            let d = self.dirty.lock().unwrap();
+            d.keys().copied().collect()
+        };
+        let pending_snap: std::collections::HashSet<BlobGuid> = {
+            let p = self.pending_deletes.lock().unwrap();
+            p.keys().copied().collect()
+        };
+
         let mut victim: Option<(BlobGuid, u64)> = None;
         for kv in &self.cache {
             if Arc::strong_count(kv.value()) > 1 {
                 continue;
             }
+            let guid = *kv.key();
+            if dirty_snap.contains(&guid) || pending_snap.contains(&guid) {
+                continue;
+            }
             let tick = kv.value().last_touched.load(Ordering::Relaxed);
             match victim {
-                None => victim = Some((*kv.key(), tick)),
+                None => victim = Some((guid, tick)),
                 Some((_, vmin)) if tick < vmin => {
-                    victim = Some((*kv.key(), tick));
+                    victim = Some((guid, tick));
                 }
                 _ => {}
             }
         }
         if let Some((guid, _)) = victim {
-            // `remove_if` re-checks strong_count under the shard
-            // lock — guards against a pin acquired between our
+            // `remove_if` re-checks strong_count + dirty + pending
+            // under the shard lock — guards against a pin acquired
+            // (or a fresh dirty / pending-delete mark) between our
             // scan and the remove.
             return self
                 .cache
-                .remove_if(&guid, |_, e| Arc::strong_count(e) == 1)
+                .remove_if(&guid, |_, e| {
+                    if Arc::strong_count(e) > 1 {
+                        return false;
+                    }
+                    let d = self.dirty.lock().unwrap();
+                    if d.contains_key(&guid) {
+                        return false;
+                    }
+                    drop(d);
+                    let p = self.pending_deletes.lock().unwrap();
+                    if p.contains_key(&guid) {
+                        return false;
+                    }
+                    true
+                })
                 .is_some();
         }
         false
@@ -1062,6 +1108,104 @@ mod tests {
         assert!(bm.cache.contains_key(&g_last));
         assert!(!bm.cache.contains_key(&g_first));
     }
+
+    /// Regression: prior to the v0.2.1 fix, `try_evict_lru` only
+    /// checked `Arc::strong_count == 1` — it would happily evict
+    /// a dirty cache image, leaving the dirty entry orphaned in
+    /// the dirty map. That broke invariant I1 (dirty ⟺ cache
+    /// newer than backend) and silently lost the cache mutation
+    /// (memory mode) / stuck the WAL truncate gate forever
+    /// (persistent mode).
+    #[test]
+    fn lru_eviction_skips_dirty_entries() {
+        let inner: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        // Pre-populate the inner backend with three blobs whose
+        // bytes we'll be able to distinguish.
+        for i in 0..3u8 {
+            let mut g = [0u8; 16];
+            g[0] = i;
+            inner.write_blob(g, &make_buf(i)).unwrap();
+        }
+
+        // Capacity 2 — any third load must trigger overflow.
+        let bm = BufferManager::new(inner, 2);
+
+        let g_a = {
+            let mut g = [0u8; 16];
+            g[0] = 0;
+            g
+        };
+        let g_b = {
+            let mut g = [0u8; 16];
+            g[0] = 1;
+            g
+        };
+        let g_c = {
+            let mut g = [0u8; 16];
+            g[0] = 2;
+            g
+        };
+
+        // Pin + dirty A. The pin is released right away; only
+        // the dirty entry should keep A from being evicted.
+        {
+            let _pin = bm.pin(g_a).unwrap();
+        }
+        bm.mark_dirty(g_a, 10);
+        assert_eq!(bm.dirty_count(), 1);
+        assert!(bm.cache.contains_key(&g_a));
+
+        // Load B (cache now at capacity = 2).
+        {
+            let _pin = bm.pin(g_b).unwrap();
+        }
+        assert!(bm.cache.contains_key(&g_a));
+        assert!(bm.cache.contains_key(&g_b));
+
+        // Load C — this must trigger overflow eviction. Pre-fix
+        // it would pick A (oldest by tick); post-fix it must
+        // skip A and pick B.
+        {
+            let _pin = bm.pin(g_c).unwrap();
+        }
+
+        assert!(
+            bm.cache.contains_key(&g_a),
+            "dirty entry A's cache image must survive inline LRU eviction",
+        );
+        assert!(
+            bm.cache.contains_key(&g_c),
+            "newly-pinned C must be in cache",
+        );
+        // B (clean, oldest after A is protected) is the victim.
+        assert!(
+            !bm.cache.contains_key(&g_b),
+            "B (clean, no pin) should have been evicted in A's stead",
+        );
+        // The dirty entry for A is still tracked.
+        assert_eq!(
+            bm.dirty_count(),
+            1,
+            "dirty bookkeeping must not be touched by eviction",
+        );
+
+        // And snapshot_bytes(A) must still return Some — the
+        // invariant downstream checkpoint code relies on.
+        assert!(
+            bm.snapshot_bytes(g_a).is_some(),
+            "dirty entry's cache image must be snapshottable",
+        );
+    }
+
+    // Note on pending-delete + cache: `mark_for_delete` already
+    // removes the cache image (`self.cache.remove(&guid)`) in the
+    // same call as it queues the pending-delete, so under the
+    // engine's current invariant set a blob is never both cached
+    // and in `pending_deletes` simultaneously. `try_evict_lru`'s
+    // pending-delete check is kept as defense in depth — cheap
+    // (one lock + contains_key per scan) and documents the
+    // invariant for future readers — but isn't exercised by a
+    // test today.
 
     #[test]
     fn write_through_propagates_to_inner_backend() {
