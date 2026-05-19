@@ -65,18 +65,27 @@ cargo pgo optimize bench -- --bench main
 
 ## Expected gains
 
-Numbers below are from one M-series workstation (M3 Max, 10000-
-key tree, `bench_kv_microcase`):
+PGO measurements for holt's hot paths haven't been published
+yet — the table below shows what the literature reports for
+similar workloads on rustc + LLVM PGO and what holt is
+**likely** to see, so you have a yardstick when you measure
+your own deployment:
 
-| Workload          | Release | Release + PGO | Δ      |
-| ----------------- | ------- | ------------- | ------ |
-| `objstore_get`    | 178 ns  | 152 ns        | -15 %  |
-| `objstore_list`   | 1.2 µs  | 1.05 µs       | -12 %  |
-| `objstore_put`    | 735 ns  | 681 ns        | -7 %   |
+| Workload pattern             | Typical PGO Δ | Why                                              |
+| ---------------------------- | ------------- | ------------------------------------------------ |
+| Walker `Tree::get` hot path  | -10 to -15 %  | Tight `ntype_of → body_of_slot → SIMD scan → recurse`; branch + inline decisions dominate |
+| Range / list-style scans     | -5 to -12 %   | More uniform control flow, SIMD step inner loop already saturates |
+| Write paths (`put` / spillover) | -5 to -8 %   | Spillover allocates + memcpys 512 KB blobs; LLVM PGO can't reorder a `memcpy` |
+| WAL-fsync-bound workloads    | ≈0            | End-to-end latency is `sync_data`; CPU savings are rounding error |
 
-x86_64 servers see similar ratios but the absolute numbers shift
-with the AVX feature mix and L1 latency. Always measure on your
-target hardware before committing the optimized binary.
+If you publish numbers from your own runs, replace this table
+with concrete measurements and the criterion baseline you
+compared against (`cargo bench --bench main -- --baseline release`).
+
+The bench harness lives at `benches/main.rs` and covers KV /
+object-store / FS-metadata workloads × get / put / mixed /
+list / list-delim × memory / persistent (24 sub-benches). See
+`benches/README.md` for how to read the criterion output.
 
 ## When PGO doesn't help
 

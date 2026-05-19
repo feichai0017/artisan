@@ -18,9 +18,13 @@
 //! ## Metrics emitted
 //!
 //! All metric names are prefixed with `holt_` and follow the
-//! [Prometheus naming convention][1]: `_total` for monotonic
-//! counters, `_bytes` for byte gauges, no suffix for arbitrary
-//! gauges.
+//! [Prometheus naming convention][1]:
+//!
+//! - **`_total` suffix**: monotonically-non-decreasing counters,
+//!   never reset across a process's lifetime.
+//! - **`_bytes` suffix**: gauges measured in bytes.
+//! - **No suffix**: arbitrary gauges (instantaneous values that
+//!   can go up or down).
 //!
 //! [1]: https://prometheus.io/docs/practices/naming/
 //!
@@ -29,9 +33,9 @@
 //! | `holt_blob_count`                       | gauge   | `TreeStats::blob_count`                |
 //! | `holt_space_used_bytes`                 | gauge   | `TreeStats::total_space_used`          |
 //! | `holt_gap_space_bytes`                  | gauge   | `TreeStats::total_gap_space`           |
-//! | `holt_slots_total`                      | gauge   | `TreeStats::total_slots`               |
-//! | `holt_compactions_total`                | counter | `TreeStats::total_compactions`         |
-//! | `holt_tombstones_total`                 | gauge   | `TreeStats::total_tombstones`          |
+//! | `holt_slots`                            | gauge   | `TreeStats::total_slots`               |
+//! | `holt_compactions`                      | gauge   | `TreeStats::total_compactions` (sum of `compact_times` across **currently reachable** blobs — can go DOWN if a blob is merged/deleted; it's a tree-shape metric, not a lifetime counter) |
+//! | `holt_tombstones`                       | gauge   | `TreeStats::total_tombstones`          |
 //! | `holt_bm_dirty_count`                   | gauge   | `TreeStats::bm_dirty_count`            |
 //! | `holt_bm_pending_delete_count`          | gauge   | `TreeStats::bm_pending_delete_count`   |
 //! | `holt_bm_cache_hits_total`              | counter | `TreeStats::bm_cache_hits`             |
@@ -57,6 +61,7 @@ use crate::api::stats::TreeStats;
 /// The output is one HELP + TYPE + sample line per metric,
 /// terminated by a `\n`. Suitable as the body of an HTTP 200
 /// response with `Content-Type: text/plain; version=0.0.4`.
+#[allow(clippy::too_many_lines)] // one `metric(...)` call per emit — splitting hides the export shape
 #[must_use]
 pub fn render_prometheus(stats: &TreeStats) -> String {
     // Pre-size for the typical payload (~1.5 KB) to avoid the
@@ -86,22 +91,25 @@ pub fn render_prometheus(stats: &TreeStats) -> String {
     );
     metric(
         &mut out,
-        "holt_slots_total",
-        "Sum of `num_slots` across every blob.",
+        "holt_slots",
+        "Sum of `num_slots` across every reachable blob.",
         "gauge",
         stats.total_slots,
     );
     metric(
         &mut out,
-        "holt_compactions_total",
-        "Lifetime per-blob `compact_blob` runs.",
-        "counter",
+        "holt_compactions",
+        "Sum of `compact_times` across currently-reachable blobs. \
+         A gauge, not a counter — a blob that merges into its \
+         parent (or is deleted) takes its `compact_times` with \
+         it, so this can go down.",
+        "gauge",
         stats.total_compactions,
     );
     metric(
         &mut out,
-        "holt_tombstones_total",
-        "Sum of `tombstone_leaf_cnt` across every blob.",
+        "holt_tombstones",
+        "Sum of `tombstone_leaf_cnt` across every reachable blob.",
         "gauge",
         stats.total_tombstones,
     );
@@ -232,8 +240,20 @@ mod tests {
         assert!(out.contains("# HELP holt_blob_count "));
         assert!(out.contains("# TYPE holt_blob_count gauge\n"));
         assert!(out.contains("holt_blob_count 3\n"));
+        // Monotonic counters keep the `_total` suffix...
         assert!(out.contains("holt_bm_cache_hits_total 1000\n"));
         assert!(out.contains("holt_bm_optimistic_restarts_total 3\n"));
+        // ...non-monotonic gauges (sum-over-reachable-blobs) drop it.
+        assert!(out.contains("# TYPE holt_slots gauge\n"));
+        assert!(out.contains("holt_slots 42\n"));
+        assert!(out.contains("# TYPE holt_compactions gauge\n"));
+        assert!(out.contains("holt_compactions 7\n"));
+        assert!(out.contains("# TYPE holt_tombstones gauge\n"));
+        assert!(out.contains("holt_tombstones 5\n"));
+        // None of the gauges leak `_total`.
+        assert!(!out.contains("holt_slots_total"));
+        assert!(!out.contains("holt_compactions_total"));
+        assert!(!out.contains("holt_tombstones_total"));
         // No checkpointer block.
         assert!(!out.contains("holt_checkpoint_"));
     }

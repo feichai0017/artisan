@@ -79,26 +79,43 @@ pub(super) fn run_round(shared: &Arc<Shared>) -> Result<()> {
     #[cfg(feature = "tracing")]
     let round_start = std::time::Instant::now();
 
-    // 1+2. Snapshot dirty + flush WAL, both under the same wal
-    // lock so the dirty set we drain is closed against in-flight
-    // writers (W2D-strict). The writer-side protocol holds
-    // wal.lock for the duration of walker.mutate + mark_dirty +
-    // wal.append, so any dirty entry visible here has its WAL
-    // record already buffered in the writer — the trailing
-    // `wal.flush` makes it durable before we touch backend.
+    // 1+2. Snapshot dirty AND pending-deletes + flush WAL, all
+    // under the same wal lock so both sets we drain are closed
+    // against in-flight writers (W2D-strict). The writer-side
+    // protocol holds wal.lock for the duration of walker.mutate
+    // + mark_dirty / mark_for_delete + wal.append, so any entry
+    // visible here has its WAL record already buffered in the
+    // writer — the trailing `wal.flush` makes it durable before
+    // we touch backend.
     //
-    // No-WAL trees (memory mode, user-supplied backend) skip the
-    // lock; concurrency safety there is the user's contract.
-    let snap = if let Some(wal) = &shared.wal {
+    // If `snapshot_pending_deletes` were taken outside this
+    // wal.lock block, a writer could (a) take the lock, (b)
+    // walker.erase that hits `SubtreeGone` (which calls
+    // `mark_for_delete`), (c) wal.append the erase record, (d)
+    // release the lock, before we snapshot pending; we'd then
+    // execute `backend.delete_blob` and re-Sync manifest while
+    // the writer's WAL record was still only in the writer's
+    // buffer. A crash there would leave the manifest ahead of
+    // WAL — exactly the W2D violation deferred-delete was
+    // designed to prevent.
+    //
+    // No-WAL trees (memory mode, user-supplied backend) skip
+    // the lock; concurrency safety there is the user's contract.
+    let (snap, pending) = if let Some(wal) = &shared.wal {
         let mut w = wal.lock().unwrap();
         let snap = shared.bm.snapshot_dirty();
+        let pending = shared.bm.snapshot_pending_deletes();
         if let Err(e) = w.flush() {
             shared.bm.restore_dirty(snap);
+            shared.bm.restore_pending_deletes(pending);
             return Err(e);
         }
-        snap
+        (snap, pending)
     } else {
-        shared.bm.snapshot_dirty()
+        (
+            shared.bm.snapshot_dirty(),
+            shared.bm.snapshot_pending_deletes(),
+        )
     };
     let snap_count = snap.len();
     shared.last_dirty_count.store(snap_count, Ordering::Relaxed);
@@ -106,10 +123,10 @@ pub(super) fn run_round(shared: &Arc<Shared>) -> Result<()> {
     // Early-skip only when nothing at all needs attention. A
     // pending deferred-delete from a previous round (e.g. one
     // whose `backend.delete_blob` or trailing Sync failed and
-    // got restored) must keep rounds running so it eventually
-    // drains — otherwise the WAL truncate gate stays closed
-    // forever.
-    if snap.is_empty() && merged == 0 && shared.bm.pending_delete_count() == 0 {
+    // got restored) was already drained above; check the
+    // snapshot's length so we don't bail out on something we
+    // just picked up.
+    if snap.is_empty() && merged == 0 && pending.is_empty() {
         shared.rounds_succeeded.fetch_add(1, Ordering::Relaxed);
         #[cfg(feature = "tracing")]
         tracing::trace!(target: "holt::checkpoint", "round skipped — nothing dirty");
@@ -203,15 +220,11 @@ pub(super) fn run_round(shared: &Arc<Shared>) -> Result<()> {
         }
     }
 
-    // 6. Apply pending deletes — the erase walker's SubtreeGone
-    //    path queued these via `bm.mark_for_delete(child, seq)`
-    //    so the manifest mutation couldn't race ahead of the WAL.
-    //    Safe to drain now: every dirty Flush above is on disk
-    //    (via Sync at step 5) and the WAL records covering the
-    //    erase ops were durable at step 2. The manifest mutations
-    //    happen in-memory here; the trailing re-Sync at step 7
-    //    persists them.
-    let pending = shared.bm.snapshot_pending_deletes();
+    // 6. Apply pending deletes — `pending` was already drained in
+    //    step 1 under the wal.lock, so the writer-side WAL records
+    //    covering each unlink op are durable on disk (via the
+    //    step-2 wal.flush). Safe to mutate the manifest now; the
+    //    trailing re-Sync at step 7 persists it.
     let pending_count = pending.len();
     let mut pending_failed: HashMap<BlobGuid, u64> = HashMap::new();
     for (guid, seq) in &pending {

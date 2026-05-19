@@ -734,6 +734,113 @@ fn compact_does_not_leak_pre_wal_state_to_backend() {
 }
 
 #[test]
+fn multi_blob_compact_does_not_leak_pre_wal_state_to_backend() {
+    // Same protocol assertion as
+    // `compact_does_not_leak_pre_wal_state_to_backend`, but
+    // sized to force spillover so `Tree::compact` actually
+    // enters its **phase 1.5 `refresh_blob_node_pointers`**
+    // path — that path rewrites parent `BlobNode.child_entry_ptr`
+    // after `compact_blob` renumbers each child's slots. Before
+    // the fix it called `bm.commit(parent_guid)` inline, which
+    // pushed the parent's cache image (potentially carrying
+    // unflushed user mutations) to backend before the compact's
+    // trailing `flush_dirty_inline` could gate it under W2D.
+    use holt::{Backend, MemoryBackend};
+    use std::sync::Arc;
+
+    let inner: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+    let mut cfg = TreeConfig::memory();
+    cfg.flush_on_write = false;
+    let tree = Tree::open_with_backend(cfg, Arc::clone(&inner)).unwrap();
+
+    // Inner backend starts with only the seeded root.
+    assert_eq!(inner.list_blobs().unwrap().len(), 1);
+
+    // Stuff enough data to force at least two spillovers so the
+    // `refresh_blob_node_pointers` walk has multiple parent
+    // BlobNodes to consider.
+    let payload = vec![b'q'; 1024];
+    for i in 0..1500u32 {
+        tree.put(format!("k{i:05}").as_bytes(), &payload).unwrap();
+    }
+    let stats = tree.stats().unwrap();
+    assert!(
+        stats.blob_count > 1,
+        "multi-blob compact precondition: spillover must trigger (got {} blobs)",
+        stats.blob_count,
+    );
+
+    // Compact restructures every blob + the parent BlobNodes. It
+    // must NOT push anything to backend — only stage via dirty.
+    tree.compact().unwrap();
+    let after_compact = inner.list_blobs().unwrap();
+    assert_eq!(
+        after_compact.len(),
+        1,
+        "multi-blob compact must not push cache state to backend (got {} blobs)",
+        after_compact.len(),
+    );
+    assert!(
+        tree.stats().unwrap().bm_dirty_count >= 1,
+        "compact must leave dirty entries waiting for the next checkpoint",
+    );
+
+    // Now checkpoint and reopen-via-backend: every key must still
+    // be present (the structural rewrite preserved logical state).
+    tree.checkpoint().unwrap();
+    assert_eq!(tree.stats().unwrap().bm_dirty_count, 0);
+    for i in 0..1500u32 {
+        let k = format!("k{i:05}");
+        assert_eq!(
+            tree.get(k.as_bytes()).unwrap().as_deref(),
+            Some(payload.as_slice()),
+            "key {k} lost after multi-blob compact + checkpoint",
+        );
+    }
+}
+
+#[test]
+fn tree_stats_does_not_perturb_cache_counters_or_lru() {
+    // `Tree::stats` is the observability path — it must NOT
+    // bump `bm_cache_hits` / `bm_cache_misses` or refresh the
+    // per-entry `last_touched` tick. A Prometheus scrape calling
+    // `stats()` repeatedly should report the same numbers
+    // between scrapes when no other work happens in between.
+    let tree = Tree::open(TreeConfig::memory()).unwrap();
+    // Seed enough data to spillover so `stats()` walks multiple
+    // blobs (not just the root).
+    let payload = vec![b'q'; 1024];
+    for i in 0..800u32 {
+        tree.put(format!("k{i:05}").as_bytes(), &payload).unwrap();
+    }
+
+    // Capture baseline counters AFTER one stats() call so any
+    // first-call setup costs are excluded.
+    let baseline = tree.stats().unwrap();
+    let baseline_hits = baseline.bm_cache_hits;
+    let baseline_misses = baseline.bm_cache_misses;
+    assert!(
+        baseline.blob_count > 1,
+        "test premise: multi-blob tree (got {})",
+        baseline.blob_count,
+    );
+
+    // Call stats() a bunch more times — none of these should
+    // perturb the cache hit/miss counters.
+    for _ in 0..50 {
+        let s = tree.stats().unwrap();
+        assert_eq!(
+            s.bm_cache_hits, baseline_hits,
+            "Tree::stats() must not bump cache_hits",
+        );
+        assert_eq!(
+            s.bm_cache_misses, baseline_misses,
+            "Tree::stats() must not bump cache_misses",
+        );
+    }
+}
+
+#[test]
 fn batch_replay_then_checkpoint_then_reopen_preserves_data() {
     // Same W2D closure as `replay_then_checkpoint_then_reopen_preserves_data`,
     // but exercises the `apply_batch` path: a single `Batch` WAL

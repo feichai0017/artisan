@@ -876,7 +876,19 @@ impl Tree {
     /// Acceptable for observability; use [`Tree::checkpoint`] first
     /// if you need a quiescent snapshot.
     pub fn stats(&self) -> Result<TreeStats> {
-        let guids = engine::collect_blob_guids(&self.backend, self.root_guid)?;
+        // `Tree::stats` is an introspection path — used by users
+        // checking on the tree, and (via `holt::metrics`) by
+        // Prometheus scrapes that read `bm_cache_hits`,
+        // `bm_cache_misses`, `bm_optimistic_restarts`, etc. We
+        // walk every reachable blob to gather per-blob stats; if
+        // that walk went through `BufferManager::pin`, every
+        // hit would bump `cache_hits` and every entry's
+        // `last_touched` tick would be refreshed — the scrape
+        // would (a) inflate the very counters it's reporting
+        // and (b) hand-rescue cold entries from the eviction
+        // sweep just by looking at them. Both paths use the
+        // `_silent` variants instead.
+        let guids = engine::collect_blob_guids_silent(&self.backend, self.root_guid)?;
         let mut blobs: Vec<BlobStats> = Vec::with_capacity(guids.len());
         let mut total_space_used: u64 = 0;
         let mut total_gap_space: u64 = 0;
@@ -884,7 +896,7 @@ impl Tree {
         let mut total_compactions: u64 = 0;
         let mut total_tombstones: u64 = 0;
         for guid in &guids {
-            let pin = self.backend.pin(*guid)?;
+            let pin = self.backend.pin_silent(*guid)?;
             let guard = pin.read();
             let frame = BlobFrameRef::wrap(guard.as_slice());
             let h = frame.header();
@@ -938,7 +950,23 @@ impl Tree {
     /// fold every mergeable cross-blob crossing back into its
     /// parent.
     ///
-    /// Two phases:
+    /// ## Not safe to run concurrently with reads or writes.
+    ///
+    /// The caller must guarantee no other thread is calling
+    /// `Tree::{put, get, delete, rename, txn, range, scan_prefix}`
+    /// for the duration of `compact()`. Phase 1 rebuilds each
+    /// blob in place, which renumbers slot indices inside the
+    /// child blob; phase 1.5 then walks the tree and fixes every
+    /// parent `BlobNode.child_entry_ptr` to match the child's
+    /// freshly-rewritten `header.root_slot`. In the window
+    /// between phase 1 and phase 1.5 a concurrent reader can
+    /// pull a stale `child_entry_ptr` from the parent and
+    /// descend into a slot that no longer means what it used
+    /// to. A tree-wide maintenance latch (writers stall while
+    /// compact runs) is the planned v0.3 fix; until then,
+    /// schedule `compact()` during a quiescent window.
+    ///
+    /// ## Two phases:
     ///
     /// 1. **Per-blob compact**: every reachable blob is rebuilt in
     ///    place, dropping tombstones and reclaiming bump-area waste.

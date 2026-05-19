@@ -478,6 +478,20 @@ impl BufferManager {
         Some(arc)
     }
 
+    /// Internal: same as [`Self::get_cached`] but **does not** bump
+    /// `cache_hits` / `cache_misses` and **does not** refresh the
+    /// entry's `last_touched` tick. Used by introspection paths
+    /// (`Tree::stats`, metrics scrapes) that need to read blob
+    /// state without polluting the very counters they're about
+    /// to report or skewing the LRU sweep's view of which entries
+    /// are cold.
+    fn get_cached_silent(&self, guid: BlobGuid) -> Option<Arc<CachedBlob>> {
+        let entry = self.cache.get(&guid)?;
+        let arc = Arc::clone(entry.value());
+        drop(entry);
+        Some(arc)
+    }
+
     /// Internal: insert a freshly-loaded blob into the cache.
     /// Idempotent under concurrent inserts. Stamps the new entry's
     /// `last_touched` so it doesn't look cold to the eviction
@@ -606,6 +620,43 @@ impl BufferManager {
         // Pathological: insert raced with eviction. Build an
         // entry directly from scratch and force-insert it.
         let entry = Arc::new(CachedBlob::new(scratch));
+        let tick = self.clock.fetch_add(1, Ordering::Relaxed);
+        entry.last_touched.store(tick, Ordering::Relaxed);
+        self.cache.insert(guid, Arc::clone(&entry));
+        Ok(entry)
+    }
+
+    /// Like [`Self::pin`] but does not bump `cache_hits` /
+    /// `cache_misses` and does not refresh the `last_touched`
+    /// tick on a hit — used by introspection paths
+    /// (`Tree::stats`, metrics scrapes, internal asserts) that
+    /// must not perturb the very telemetry they're about to
+    /// report or rescue cold entries from the eviction sweep
+    /// just by looking at them.
+    ///
+    /// **Miss-path behaviour**: a `pin_silent` miss still loads
+    /// the blob from the inner backend and inserts it into the
+    /// cache (via `insert_into_cache`, which stamps
+    /// `last_touched` like any other insert) — the alternative
+    /// (return `Err`) would surprise callers and the load is
+    /// the only sane way to fulfil the pin contract. The miss
+    /// itself is just not reflected in `cache_misses`. Hot
+    /// scrape paths should expect most calls to be hits.
+    pub fn pin_silent(&self, guid: BlobGuid) -> Result<Arc<CachedBlob>> {
+        if let Some(entry) = self.get_cached_silent(guid) {
+            return Ok(entry);
+        }
+        let mut scratch = AlignedBlobBuf::zeroed();
+        self.backend.read_blob(guid, &mut scratch)?;
+        self.insert_into_cache(guid, &scratch);
+        if let Some(entry) = self.get_cached_silent(guid) {
+            return Ok(entry);
+        }
+        let entry = Arc::new(CachedBlob::new(scratch));
+        // We still stamp last_touched on the truly-pathological
+        // race-with-eviction fallback path — the entry is being
+        // freshly inserted, the tick reflects that creation, not
+        // a "touch" by the scrape.
         let tick = self.clock.fetch_add(1, Ordering::Relaxed);
         entry.last_touched.store(tick, Ordering::Relaxed);
         self.cache.insert(guid, Arc::clone(&entry));

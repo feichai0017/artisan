@@ -29,11 +29,36 @@ use super::writers::write_struct_to_slot;
 /// Each blob is pinned + read under a shared guard exactly once; no
 /// blob bytes are copied. The returned vector's first element is
 /// always `root_guid`.
+///
+/// Uses `BufferManager::pin`, which bumps cache hit/miss
+/// counters and refreshes `last_touched`. Callers on the
+/// observability path (`Tree::stats`, metrics scrapes) should
+/// use [`collect_blob_guids_silent`] instead to avoid the
+/// scrape polluting the counters it's about to report.
 pub fn collect_blob_guids(bm: &BufferManager, root_guid: BlobGuid) -> Result<Vec<BlobGuid>> {
+    collect_blob_guids_inner(bm, root_guid, /*silent=*/ false)
+}
+
+/// Same shape as [`collect_blob_guids`] but uses
+/// `BufferManager::pin_silent`, so the walk does not bump
+/// `cache_hits` / `cache_misses` and does not refresh
+/// `last_touched`. Used by `Tree::stats`.
+pub fn collect_blob_guids_silent(
+    bm: &BufferManager,
+    root_guid: BlobGuid,
+) -> Result<Vec<BlobGuid>> {
+    collect_blob_guids_inner(bm, root_guid, /*silent=*/ true)
+}
+
+fn collect_blob_guids_inner(
+    bm: &BufferManager,
+    root_guid: BlobGuid,
+    silent: bool,
+) -> Result<Vec<BlobGuid>> {
     let mut all = vec![root_guid];
     let mut queue: Vec<BlobGuid> = vec![root_guid];
     while let Some(guid) = queue.pop() {
-        let pin = bm.pin(guid)?;
+        let pin = if silent { bm.pin_silent(guid)? } else { bm.pin(guid)? };
         let mut found = Vec::new();
         {
             let guard = pin.read();
@@ -164,7 +189,20 @@ pub fn refresh_blob_node_pointers(bm: &BufferManager, root_guid: BlobGuid) -> Re
             }
         }
         if touched {
-            bm.commit(parent_guid)?;
+            // Stage the rewrite through the unified dirty-set
+            // protocol; `Tree::compact` (the only caller) drives
+            // the trailing `flush_dirty_inline` → `backend.flush`
+            // → conditional WAL truncate sequence under W2D.
+            //
+            // An inline `bm.commit(parent_guid)` here would push
+            // the cache image (which may still include unflushed
+            // user-write WAL records' effects on `parent_guid`)
+            // straight to backend, re-opening the W2D hole that
+            // `Tree::compact`'s phase 1/2 already closed. The
+            // `STRUCTURAL_SEQ` sentinel keeps this dirty entry
+            // out of the WAL trim watermark — the refresh itself
+            // doesn't correspond to any WAL record.
+            bm.mark_dirty(parent_guid, crate::store::buffer_manager::STRUCTURAL_SEQ);
         }
     }
     Ok(updated)

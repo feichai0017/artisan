@@ -61,7 +61,7 @@ pub use lookup::lookup_multi;
 pub use merge::try_merge_children;
 pub use migrate::compact_blob;
 pub use range::{RangeBuilder, RangeEntry, RangeIter};
-pub use scan::{collect_blob_guids, refresh_blob_node_pointers};
+pub use scan::{collect_blob_guids, collect_blob_guids_silent, refresh_blob_node_pointers};
 
 // ---------- shared internals ----------
 
