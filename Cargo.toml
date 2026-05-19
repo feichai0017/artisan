@@ -73,7 +73,10 @@ io-uring = ["dep:io-uring"]
 # users who don't enable a subscriber pay zero runtime cost
 # beyond the cfg-gated span constructor.
 tracing = ["dep:tracing"]
-# Future: "metrics" for prometheus, "mvcc" for snapshot isolation.
+# Enables the `holt::metrics` module — renders `TreeStats`
+# into Prometheus text format for `/metrics` endpoints. Pure
+# Rust, no external crates pulled in.
+metrics = []
 
 [profile.release]
 lto = "thin"

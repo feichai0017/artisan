@@ -128,6 +128,11 @@ pub(crate) mod checkpoint;
 pub(crate) mod concurrency;
 pub(crate) mod engine;
 
+/// Prometheus text-format renderer for [`TreeStats`]. Enabled via
+/// the `metrics` feature flag.
+#[cfg(feature = "metrics")]
+pub mod metrics;
+
 // -- Top-level re-exports -----------------------------------------
 //
 // The flat `holt::*` surface — every name a user reaches for via
