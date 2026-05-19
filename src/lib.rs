@@ -127,5 +127,6 @@ pub use api::errors::{Error, Result};
 pub use api::builder::TreeBuilder;
 pub use api::tree::{BlobStats, Tree, TreeStats};
 pub use api::txn::TxnBatch;
+pub use engine::{RangeBuilder, RangeEntry, RangeIter};
 pub use store::backend::{AlignedBlobBuf, Backend, MemoryBackend, PersistentBackend};
 pub use store::BufferManager;

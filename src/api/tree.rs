@@ -36,6 +36,7 @@ use std::sync::{Arc, Mutex};
 use super::config::{Storage, TreeConfig};
 use super::errors::{Error, Result};
 use crate::engine;
+use crate::engine::RangeBuilder;
 use crate::journal::reader::replay;
 use crate::journal::txn_op::TxnOp;
 use crate::journal::writer::WalWriter;
@@ -497,6 +498,28 @@ impl Tree {
             self.backend.commit(self.root_guid)?;
         }
         Ok(())
+    }
+
+    /// Open a stateful range iterator anchored at this tree.
+    ///
+    /// Returns a [`RangeBuilder`] for chaining `prefix`,
+    /// `start_after`, and `delimiter`. Call
+    /// [`RangeBuilder::into_iter`] (or `for entry in builder`) to
+    /// start emitting [`RangeEntry`](crate::RangeEntry) items in
+    /// lex key order.
+    ///
+    /// Best-effort snapshot semantics: each iterator step
+    /// re-acquires a shared read guard on its current blob; the
+    /// iterator does NOT hold a write barrier across calls.
+    /// Concurrent mutations between steps may cause a leaf to be
+    /// skipped or visited twice (the path stack is raw
+    /// `(blob_guid, slot)` pairs, mirroring the upstream
+    /// `fa_iter`'s "invalid iterator(#1)" failure mode). For
+    /// strict snapshot iteration, pause writes externally
+    /// (e.g., call [`Tree::checkpoint`] and don't mutate during
+    /// traversal).
+    pub fn range(&self) -> RangeBuilder {
+        RangeBuilder::new(Arc::clone(&self.backend), self.root_guid)
     }
 
     fn apply_put_inner(&self, key: &[u8], value: &[u8], seq: u64) -> Result<TxnOp> {

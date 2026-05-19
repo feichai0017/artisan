@@ -199,8 +199,27 @@ Required for the v0.1 tag:
       = persistent (default), `TreeConfig::memory()` = volatile
 - [x] `Tree::put / get / delete / rename` (with cross-blob lookup
       + auto-spillover insert; delete + rename cross-blob queued)
-- [ ] `Tree::range(prefix)` + `.delimiter(b'/')` + `.start_after(key)`
-      + `.take(n)`
+- [x] **`Tree::range()` stateful iterator** —
+      [`engine::RangeBuilder`](src/engine/walker/range.rs) /
+      [`engine::RangeIter`](src/engine/walker/range.rs) /
+      [`engine::RangeEntry`](src/engine/walker/range.rs).
+      Modelled on the upstream `fa_iter` shape (8 log strings give
+      the contract: `path` stack of `(blob_guid, slot)`, materialised
+      `curr_key`, exclusive `marker`, char `delimiter`, per-node
+      resume cursor `start_index_in_node`). Builder chains
+      `.prefix(p)` (anchored descent — no full-tree scan),
+      `.start_after(k)` (strict-greater lower bound), `.delimiter(b)`
+      (S3-style rollup with dedup of `CommonPrefix` emits). Walks
+      transparently across `BlobNode` crossings, holding one shared
+      read guard per stack frame. Forward-only — no `findPrev`.
+      Best-effort snapshot: between `next()` calls writers can
+      interleave (same failure mode as the upstream's
+      "invalid iterator(#1)" warning); for strict snapshot, pause
+      writes externally. Caller can stop via `.take(n)` /
+      collect-with-limit on the `Iterator` trait. Returns
+      `Iterator<Item = Result<RangeEntry>>`, where `RangeEntry::Key`
+      / `RangeEntry::CommonPrefix` distinguish leaf vs rollup
+      emissions.
 - [x] **`Tree::txn(|b| { ... })` for batch ops under one WAL record** —
       [`api::TxnBatch`](src/api/txn.rs) buffers `put` / `delete` /
       `rename`; on closure return,

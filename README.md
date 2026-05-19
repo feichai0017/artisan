@@ -110,7 +110,6 @@ Done — algorithm core:
   lone-child collapse is unchanged.
 
 Queued — see [ROADMAP.md](ROADMAP.md):
-- `Tree::range` (stateful iterator with `start_after` + `delimiter`)
 - io_uring submission on the persistent backend (Stage 7)
 
 ## Quick taste

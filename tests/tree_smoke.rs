@@ -1078,3 +1078,173 @@ fn txn_returns_error_when_rename_src_missing_and_leaves_prior_ops_applied() {
     // The post-failure put never ran.
     assert!(tree.get(b"never-reached").unwrap().is_none());
 }
+
+// ----------------------------------------------------------------
+// Tree::range
+// ----------------------------------------------------------------
+
+use holt::RangeEntry;
+
+fn collect_keys(iter: impl IntoIterator<Item = Result<RangeEntry, holt::Error>>) -> Vec<Vec<u8>> {
+    iter.into_iter()
+        .map(|r| match r.unwrap() {
+            RangeEntry::Key { key, .. } => key,
+            RangeEntry::CommonPrefix(p) => p,
+        })
+        .collect()
+}
+
+#[test]
+fn range_empty_tree_yields_nothing() {
+    let tree = Tree::open(TreeConfig::memory()).unwrap();
+    let v: Vec<_> = tree.range().into_iter().collect();
+    assert!(v.is_empty());
+}
+
+#[test]
+fn range_no_filter_walks_all_keys_in_lex_order() {
+    let tree = Tree::open(TreeConfig::memory()).unwrap();
+    let pairs: Vec<(&[u8], &[u8])> = vec![
+        (b"banana", b"yellow"),
+        (b"apple", b"red"),
+        (b"cherry", b"dark"),
+        (b"apricot", b"orange"),
+    ];
+    for (k, v) in &pairs {
+        tree.put(k, v).unwrap();
+    }
+    let got: Vec<_> = tree
+        .range()
+        .into_iter()
+        .map(|r| match r.unwrap() {
+            RangeEntry::Key { key, value } => (key, value),
+            RangeEntry::CommonPrefix(_) => panic!("no delimiter set"),
+        })
+        .collect();
+    assert_eq!(
+        got,
+        vec![
+            (b"apple".to_vec(), b"red".to_vec()),
+            (b"apricot".to_vec(), b"orange".to_vec()),
+            (b"banana".to_vec(), b"yellow".to_vec()),
+            (b"cherry".to_vec(), b"dark".to_vec()),
+        ]
+    );
+}
+
+#[test]
+fn range_prefix_narrows_to_matching_subtree_only() {
+    let tree = Tree::open(TreeConfig::memory()).unwrap();
+    for k in [
+        &b"img/01.jpg"[..],
+        b"img/02.jpg",
+        b"img/03.jpg",
+        b"video/1.mp4",
+        b"video/2.mp4",
+        b"doc/readme.md",
+    ] {
+        tree.put(k, b"v").unwrap();
+    }
+    let got = collect_keys(tree.range().prefix(b"img/"));
+    assert_eq!(
+        got,
+        vec![
+            b"img/01.jpg".to_vec(),
+            b"img/02.jpg".to_vec(),
+            b"img/03.jpg".to_vec(),
+        ]
+    );
+    // Empty for a non-existent prefix.
+    let none: Vec<_> = tree.range().prefix(b"music/").into_iter().collect();
+    assert!(none.is_empty());
+}
+
+#[test]
+fn range_start_after_is_strict_lower_bound() {
+    let tree = Tree::open(TreeConfig::memory()).unwrap();
+    for i in 0..10u32 {
+        tree.put(format!("k{i:02}").as_bytes(), b"v").unwrap();
+    }
+    let got = collect_keys(tree.range().start_after(b"k04"));
+    assert_eq!(
+        got,
+        (5..10u32)
+            .map(|i| format!("k{i:02}").into_bytes())
+            .collect::<Vec<_>>(),
+    );
+    // Start after the last key — empty.
+    let after_last: Vec<_> = tree.range().start_after(b"k09").into_iter().collect();
+    assert!(after_last.is_empty());
+}
+
+#[test]
+fn range_delimiter_rolls_up_common_prefixes_with_dedup() {
+    let tree = Tree::open(TreeConfig::memory()).unwrap();
+    for k in [
+        &b"img/01.jpg"[..],
+        b"img/02.jpg",
+        b"img/sub/a.jpg",
+        b"img/sub/b.jpg",
+        b"img/other/x.jpg",
+    ] {
+        tree.put(k, b"v").unwrap();
+    }
+    let mut keys_seen = Vec::new();
+    let mut prefixes_seen = Vec::new();
+    for r in tree.range().prefix(b"img/").delimiter(b'/').into_iter() {
+        match r.unwrap() {
+            RangeEntry::Key { key, .. } => keys_seen.push(key),
+            RangeEntry::CommonPrefix(p) => prefixes_seen.push(p),
+        }
+    }
+    // Lex order over leaves under img/:
+    //   img/01.jpg            → Key (no `/` past prefix)
+    //   img/02.jpg            → Key
+    //   img/other/x.jpg       → CommonPrefix("img/other/")
+    //   img/sub/a.jpg         → CommonPrefix("img/sub/")
+    //   img/sub/b.jpg         → deduped, skipped
+    assert_eq!(
+        keys_seen,
+        vec![b"img/01.jpg".to_vec(), b"img/02.jpg".to_vec()]
+    );
+    assert_eq!(
+        prefixes_seen,
+        vec![b"img/other/".to_vec(), b"img/sub/".to_vec()]
+    );
+}
+
+#[test]
+fn range_walks_across_blob_crossings() {
+    // Force spillover so leaves are split across multiple blobs;
+    // the iterator must descend through the BlobNode crossings
+    // transparently and still produce keys in lex order.
+    let tree = TreeBuilder::new("ignored")
+        .memory()
+        .buffer_pool_size(16)
+        .open()
+        .unwrap();
+    let big = vec![0xABu8; 4 * 1024];
+    for i in 0..256u32 {
+        tree.put(format!("k{i:08}").as_bytes(), &big).unwrap();
+    }
+    assert!(
+        tree.stats().unwrap().blob_count >= 2,
+        "workload must spill into multiple blobs",
+    );
+    let got = collect_keys(tree.range());
+    assert_eq!(got.len(), 256);
+    let expected: Vec<Vec<u8>> = (0..256u32)
+        .map(|i| format!("k{i:08}").into_bytes())
+        .collect();
+    assert_eq!(got, expected);
+}
+
+#[test]
+fn range_prefix_plus_start_after_combines() {
+    let tree = Tree::open(TreeConfig::memory()).unwrap();
+    for k in [&b"img/01"[..], b"img/02", b"img/03", b"img/04", b"video/1"] {
+        tree.put(k, b"v").unwrap();
+    }
+    let got = collect_keys(tree.range().prefix(b"img/").start_after(b"img/02"));
+    assert_eq!(got, vec![b"img/03".to_vec(), b"img/04".to_vec()]);
+}

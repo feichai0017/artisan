@@ -7,10 +7,11 @@ v0.1.0 ships.
 
 ## [Unreleased] — v0.1.0-dev
 
-The v0.1 cycle is "build the engine end-to-end." The algorithm core,
-storage cache, WAL, persistence stack, and batched transactions are
-landed; the remaining v0.1 item is the higher-level `Tree::range`
-iterator. See [`ROADMAP.md`](ROADMAP.md) for the live list.
+The v0.1 cycle is "build the engine end-to-end." All algorithmic +
+API surfaces are landed: ART core, multi-blob `splitBlob` /
+`mergeBlob` / `compactBlob`, persistent backend, physiological WAL
+with batched transactions, S3-style range iteration. See
+[`ROADMAP.md`](ROADMAP.md) for the live list.
 
 ### Added — algorithm core
 
@@ -129,6 +130,14 @@ iterator. See [`ROADMAP.md`](ROADMAP.md) for the live list.
   `TreeConfig::memory()` is volatile.
 - **`Tree::put / get / delete / rename`** — bytes-in, bytes-out.
 - **`Tree::checkpoint`** — flush WAL + commit BM + truncate WAL.
+- **`Tree::range()` stateful iterator** — `RangeBuilder` /
+  `RangeIter` / `RangeEntry`. Builder chains `.prefix(p)`
+  (anchored descent, no full-tree scan), `.start_after(k)`
+  (strict-greater lower bound), `.delimiter(b)` (S3-style rollup
+  with `CommonPrefix` dedup). Walks transparently across `BlobNode`
+  crossings. Forward-only. Best-effort snapshot — writers can
+  interleave between `next()` calls; mirrors the upstream
+  `fa_iter` contract extracted from binary log strings.
 - **`Tree::txn(|batch| { ... })`** — closure-based batched
   transaction. [`TxnBatch`] buffers `put` / `delete` / `rename`;
   on closure return, holt takes `rename_lock`, applies each op in
