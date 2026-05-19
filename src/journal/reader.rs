@@ -76,12 +76,28 @@ where
     while offset < bytes.len() {
         match decode_record(&bytes[offset..]) {
             Ok(r) => {
-                callback(&r.op, r.seq, offset as u64).map_err(|e| patch_offset(e, offset))?;
+                // Flatten Batch transparently: the callback never
+                // sees a `TxnOp::Batch`, just the inner primitive
+                // ops with derived seqs (`base + i`, mirroring the
+                // encoder's contiguous seq reservation).
+                if let TxnOp::Batch { ops, .. } = &r.op {
+                    for (i, inner) in ops.iter().enumerate() {
+                        let inner_seq = r.seq.wrapping_add(i as u64);
+                        callback(inner, inner_seq, offset as u64)
+                            .map_err(|e| patch_offset(e, offset))?;
+                        highest_seq = Some(match highest_seq {
+                            None => inner_seq,
+                            Some(s) => s.max(inner_seq),
+                        });
+                    }
+                } else {
+                    callback(&r.op, r.seq, offset as u64).map_err(|e| patch_offset(e, offset))?;
+                    highest_seq = Some(match highest_seq {
+                        None => r.seq,
+                        Some(s) => s.max(r.seq),
+                    });
+                }
                 records_seen += 1;
-                highest_seq = Some(match highest_seq {
-                    None => r.seq,
-                    Some(s) => s.max(r.seq),
-                });
                 offset += r.bytes_consumed;
             }
             Err(Error::ReplaySanityFailed { context, .. }) if is_torn_tail(context) => {

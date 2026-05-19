@@ -43,6 +43,8 @@ use crate::layout::{BlobGuid, PAGE_SIZE};
 use crate::store::backend::{AlignedBlobBuf, Backend, MemoryBackend, PersistentBackend};
 use crate::store::{BlobFrame, BlobFrameRef, BufferManager};
 
+use super::txn::{BatchOp, TxnBatch};
+
 /// An `holt` tree — your handle to one metadata store.
 ///
 /// Clone the handle to share the same backing store: the
@@ -394,6 +396,155 @@ impl Tree {
         Ok(())
     }
 
+    /// Apply a batch of mutations under a single WAL record.
+    ///
+    /// The closure builds a [`TxnBatch`] by calling its `put` /
+    /// `delete` / `rename` methods; on return, holt applies each
+    /// op in order against the BM and emits **one** WAL record
+    /// (`TxnOp::Batch`) covering the whole sequence. Either every
+    /// op is replayed on recovery, or none — the batch is
+    /// crash-atomic.
+    ///
+    /// ## Atomicity contract
+    ///
+    /// - **Crash atomicity**: yes. The single WAL record is the
+    ///   commit point; a crash before it is written rolls back
+    ///   the whole batch on next open (the BM cache is reloaded
+    ///   from the last checkpoint and replay sees no batch).
+    /// - **Runtime isolation**: best-effort. The batch holds
+    ///   `rename_lock`, so it serialises against other `rename`
+    ///   and `txn` calls but **not** against concurrent
+    ///   `put` / `delete` — those still see per-blob exclusive
+    ///   latching only. Treat the batch as "all-or-nothing under
+    ///   crash recovery", not "fully serializable under load".
+    /// - **Mid-batch failure**: if op `N` returns an `Err`
+    ///   (e.g., rename `NotFound`), ops `0..N` are already
+    ///   applied to the BM and the WAL record is NOT written —
+    ///   so on the next open the partial work is lost via replay.
+    ///   The current process still sees the partial work through
+    ///   the BM cache. Best practice: keep batches to ops you
+    ///   know will succeed, or follow a failed `txn` with
+    ///   `Tree::checkpoint` only after recovering desired state.
+    ///
+    /// ## Example
+    ///
+    /// ```no_run
+    /// # use holt::{Tree, TreeConfig};
+    /// # let tree = Tree::open(TreeConfig::memory()).unwrap();
+    /// tree.txn(|batch| {
+    ///     batch.put(b"a", b"1");
+    ///     batch.put(b"b", b"2");
+    ///     batch.delete(b"c");
+    /// })
+    /// .unwrap();
+    /// ```
+    pub fn txn<F>(&self, build: F) -> Result<()>
+    where
+        F: FnOnce(&mut TxnBatch),
+    {
+        let mut batch = TxnBatch::default();
+        build(&mut batch);
+        if batch.pending.is_empty() {
+            return Ok(());
+        }
+        self.apply_batch(batch.pending)
+    }
+
+    fn apply_batch(&self, pending: Vec<BatchOp>) -> Result<()> {
+        let count = pending.len() as u64;
+        // Serialise batches against renames + other batches so the
+        // ops here see a coherent rename-free view across the
+        // (multi-op) sequence.
+        let _r = self.rename_lock.lock().unwrap();
+        // Reserve a contiguous seq range so each inner op's seq is
+        // `base + index` and replay can derive it without storing
+        // per-inner seqs in the body.
+        let base_seq = self.next_seq.fetch_add(count, Ordering::SeqCst);
+        let mut wal_ops: Vec<TxnOp> = Vec::with_capacity(pending.len());
+
+        for (i, op) in pending.into_iter().enumerate() {
+            let seq = base_seq + i as u64;
+            match op {
+                BatchOp::Put { key, value } => {
+                    let entry = self.apply_put_inner(&key, &value, seq)?;
+                    wal_ops.push(entry);
+                }
+                BatchOp::Delete { key } => {
+                    if let Some(entry) = self.apply_delete_inner(&key, seq)? {
+                        wal_ops.push(entry);
+                    }
+                    // Pure no-op deletes (key absent) leave no WAL
+                    // record, matching `Tree::delete`'s contract.
+                }
+                BatchOp::Rename { src, dst, force } => {
+                    let entry = self.apply_rename_inner(&src, &dst, force, seq)?;
+                    wal_ops.push(entry);
+                }
+            }
+        }
+
+        if let Some(wal) = &self.wal {
+            let mut w = wal.lock().unwrap();
+            let envelope = TxnOp::Batch {
+                tree_id: 0,
+                ops: wal_ops,
+            };
+            w.append(&envelope, base_seq)?;
+            if self.cfg.wal_sync_on_commit {
+                w.flush()?;
+            }
+        } else if self.cfg.flush_on_write {
+            self.backend.commit(self.root_guid)?;
+        }
+        Ok(())
+    }
+
+    fn apply_put_inner(&self, key: &[u8], value: &[u8], seq: u64) -> Result<TxnOp> {
+        let padded = pad_key(key);
+        let outcome = engine::insert_multi(&self.backend, self.root_guid, &padded, value, seq)?;
+        Ok(TxnOp::Insert {
+            tree_id: 0,
+            seq,
+            key: key.to_vec(),
+            value: value.to_vec(),
+            prev_value: outcome.previous,
+        })
+    }
+
+    fn apply_delete_inner(&self, key: &[u8], seq: u64) -> Result<Option<TxnOp>> {
+        let padded = pad_key(key);
+        let outcome = engine::erase_multi(&self.backend, self.root_guid, &padded)?;
+        Ok(outcome.previous.map(|prev| TxnOp::Erase {
+            tree_id: 0,
+            seq,
+            key: key.to_vec(),
+            value: prev,
+        }))
+    }
+
+    fn apply_rename_inner(&self, src: &[u8], dst: &[u8], force: bool, seq: u64) -> Result<TxnOp> {
+        let src_padded = pad_key(src);
+        let dst_padded = pad_key(dst);
+        let Some(value) = engine::lookup_multi(&self.backend, self.root_guid, &src_padded)? else {
+            return Err(Error::NotFound);
+        };
+        if src != dst {
+            if !force && engine::lookup_multi(&self.backend, self.root_guid, &dst_padded)?.is_some()
+            {
+                return Err(Error::DstExists);
+            }
+            engine::erase_multi(&self.backend, self.root_guid, &src_padded)?;
+            engine::insert_multi(&self.backend, self.root_guid, &dst_padded, &value, seq)?;
+        }
+        Ok(TxnOp::RenameObject {
+            tree_id: 0,
+            seq,
+            src_key: src.to_vec(),
+            dst_key: dst.to_vec(),
+            force,
+        })
+    }
+
     /// Make every previously-applied mutation durable and trim
     /// the WAL.
     ///
@@ -608,13 +759,17 @@ fn replay_wal(path: &std::path::Path, bm: &Arc<BufferManager>, root_guid: BlobGu
             }
             // Structural / multi-tenant / marker variants don't
             // affect logical state at v0.1's single-tree surface.
+            // `Batch` is unpacked into per-inner callbacks inside
+            // `journal::reader::replay_bytes`, so it never reaches
+            // this match — defensive arm only.
             TxnOp::Split { .. }
             | TxnOp::Merge { .. }
             | TxnOp::Compact { .. }
             | TxnOp::Rename { .. }
             | TxnOp::NewTree { .. }
             | TxnOp::RmTree { .. }
-            | TxnOp::MemMarker { .. } => {}
+            | TxnOp::MemMarker { .. }
+            | TxnOp::Batch { .. } => {}
         }
         highest = highest.max(seq);
         Ok(())

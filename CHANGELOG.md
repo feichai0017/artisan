@@ -8,9 +8,9 @@ v0.1.0 ships.
 ## [Unreleased] — v0.1.0-dev
 
 The v0.1 cycle is "build the engine end-to-end." The algorithm core,
-storage cache, WAL, and persistence stack are landed; the remaining
-v0.1 items are the higher-level API surface (`Tree::range`,
-`Tree::txn`). See [`ROADMAP.md`](ROADMAP.md) for the live list.
+storage cache, WAL, persistence stack, and batched transactions are
+landed; the remaining v0.1 item is the higher-level `Tree::range`
+iterator. See [`ROADMAP.md`](ROADMAP.md) for the live list.
 
 ### Added — algorithm core
 
@@ -113,6 +113,14 @@ v0.1 items are the higher-level API surface (`Tree::range`,
 - **Reference-based `WalWriter::append_insert` / `append_erase` /
   `append_rename_object`** fast paths — skip the three `Vec` clones
   the `TxnOp` enum's owned-data shape would force.
+- **`TxnOp::Batch` + `TY_BATCH = 10`** — single WAL record carrying
+  N primitive ops (`Insert` / `Erase` / `RenameObject` today);
+  nested batches are rejected at encode + decode. Inner ops share
+  the outer record's CRC and derive their seqs from
+  `outer_seq + index` via a contiguous WAL-level seq reservation.
+  Replay (`journal::reader::replay_bytes`) transparently flattens
+  a `Batch` into per-inner callbacks so existing consumers don't
+  need a new arm.
 
 ### Added — public API
 
@@ -121,6 +129,16 @@ v0.1 items are the higher-level API surface (`Tree::range`,
   `TreeConfig::memory()` is volatile.
 - **`Tree::put / get / delete / rename`** — bytes-in, bytes-out.
 - **`Tree::checkpoint`** — flush WAL + commit BM + truncate WAL.
+- **`Tree::txn(|batch| { ... })`** — closure-based batched
+  transaction. [`TxnBatch`] buffers `put` / `delete` / `rename`;
+  on closure return, holt takes `rename_lock`, applies each op in
+  order, then emits one `TxnOp::Batch` WAL record. Crash atomicity:
+  on recovery the whole batch is either replayed or lost. Runtime
+  isolation is best-effort — concurrent `put` / `delete` on
+  disjoint blobs are not blocked, so the contract is "crash-
+  atomic, not serialisable." Mid-batch failure (e.g., rename
+  `NotFound`) leaves earlier ops applied to the BM but skips the
+  WAL emit; documented on the method.
 - **`TreeConfig::wal_sync_on_commit`** — opt-in per-op WAL fsync
   (default `false`, matching RocksDB's `sync=false` baseline).
 - **`TreeBuilder`** — chainable config (`memory()`,

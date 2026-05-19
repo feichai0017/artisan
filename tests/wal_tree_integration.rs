@@ -350,3 +350,69 @@ fn many_round_trips_through_checkpoint_boundaries() {
         );
     }
 }
+
+#[test]
+fn batch_persists_through_crash_and_replay() {
+    // Tree::txn emits one Batch WAL record; on reopen the replay
+    // unpacks it transparently into per-inner callbacks so every
+    // op in the batch comes back. `wal_sync_on_commit = true`
+    // makes the simulated crash drop right after the batch flush.
+    let dir = tempdir().unwrap();
+    let cfg = durable_cfg(dir.path());
+
+    {
+        let tree = Tree::open(cfg.clone()).unwrap();
+        // Seed something to mutate inside the batch.
+        tree.put(b"seed", b"S").unwrap();
+
+        tree.txn(|b| {
+            b.put(b"batch-a", b"A");
+            b.put(b"batch-b", b"B");
+            b.delete(b"seed");
+            b.rename(b"batch-a", b"batch-aa", false);
+        })
+        .unwrap();
+    } // dropped without checkpoint — disk has only the WAL.
+
+    // Reopen — replay should reconstruct the post-batch state.
+    let tree = Tree::open(cfg).unwrap();
+    assert!(tree.get(b"seed").unwrap().is_none());
+    assert!(tree.get(b"batch-a").unwrap().is_none());
+    assert_eq!(tree.get(b"batch-aa").unwrap().as_deref(), Some(&b"A"[..]));
+    assert_eq!(tree.get(b"batch-b").unwrap().as_deref(), Some(&b"B"[..]));
+}
+
+#[test]
+fn batch_crash_before_flush_loses_whole_batch() {
+    // Default mode (`wal_sync_on_commit = false`): if we drop
+    // without checkpoint, the OS may not have flushed the batch
+    // record yet, so the whole batch is rolled back on reopen.
+    // We exercise the contract by skipping checkpoint and
+    // checking that the unflushed batch isn't visible after
+    // reopen.
+    let dir = tempdir().unwrap();
+    let cfg = TreeConfig::new(dir.path()); // default: wal_sync_on_commit = false
+
+    {
+        let tree = Tree::open(cfg.clone()).unwrap();
+        tree.put(b"durable", b"D").unwrap();
+        tree.checkpoint().unwrap();
+
+        // Batch goes through the BM cache but the WAL flush is
+        // deferred; without a checkpoint, the on-disk WAL stays
+        // empty for these ops.
+        tree.txn(|b| {
+            b.put(b"vanish-a", b"VA");
+            b.put(b"vanish-b", b"VB");
+        })
+        .unwrap();
+        // Note: we do NOT call tree.checkpoint() — the batch
+        // record sits in the WAL's in-memory buffer and dies
+        // with the process.
+    }
+
+    let tree = Tree::open(cfg).unwrap();
+    assert_eq!(tree.get(b"durable").unwrap().as_deref(), Some(&b"D"[..]));
+    assert!(tree.get(b"vanish-a").unwrap().is_none());
+    assert!(tree.get(b"vanish-b").unwrap().is_none());
+}

@@ -3,7 +3,10 @@
 //! Each variant carries the minimal info needed to replay the
 //! operation deterministically during WAL recovery.
 
-/// 14 transaction-op variants emitted by the walker.
+/// 11 transaction-op variants emitted by the walker.
+///
+/// Variant tags are stable on-disk constants — see the `TY_*`
+/// block in [`super::codec`]. Never renumber; only append.
 #[derive(Debug, Clone)]
 pub enum TxnOp {
     /// Single-key insert / update.
@@ -103,6 +106,19 @@ pub enum TxnOp {
         /// Sequence number for reconciliation.
         seq: u64,
     },
+    /// Batch — one WAL record carrying multiple primitive ops so a
+    /// crash either replays all of them or none.
+    ///
+    /// Emitted by [`crate::Tree::txn`]. Inner ops are primitive
+    /// variants only (`Insert` / `Erase` / `RenameObject` today);
+    /// nested `Batch`es are rejected at encode + decode. Each
+    /// inner op carries `seq = outer_seq + index`; the outer
+    /// record's header `SEQ` is the base, and the WAL allocator
+    /// reserves a contiguous range of `ops.len()` seqs per batch.
+    Batch {
+        /// Owning tree root identifier.
+        tree_id: u64,
+        /// Inner ops, applied in order.
+        ops: Vec<TxnOp>,
+    },
 }
-
-// TODO: encoder + decoder for the physiological WAL format.

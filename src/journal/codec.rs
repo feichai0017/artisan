@@ -149,6 +149,7 @@ const TY_RENAME: u8 = 6;
 const TY_NEW_TREE: u8 = 7;
 const TY_RM_TREE: u8 = 8;
 const TY_MEM_MARKER: u8 = 9;
+const TY_BATCH: u8 = 10;
 
 // CompactReason on-disk tags (stable).
 const REASON_SPLIT_TOMBSTONE: u8 = 0;
@@ -304,6 +305,7 @@ fn variant_tag(op: &TxnOp) -> u8 {
         TxnOp::NewTree { .. } => TY_NEW_TREE,
         TxnOp::RmTree { .. } => TY_RM_TREE,
         TxnOp::MemMarker { .. } => TY_MEM_MARKER,
+        TxnOp::Batch { .. } => TY_BATCH,
     }
 }
 
@@ -391,6 +393,20 @@ fn encode_body(op: &TxnOp, out: &mut Vec<u8>) {
         TxnOp::MemMarker { seq: _ } => {
             // Body is empty — seq travels in the record header.
         }
+        TxnOp::Batch { tree_id, ops } => {
+            out.extend_from_slice(&tree_id.to_le_bytes());
+            let count = u32::try_from(ops.len()).expect("batch ops fit in u32");
+            out.extend_from_slice(&count.to_le_bytes());
+            for inner in ops {
+                let inner_ty = variant_tag(inner);
+                assert!(
+                    inner_ty != TY_BATCH,
+                    "nested Batch is rejected — Tree::txn must flatten",
+                );
+                out.push(inner_ty);
+                encode_body(inner, out);
+            }
+        }
     }
 }
 
@@ -472,13 +488,27 @@ pub fn decode_record(buf: &[u8]) -> Result<DecodedRecord> {
     })
 }
 
-fn decode_body(ty: u8, mut body: &[u8], seq: u64) -> Result<TxnOp> {
+fn decode_body(ty: u8, body: &[u8], seq: u64) -> Result<TxnOp> {
+    let mut cursor = body;
+    let op = decode_body_into(ty, &mut cursor, seq)?;
+    if !cursor.is_empty() {
+        return Err(sanity("trailing bytes after variant body"));
+    }
+    Ok(op)
+}
+
+/// Internal: decode one variant body from `cursor`, advancing it.
+/// Doesn't enforce body-exhaustion — `decode_body` wraps with that
+/// check, and `TY_BATCH` re-enters this for each inner op (sharing
+/// the parent's cursor as the inner-frame stream).
+#[allow(clippy::too_many_lines)] // single big match over 11 variants reads cleaner inline than split
+fn decode_body_into(ty: u8, body: &mut &[u8], seq: u64) -> Result<TxnOp> {
     let op = match ty {
         TY_INSERT => {
-            let tree_id = read_u64(&mut body)?;
-            let key = read_bytes(&mut body)?;
-            let value = read_bytes(&mut body)?;
-            let prev_value = read_optional_bytes(&mut body)?;
+            let tree_id = read_u64(body)?;
+            let key = read_bytes(body)?;
+            let value = read_bytes(body)?;
+            let prev_value = read_optional_bytes(body)?;
             TxnOp::Insert {
                 tree_id,
                 seq,
@@ -488,9 +518,9 @@ fn decode_body(ty: u8, mut body: &[u8], seq: u64) -> Result<TxnOp> {
             }
         }
         TY_ERASE => {
-            let tree_id = read_u64(&mut body)?;
-            let key = read_bytes(&mut body)?;
-            let value = read_bytes(&mut body)?;
+            let tree_id = read_u64(body)?;
+            let key = read_bytes(body)?;
+            let value = read_bytes(body)?;
             TxnOp::Erase {
                 tree_id,
                 seq,
@@ -499,10 +529,10 @@ fn decode_body(ty: u8, mut body: &[u8], seq: u64) -> Result<TxnOp> {
             }
         }
         TY_SPLIT => {
-            let parent_blob = read_guid(&mut body)?;
-            let pre_split_node = read_u16(&mut body)?;
-            let new_child_blob = read_guid(&mut body)?;
-            let new_child_entry = read_u16(&mut body)?;
+            let parent_blob = read_guid(body)?;
+            let pre_split_node = read_u16(body)?;
+            let new_child_blob = read_guid(body)?;
+            let new_child_entry = read_u16(body)?;
             TxnOp::Split {
                 parent_blob,
                 pre_split_node,
@@ -511,9 +541,9 @@ fn decode_body(ty: u8, mut body: &[u8], seq: u64) -> Result<TxnOp> {
             }
         }
         TY_MERGE => {
-            let parent_blob = read_guid(&mut body)?;
-            let pre_merge_node = read_u16(&mut body)?;
-            let child_blob = read_guid(&mut body)?;
+            let parent_blob = read_guid(body)?;
+            let pre_merge_node = read_u16(body)?;
+            let child_blob = read_guid(body)?;
             TxnOp::Merge {
                 parent_blob,
                 pre_merge_node,
@@ -521,15 +551,15 @@ fn decode_body(ty: u8, mut body: &[u8], seq: u64) -> Result<TxnOp> {
             }
         }
         TY_COMPACT => {
-            let blob = read_guid(&mut body)?;
-            let reason = decode_reason(read_u8(&mut body)?)?;
+            let blob = read_guid(body)?;
+            let reason = decode_reason(read_u8(body)?)?;
             TxnOp::Compact { blob, reason }
         }
         TY_RENAME_OBJECT => {
-            let tree_id = read_u64(&mut body)?;
-            let src_key = read_bytes(&mut body)?;
-            let dst_key = read_bytes(&mut body)?;
-            let force = read_u8(&mut body)? != 0;
+            let tree_id = read_u64(body)?;
+            let src_key = read_bytes(body)?;
+            let dst_key = read_bytes(body)?;
+            let force = read_u8(body)? != 0;
             TxnOp::RenameObject {
                 tree_id,
                 seq,
@@ -539,11 +569,11 @@ fn decode_body(ty: u8, mut body: &[u8], seq: u64) -> Result<TxnOp> {
             }
         }
         TY_RENAME => {
-            let src_tree_id = read_u64(&mut body)?;
-            let dst_tree_id = read_u64(&mut body)?;
-            let src_key = read_bytes(&mut body)?;
-            let dst_key = read_bytes(&mut body)?;
-            let force = read_u8(&mut body)? != 0;
+            let src_tree_id = read_u64(body)?;
+            let dst_tree_id = read_u64(body)?;
+            let src_key = read_bytes(body)?;
+            let dst_key = read_bytes(body)?;
+            let force = read_u8(body)? != 0;
             TxnOp::Rename {
                 src_tree_id,
                 dst_tree_id,
@@ -554,21 +584,32 @@ fn decode_body(ty: u8, mut body: &[u8], seq: u64) -> Result<TxnOp> {
             }
         }
         TY_NEW_TREE => {
-            let tree_id = read_u64(&mut body)?;
-            let name = read_bytes(&mut body)?;
+            let tree_id = read_u64(body)?;
+            let name = read_bytes(body)?;
             TxnOp::NewTree { tree_id, name }
         }
         TY_RM_TREE => {
-            let tree_id = read_u64(&mut body)?;
+            let tree_id = read_u64(body)?;
             TxnOp::RmTree { tree_id }
         }
         TY_MEM_MARKER => TxnOp::MemMarker { seq },
+        TY_BATCH => {
+            let tree_id = read_u64(body)?;
+            let count = read_u32(body)? as usize;
+            let mut ops = Vec::with_capacity(count);
+            for i in 0..count {
+                let inner_ty = read_u8(body)?;
+                if inner_ty == TY_BATCH {
+                    return Err(sanity("nested Batch is rejected"));
+                }
+                let inner_seq = seq.wrapping_add(i as u64);
+                let inner = decode_body_into(inner_ty, body, inner_seq)?;
+                ops.push(inner);
+            }
+            TxnOp::Batch { tree_id, ops }
+        }
         _ => return Err(sanity("unknown TxnOp variant tag")),
     };
-
-    if !body.is_empty() {
-        return Err(sanity("trailing bytes after variant body"));
-    }
     Ok(op)
 }
 
@@ -920,5 +961,111 @@ mod tests {
         let r2 = decode_record(&buf[r1.bytes_consumed..]).unwrap();
         assert_eq!(r2.seq, 2);
         assert_eq!(r1.bytes_consumed + r2.bytes_consumed, buf.len());
+    }
+
+    #[test]
+    fn roundtrip_batch_three_inner_ops() {
+        // Insert + Erase + RenameObject under one Batch envelope.
+        // Inner seqs are derived from `base + index`, so the encoder
+        // should not need explicit per-inner seq storage.
+        let base = 100u64;
+        let batch = TxnOp::Batch {
+            tree_id: 0,
+            ops: vec![
+                TxnOp::Insert {
+                    tree_id: 0,
+                    seq: base,
+                    key: b"a".to_vec(),
+                    value: b"v-a".to_vec(),
+                    prev_value: None,
+                },
+                TxnOp::Erase {
+                    tree_id: 0,
+                    seq: base + 1,
+                    key: b"b".to_vec(),
+                    value: b"v-b".to_vec(),
+                },
+                TxnOp::RenameObject {
+                    tree_id: 0,
+                    seq: base + 2,
+                    src_key: b"c".to_vec(),
+                    dst_key: b"d".to_vec(),
+                    force: false,
+                },
+            ],
+        };
+        let mut buf = Vec::new();
+        encode_record(&batch, base, &mut buf).unwrap();
+
+        let r = decode_record(&buf).unwrap();
+        assert_eq!(r.seq, base);
+        assert_eq!(r.bytes_consumed, buf.len());
+        match r.op {
+            TxnOp::Batch { tree_id, ops } => {
+                assert_eq!(tree_id, 0);
+                assert_eq!(ops.len(), 3);
+                match &ops[0] {
+                    TxnOp::Insert { seq, key, .. } => {
+                        assert_eq!(*seq, base);
+                        assert_eq!(key, b"a");
+                    }
+                    other => panic!("expected Insert, got {other:?}"),
+                }
+                match &ops[1] {
+                    TxnOp::Erase { seq, key, .. } => {
+                        assert_eq!(*seq, base + 1);
+                        assert_eq!(key, b"b");
+                    }
+                    other => panic!("expected Erase, got {other:?}"),
+                }
+                match &ops[2] {
+                    TxnOp::RenameObject {
+                        seq,
+                        src_key,
+                        dst_key,
+                        force,
+                        ..
+                    } => {
+                        assert_eq!(*seq, base + 2);
+                        assert_eq!(src_key, b"c");
+                        assert_eq!(dst_key, b"d");
+                        assert!(!force);
+                    }
+                    other => panic!("expected RenameObject, got {other:?}"),
+                }
+            }
+            other => panic!("expected Batch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn roundtrip_batch_empty() {
+        let batch = TxnOp::Batch {
+            tree_id: 0,
+            ops: vec![],
+        };
+        let mut buf = Vec::new();
+        encode_record(&batch, 7, &mut buf).unwrap();
+        let r = decode_record(&buf).unwrap();
+        assert_eq!(r.seq, 7);
+        match r.op {
+            TxnOp::Batch { ops, .. } => assert!(ops.is_empty()),
+            other => panic!("expected Batch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "nested Batch is rejected")]
+    fn nested_batch_encode_panics() {
+        let inner = TxnOp::Batch {
+            tree_id: 0,
+            ops: vec![],
+        };
+        let outer = TxnOp::Batch {
+            tree_id: 0,
+            ops: vec![inner],
+        };
+        let mut buf = Vec::new();
+        let _ = encode_record(&outer, 0, &mut buf);
     }
 }

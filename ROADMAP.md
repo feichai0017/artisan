@@ -201,7 +201,19 @@ Required for the v0.1 tag:
       + auto-spillover insert; delete + rename cross-blob queued)
 - [ ] `Tree::range(prefix)` + `.delimiter(b'/')` + `.start_after(key)`
       + `.take(n)`
-- [ ] `Tree::txn(|t| { ... })` for batch ops under one WAL record
+- [x] **`Tree::txn(|b| { ... })` for batch ops under one WAL record** —
+      [`api::TxnBatch`](src/api/txn.rs) buffers `put` / `delete` /
+      `rename`; on closure return,
+      [`Tree::txn`](src/api/tree.rs) takes `rename_lock`, applies
+      each op in order, and emits one [`TxnOp::Batch`](src/journal/txn_op.rs)
+      record (new `TY_BATCH = 10` tag). Inner ops carry derived
+      seqs (`base + i`) via a contiguous reservation, so neither
+      encoder nor decoder needs per-inner seq bytes. Replay
+      transparently flattens the batch into per-inner callbacks
+      ([`journal::reader::replay_bytes`](src/journal/reader.rs)).
+      Crash atomicity: all-or-nothing across restarts. Runtime
+      isolation: best-effort — see the contract on
+      [`Tree::txn`](src/api/tree.rs).
 - [x] `Tree::checkpoint()` (flushes cached root + backend flush)
 - [ ] `Tree::stats()` — per-blob compact_times, tombstone count,
       slot utilization

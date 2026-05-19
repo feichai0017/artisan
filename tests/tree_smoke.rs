@@ -1025,3 +1025,56 @@ fn stats_aggregates_across_multi_blob_tree() {
     let sum_slots: u64 = s.blobs.iter().map(|b| u64::from(b.num_slots)).sum();
     assert_eq!(sum_slots, s.total_slots);
 }
+
+#[test]
+fn txn_applies_buffered_ops_in_order() {
+    let tree = Tree::open(TreeConfig::memory()).unwrap();
+    tree.put(b"seed", b"S").unwrap();
+
+    tree.txn(|batch| {
+        batch.put(b"a", b"1");
+        batch.put(b"b", b"2");
+        batch.delete(b"seed");
+        batch.rename(b"a", b"aa", false);
+    })
+    .unwrap();
+
+    assert!(tree.get(b"seed").unwrap().is_none());
+    assert!(tree.get(b"a").unwrap().is_none());
+    assert_eq!(tree.get(b"aa").unwrap().as_deref(), Some(&b"1"[..]));
+    assert_eq!(tree.get(b"b").unwrap().as_deref(), Some(&b"2"[..]));
+}
+
+#[test]
+fn txn_empty_batch_is_a_noop() {
+    let tree = Tree::open(TreeConfig::memory()).unwrap();
+    tree.put(b"unchanged", b"X").unwrap();
+
+    tree.txn(|_batch| {}).unwrap();
+
+    assert_eq!(tree.get(b"unchanged").unwrap().as_deref(), Some(&b"X"[..]));
+}
+
+#[test]
+fn txn_returns_error_when_rename_src_missing_and_leaves_prior_ops_applied() {
+    // Contract per Tree::txn doc: mid-batch failure leaves the
+    // already-applied ops in the BM cache (they're not rolled
+    // back), and the WAL record is NOT written — so a future
+    // reopen-via-replay would lose the whole batch.
+    let tree = Tree::open(TreeConfig::memory()).unwrap();
+    let err = tree
+        .txn(|batch| {
+            batch.put(b"committed", b"C");
+            batch.rename(b"missing-src", b"dst", false);
+            batch.put(b"never-reached", b"N");
+        })
+        .unwrap_err();
+    assert!(
+        matches!(err, holt::Error::NotFound),
+        "expected NotFound from rename of missing src, got {err:?}",
+    );
+    // The pre-failure put landed in the BM cache.
+    assert_eq!(tree.get(b"committed").unwrap().as_deref(), Some(&b"C"[..]),);
+    // The post-failure put never ran.
+    assert!(tree.get(b"never-reached").unwrap().is_none());
+}

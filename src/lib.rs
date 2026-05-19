@@ -39,7 +39,8 @@
 //! - [`engine`] — recursive walker (insert / lookup / erase /
 //!   scan / rename / compact).
 //! - [`journal`] — WAL + replay + checkpoint.
-//! - [`api`] — high-level `Tree` / `Txn` / `Iter` surface.
+//! - [`api`] — high-level `Tree` + [`TxnBatch`] (single-record
+//!   batched transactions) + the queued `Iter` surface.
 //!
 //! ## Platform support
 //!
@@ -125,5 +126,6 @@ pub use api::errors::{Error, Result};
 
 pub use api::builder::TreeBuilder;
 pub use api::tree::{BlobStats, Tree, TreeStats};
+pub use api::txn::TxnBatch;
 pub use store::backend::{AlignedBlobBuf, Backend, MemoryBackend, PersistentBackend};
 pub use store::BufferManager;
