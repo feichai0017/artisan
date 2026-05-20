@@ -2,7 +2,9 @@
 //!
 //! A first-class node-type variant used when a tree spans
 //! multiple 512 KB blob frames. The walker hits one, swaps to
-//! the target blob, and continues at `child_entry_ptr`.
+//! the target blob, and continues at the child blob's
+//! authoritative `header.root_slot`; `child_entry_ptr` is kept as
+//! an on-disk compatibility/debug hint.
 
 use std::mem::{offset_of, size_of};
 
@@ -26,7 +28,8 @@ pub struct BlobNode {
     _pad_6: u16,
     /// 128-bit identifier of the blob to walk into.
     pub child_blob_guid: [u8; 16],
-    /// Slot index inside the child blob where the walk resumes.
+    /// Slot hint inside the child blob where the walk resumes.
+    /// The child blob's `header.root_slot` is authoritative.
     pub child_entry_ptr: u32,
     _pad_28: u32,
     /// Inline path-compressed prefix bytes (only first

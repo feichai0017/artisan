@@ -110,12 +110,12 @@ where
         // the whole walk from the root (the parent BlobNode that
         // pointed us here may also have moved).
         let mut current_guid = crossing.child_guid;
-        let mut start_slot = crossing.child_slot;
         let mut depth = crossing.child_depth;
         loop {
             let pin = bm.pin(current_guid)?;
             let guard = pin.read_optimistic();
             let frame = BlobFrameRef::wrap(guard.as_slice());
+            let start_slot = frame.header().root_slot;
             let result = lookup_at(frame, start_slot, key, depth);
             if !guard.validate() {
                 bm.note_optimistic_restart();
@@ -127,7 +127,6 @@ where
                 Ok(LookupResult::NotFound) => return Ok(None),
                 Ok(LookupResult::Crossing(c)) => {
                     current_guid = c.child_guid;
-                    start_slot = c.child_slot;
                     depth = c.child_depth;
                 }
             }

@@ -219,14 +219,14 @@ pub struct CachedBlob {
     /// every possible slot index has its own counter; ~80 KB per
     /// blob (10240 × `AtomicU64`).
     ///
-    /// **Phase 1 status (current):** bumps are emitted on the
-    /// writer side but not yet consulted on the reader side. The
-    /// walker still uses blob-level [`HybridLatch`] for all
-    /// concurrency. Phases 2-3 will introduce per-slot optimistic
-    /// reads + cross-blob lock-coupling using these counters as
-    /// the re-acquire tokens (walker releases parent latch before
-    /// descending into a child blob; re-validates the parent's
-    /// slot counter on the way back up).
+    /// Writers now use these counters for versioned `BlobFrame`
+    /// mutation accounting, while cross-blob `put` / `delete`
+    /// shorten latch hold time through lock-coupled handoff
+    /// between blobs. The current handoff avoids parent
+    /// re-acquire for normal child-local root changes by treating
+    /// the child blob's `header.root_slot` as authoritative;
+    /// the counters remain the per-slot validation token for
+    /// compatibility assertions and finer optimistic node reads.
     ///
     /// Default 64-blob pool → ~5.2 MB total for these counters,
     /// 128-blob pool → ~10.4 MB. Acceptable for the concurrency
@@ -275,9 +275,10 @@ impl CachedBlob {
     /// completes — a mismatch means a writer landed in between
     /// and the caller must restart.
     ///
-    /// Phase 1 (current): only consumers are tests. Phases 2-3
-    /// of the per-node-latch milestone wire this into the walker's
-    /// cross-blob descent paths.
+    /// Currently consumed by tests and version-invariant checks;
+    /// the main cross-blob writer path does not need to re-read a
+    /// parent slot after child work because it no longer stores
+    /// correctness-critical child entry slots in the parent.
     #[cfg_attr(not(test), allow(dead_code))]
     #[must_use]
     pub(crate) fn slot_version(&self, slot: u16) -> u64 {
@@ -382,8 +383,8 @@ impl Deref for BlobReadGuard<'_> {
 /// `BlobFrame::wrap(guard.as_mut_slice())` — the frame
 /// constructed via `frame()` is wired to the owning blob's
 /// per-slot version counters, so mutations through it bump those
-/// counters (the foundation for cross-blob lock-coupling in
-/// Phases 2-3 of the per-node-latch milestone).
+/// counters (the mutation-accounting foundation for cross-blob
+/// latch coupling and future per-slot optimistic readers).
 pub struct BlobWriteGuard<'a> {
     _latch: LatchGuard<'a>,
     buf: &'a UnsafeCell<AlignedBlobBuf>,

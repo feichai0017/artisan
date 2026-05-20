@@ -12,8 +12,7 @@ fine-grained per-commit history is in `git log`.
 The v0.3 milestone is still unreleased. Everything in this
 section is queued for the first v0.3 tag: the API split, walker
 hot-path optimizations, WAL format cleanup, zero-copy reads,
-batch-WAL encoding, and the first slot-version lock-coupling
-groundwork.
+batch-WAL encoding, and recursive cross-blob latch coupling.
 
 The three breaking-but-surgical wins below land first; the
 extreme metadata-engine performance track builds on them.
@@ -126,16 +125,20 @@ same change applied inside the batch-path rename arm of
 - `apply_put_inner` / `apply_delete_inner` / `apply_rename_inner`
   Tree helpers folded into the new `apply_batch_walker_inline`.
 
-### Infrastructure — slot-version lock-coupling, Phase 1
+### Infrastructure — slot-version counters and cross-blob latch coupling
 
-Lays the data-structure groundwork for cross-blob lock-coupling
-(the path to closing the remaining `fs_put` 2 M structural gap
-vs RocksDB; cf. `benches/RESULTS.md`). **No user-visible behavior
-change in Phase 1** — the walker still uses blob-level latches
-for all concurrency. Phases 2-5 (queued for follow-up sessions
-within this v0.3 cycle) will refactor the walker descent to
-release parent latches before child blobs, using these counters
-as the cross-blob re-acquire tokens.
+Implements the first real concurrency cut for split metadata
+trees. `put` / `insert` and `delete` / `remove` no longer hold a
+root or ancestor blob's exclusive latch while mutating a
+descendant blob on the key path. The walker now acquires the
+child blob while the parent is still latched, releases the parent,
+and repeats that handoff recursively for every deeper `BlobNode`.
+
+The correctness boundary also changes: parent
+`BlobNode.child_entry_ptr` is now a compatibility / debug hint.
+The child blob's own `header.root_slot` is authoritative, so
+child-local splits, collapses, and post-compact root-slot changes
+do not require re-acquiring and rewriting the parent `BlobNode`.
 
 Concretely:
 
@@ -161,45 +164,28 @@ Concretely:
   (Release ordering) after every body mutation. Counters start
   at 0; bumps are monotonic across the blob's lifetime in the
   cache.
-- `CachedBlob::slot_version(slot)` reader (Acquire load) ready
-  for Phase 2-3 consumers. Phase 1 only consumer is the
-  contract test
-  (`slot_version_bumps_on_versioned_frame_mutation` in
-  `src/store/buffer_manager.rs::tests`).
-
-### Infrastructure — slot-version lock-coupling, Phase 2.A
-
-Builds the cross-blob-hop capture/validate scaffolding on top of
-Phase 1's per-slot counters. **Still no user-visible behavior
-change** — parent latch is held throughout the cross-blob hop so
-the validate is a `debug_assert` (current Phase 1 invariant
-guarantees it can never fire). Phase 2.B will drop the parent
-guard before the child hop and turn the debug_assert into a real
-restart-on-mismatch path.
-
-Concretely:
-
 - New `BlobFrame::slot_version(slot)` reader — `Acquire`-load
   pair to `BlobFrame::bump_slot_version`'s `Release` store.
   Returns 0 for unversioned frames (init / local-buf / test
   paths) or out-of-range slot indices.
-- `walker::insert::insert_at_blob_node` captures the parent's
-  `BlobNode` slot version before pinning the child, then
-  `debug_assert_eq!`s the version is unchanged before the
-  optional write-back (`child_entry_ptr` mutation).
-- `walker::erase::erase_at_blob_node` mirrors the same
-  capture/validate protocol — the validate gates all three
-  return arms (`Unchanged` / `Replaced` / `SubtreeGone`).
-- Both functions document the Phase 2.A status inline and call
-  out the Phase 2.B transition path: the `debug_assert` becomes
-  a real `if cur != captured { restart-from-root }` once parent
-  guard is dropped before child pin.
-
-The scaffolding is "free" in release builds (debug_assert is a
-no-op) and exercises the Phase 1 bump pipeline end-to-end on
-every cross-blob insert / erase under tests / debug builds. Any
-regression in Phase 1's bump-on-mutation contract will surface
-as an immediate test failure on the next cross-blob op.
+- `walker::insert::insert_multi` first tries the recursive
+  lock-coupled path. If the root blob is full, `spillover_blob`
+  + `compact_blob` run as before, then the walker re-checks the
+  key path; if the target subtree moved behind a new `BlobNode`,
+  the retry immediately hands off to the child instead of holding
+  the root latch across child mutation.
+- `walker::erase::erase_multi` mirrors the same recursive
+  handoff. The lock-coupled delete path leaves an emptied child
+  blob reachable with an `EmptyRoot` sentinel rather than
+  unlinking the parent immediately; conservative parent-unlink
+  remains in the fallback and maintenance paths.
+- `walker::lookup`, `range`, and merge paths follow
+  `child.header.root_slot` when crossing blobs, so stale parent
+  hints cannot misroute reads after child compaction.
+- The older `insert_at_blob_node` / `erase_at_blob_node`
+  fallback arms keep debug-only slot-version assertions while
+  holding the parent latch. They are compatibility / conservative
+  paths, not the hot cross-blob writer path.
 
 ### Breaking — API redesign (split returning from blind)
 
@@ -470,8 +456,10 @@ competitive). Full table in [benches/RESULTS.md](benches/RESULTS.md).
   **Put** wins at 20 k / 100 k / 500 k, ties RocksDB at 2 M kv,
   but loses 8-22 % to RocksDB / SQLite at 2 M on objstore / fs
   — the regime where LSM-style write amortization is the right
-  choice and ART-over-blobs isn't competitive; cross-blob lock-
-  coupling is queued for v0.3 to close the gap.
+  choice and ART-over-blobs isn't competitive. The recursive
+  cross-blob latch-coupling work above targets this exact gap;
+  the next benchmark pass should re-measure the 2 M objstore / fs
+  put cells.
 - **Group C — p95/p99 under maintenance interference**
   (`tests/bench_contention_p95.rs`, `#[ignore]`). 4 writer
   threads + 5 ms-cadence background checkpointer + concurrent

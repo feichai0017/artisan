@@ -6,7 +6,8 @@ use crate::api::errors::{Error, Result};
 use crate::layout::{leaf_extent_size, BlobNode, Leaf, NodeType, BLOB_MAX_INLINE};
 use std::sync::Arc;
 
-use crate::store::{BlobFrame, BlobFrameRef, BufferManager, CachedBlob};
+use crate::store::buffer_manager::BlobWriteGuard;
+use crate::store::{BlobFrame, BufferManager, CachedBlob};
 
 use super::cast;
 use super::readers::{longest_common, ntype_of, read_leaf_key_ref, read_prefix};
@@ -86,68 +87,127 @@ pub fn insert_multi(
 
     // The caller (typically `Tree`) keeps `root_pin` alive across
     // every op so we skip `BufferManager`'s pin-Mutex on the hot
-    // path. Cross-blob writes still pin children through `bm`.
-    // Hold the exclusive guard for the **entire** insert. Every
-    // observable mutation (walker descent, header.root_slot bump,
-    // spillover, compact) happens inside one continuous critical
-    // section — releasing between phases would let another writer
-    // observe an inconsistent intermediate state (e.g. freed
-    // EmptyRoot slot before header is bumped) and lose updates to
-    // the racy header rewrite.
+    // root hop. The guard-aware walker performs a single descent:
+    // it mutates the current blob directly, or if the path reaches
+    // a BlobNode it lock-couples into the child and releases the
+    // parent before descendant mutation.
     let mut guard = root_pin.write();
+    let (root_guid, root_slot) = {
+        let frame = guard.frame();
+        (frame.header().blob_guid, frame.header().root_slot)
+    };
+    lock_coupled_insert_in_blob(
+        bm, guard, root_guid, root_slot, true, key, value, seq, wants_prev, 0,
+    )
+}
 
-    // Retry loop. On every `OutOfSpace`, run **spillover + compact
-    // back-to-back**:
-    //
-    // - `spillover_blob` picks the largest non-Blob subtree,
-    //   migrates it to a fresh child blob via `make_blob_from_node`,
-    //   and rewires the parent's child pointer through a freshly-
-    //   allocated `BlobNode` (uses the bump area's
-    //   `SPILLOVER_RESERVATION`).
-    // - `compact_blob` then deep-clones the source's live tree into
-    //   a new image and copies it back — reclaiming the just-
-    //   migrated subtree's leaf-extent bytes.
-    //
-    // Child blobs that OOM run the same loop inside
-    // `insert_at_blob_node`.
+#[derive(Debug, Clone, Copy)]
+struct InsertBlobCrossing {
+    child_guid: crate::layout::BlobGuid,
+    child_depth: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BlobCrossMode {
+    Conservative,
+    LockCoupled,
+}
+
+enum InsertStep {
+    Done(InsertReturn),
+    Crossing(InsertBlobCrossing),
+}
+
+#[allow(clippy::too_many_arguments)] // hot-path helper mirrors insert_at's call shape
+fn lock_coupled_insert_in_blob(
+    bm: &BufferManager,
+    mut guard: BlobWriteGuard<'_>,
+    current_guid: crate::layout::BlobGuid,
+    top_root_slot: u16,
+    is_top_blob: bool,
+    key: &[u8],
+    value: &[u8],
+    seq: u64,
+    wants_prev: bool,
+    depth: usize,
+) -> Result<InsertOutcome> {
+    let mut current_dirty = false;
+
     for _attempt in 0..MAX_SPILLOVER_ATTEMPTS {
         let r = {
             let mut frame = guard.frame();
             let root_slot = frame.header().root_slot;
-            insert_at(
+            insert_at_step(
                 Some(bm),
                 &mut frame,
                 root_slot,
                 key,
                 value,
-                0,
+                depth,
                 seq,
                 wants_prev,
+                BlobCrossMode::LockCoupled,
             )
         };
         match r {
-            Ok(out) => {
+            Ok(InsertStep::Done(out)) => {
                 {
                     let mut frame = guard.frame();
                     frame.header_mut().root_slot = out.slot_after;
                 }
+                drop(guard);
+                if !is_top_blob {
+                    bm.mark_dirty(current_guid, seq);
+                }
+
                 return Ok(InsertOutcome {
-                    new_root_slot: out.slot_after,
+                    new_root_slot: if is_top_blob {
+                        out.slot_after
+                    } else {
+                        top_root_slot
+                    },
                     previous: out.previous,
                 });
+            }
+            Ok(InsertStep::Crossing(crossing)) => {
+                let child_pin = bm.pin(crossing.child_guid)?;
+                let child_guard = child_pin.write();
+                drop(guard);
+
+                let outcome = lock_coupled_insert_in_blob(
+                    bm,
+                    child_guard,
+                    crossing.child_guid,
+                    top_root_slot,
+                    false,
+                    key,
+                    value,
+                    seq,
+                    wants_prev,
+                    crossing.child_depth,
+                );
+                drop(child_pin);
+
+                if outcome.is_ok() && current_dirty && !is_top_blob {
+                    bm.mark_dirty(current_guid, seq);
+                }
+                return outcome;
             }
             Err(Error::Alloc(crate::store::AllocError::OutOfSpace { .. })) => {
                 {
                     let mut frame = guard.frame();
-                    spillover_blob(bm, &mut frame, seq)?;
+                    spillover_blob(bm, &mut frame, seq)
+                        .map_err(|e| e.with_blob_guid(current_guid))?;
                 }
-                compact_blob(&mut guard)?;
+                compact_blob(&mut guard).map_err(|e| e.with_blob_guid(current_guid))?;
+                current_dirty = true;
             }
-            Err(other) => return Err(other),
+            Err(e) => return Err(e.with_blob_guid(current_guid)),
         }
     }
+
     Err(Error::NotYetImplemented(
-        "insert_multi: spillover retry loop exhausted",
+        "lock_coupled_insert_in_blob: spillover retry loop exhausted",
     ))
 }
 
@@ -164,24 +224,95 @@ pub(super) fn insert_at(
     seq: u64,
     wants_prev: bool,
 ) -> Result<InsertReturn> {
+    match insert_at_step(
+        bm,
+        frame,
+        slot,
+        key,
+        value,
+        depth,
+        seq,
+        wants_prev,
+        BlobCrossMode::Conservative,
+    )? {
+        InsertStep::Done(r) => Ok(r),
+        InsertStep::Crossing(_) => Err(Error::node_corrupt(
+            "walker::insert_at: conservative mode returned a BlobNode crossing",
+        )),
+    }
+}
+
+#[allow(clippy::too_many_arguments)] // wants_prev threads through every arm
+fn insert_at_step(
+    bm: Option<&BufferManager>,
+    frame: &mut BlobFrame<'_>,
+    slot: u16,
+    key: &[u8],
+    value: &[u8],
+    depth: usize,
+    seq: u64,
+    wants_prev: bool,
+    cross_mode: BlobCrossMode,
+) -> Result<InsertStep> {
     let ntype = ntype_of(frame.as_ref(), slot)?;
     match ntype {
         NodeType::Invalid => Err(Error::node_corrupt(
             "walker::insert_at: hit NodeType::Invalid",
         )),
-        NodeType::EmptyRoot => insert_into_empty_root(frame, slot, key, value, seq),
-        NodeType::Leaf => insert_into_leaf(frame, slot, key, value, depth, seq, wants_prev),
-        NodeType::Prefix => insert_into_prefix(bm, frame, slot, key, value, depth, seq, wants_prev),
-        NodeType::Node4 | NodeType::Node16 | NodeType::Node48 | NodeType::Node256 => {
-            insert_into_inner(bm, frame, slot, ntype, key, value, depth, seq, wants_prev)
+        NodeType::EmptyRoot => {
+            insert_into_empty_root(frame, slot, key, value, seq).map(InsertStep::Done)
         }
-        NodeType::Blob => match bm {
-            Some(b) => insert_at_blob_node(b, frame, slot, key, value, depth, seq, wants_prev),
-            None => Err(Error::NotYetImplemented(
+        NodeType::Leaf => {
+            insert_into_leaf(frame, slot, key, value, depth, seq, wants_prev).map(InsertStep::Done)
+        }
+        NodeType::Prefix => insert_into_prefix_step(
+            bm, frame, slot, key, value, depth, seq, wants_prev, cross_mode,
+        ),
+        NodeType::Node4 | NodeType::Node16 | NodeType::Node48 | NodeType::Node256 => {
+            insert_into_inner_step(
+                bm, frame, slot, ntype, key, value, depth, seq, wants_prev, cross_mode,
+            )
+        }
+        NodeType::Blob => match (bm, cross_mode) {
+            (Some(_), BlobCrossMode::LockCoupled) => {
+                blob_node_insert_crossing(frame, slot, key, depth).map(InsertStep::Crossing)
+            }
+            (Some(b), BlobCrossMode::Conservative) => {
+                insert_at_blob_node(b, frame, slot, key, value, depth, seq, wants_prev)
+                    .map(InsertStep::Done)
+            }
+            (None, _) => Err(Error::NotYetImplemented(
                 "walker::insert_at: BlobNode crossing requires BufferManager — use insert_multi",
             )),
         },
     }
+}
+
+fn blob_node_insert_crossing(
+    frame: &BlobFrame<'_>,
+    slot: u16,
+    key: &[u8],
+    depth: usize,
+) -> Result<InsertBlobCrossing> {
+    let body = frame.body_of_slot(slot).ok_or(Error::node_corrupt(
+        "blob_node_insert_crossing: BlobNode body resolution failed",
+    ))?;
+    let bn = *cast::<BlobNode>(body);
+    let plen = bn.prefix_len as usize;
+    if plen > BLOB_MAX_INLINE {
+        return Err(Error::node_corrupt(
+            "blob_node_insert_crossing: BlobNode prefix_len exceeds inline buffer",
+        ));
+    }
+    if depth + plen > key.len() || key[depth..depth + plen] != bn.bytes[..plen] {
+        return Err(Error::NotYetImplemented(
+            "blob_node_insert_crossing: BlobNode inline-prefix split is not yet implemented",
+        ));
+    }
+    Ok(InsertBlobCrossing {
+        child_guid: bn.child_blob_guid,
+        child_depth: depth + plen,
+    })
 }
 
 fn insert_into_empty_root(
@@ -347,7 +478,7 @@ fn insert_into_leaf(
 }
 
 #[allow(clippy::too_many_arguments)] // wants_prev added by API split
-fn insert_into_prefix(
+fn insert_into_prefix_step(
     bm: Option<&BufferManager>,
     frame: &mut BlobFrame<'_>,
     pfx_slot: u16,
@@ -356,7 +487,8 @@ fn insert_into_prefix(
     depth: usize,
     seq: u64,
     wants_prev: bool,
-) -> Result<InsertReturn> {
+    cross_mode: BlobCrossMode,
+) -> Result<InsertStep> {
     // `Prefix` is `Copy` and `read_prefix` returns it by value, so
     // `p` is owned on the stack. The inline prefix bytes live in
     // `p.bytes` — no need to allocate a `Vec` to keep them alive
@@ -374,7 +506,7 @@ fn insert_into_prefix(
     let common = longest_common(prefix_bytes, key_tail);
 
     if common == plen {
-        let r = insert_at(
+        let r = insert_at_step(
             bm,
             frame,
             child_slot,
@@ -383,14 +515,18 @@ fn insert_into_prefix(
             depth + plen,
             seq,
             wants_prev,
+            cross_mode,
         )?;
+        let InsertStep::Done(r) = r else {
+            return Ok(r);
+        };
         if r.slot_after != child_slot {
             set_prefix_child(frame, pfx_slot, u32::from(r.slot_after))?;
         }
-        return Ok(InsertReturn {
+        return Ok(InsertStep::Done(InsertReturn {
             slot_after: pfx_slot,
             previous: r.previous,
-        });
+        }));
     }
 
     if depth + common >= key.len() {
@@ -425,14 +561,14 @@ fn insert_into_prefix(
 
     frame.free_node(pfx_slot)?;
 
-    Ok(InsertReturn {
+    Ok(InsertStep::Done(InsertReturn {
         slot_after: final_slot,
         previous: None,
-    })
+    }))
 }
 
 #[allow(clippy::too_many_arguments)] // mirrors insert_at's call shape
-fn insert_into_inner(
+fn insert_into_inner_step(
     bm: Option<&BufferManager>,
     frame: &mut BlobFrame<'_>,
     inner_slot: u16,
@@ -442,7 +578,8 @@ fn insert_into_inner(
     depth: usize,
     seq: u64,
     wants_prev: bool,
-) -> Result<InsertReturn> {
+    cross_mode: BlobCrossMode,
+) -> Result<InsertStep> {
     if depth >= key.len() {
         return Err(Error::NotYetImplemented(
             "walker::insert_into_inner: key terminates at an inner node",
@@ -451,7 +588,7 @@ fn insert_into_inner(
     let byte = key[depth];
 
     if let Some(child_slot) = inner_find_child(frame, inner_slot, ntype, byte)? {
-        let r = insert_at(
+        let r = insert_at_step(
             bm,
             frame,
             child_slot,
@@ -460,22 +597,26 @@ fn insert_into_inner(
             depth + 1,
             seq,
             wants_prev,
+            cross_mode,
         )?;
+        let InsertStep::Done(r) = r else {
+            return Ok(r);
+        };
         if r.slot_after != child_slot {
             inner_update_child(frame, inner_slot, ntype, byte, u32::from(r.slot_after))?;
         }
-        return Ok(InsertReturn {
+        return Ok(InsertStep::Done(InsertReturn {
             slot_after: inner_slot,
             previous: r.previous,
-        });
+        }));
     }
 
     let new_leaf = write_leaf(frame, key, value, seq)?;
     let possibly_grown = inner_add_child(frame, inner_slot, ntype, byte, u32::from(new_leaf))?;
-    Ok(InsertReturn {
+    Ok(InsertStep::Done(InsertReturn {
         slot_after: possibly_grown,
         previous: None,
-    })
+    }))
 }
 
 // ---------- multi-blob arm ----------
@@ -514,20 +655,12 @@ fn insert_at_blob_node(
             ))?;
         *cast::<BlobNode>(body)
     };
-    // Phase 2.A: Capture the parent's per-slot version *before*
-    // any child-blob work. Phase 1's bump-on-mutation contract
-    // means a writer that later touches `parent_frame[bn_slot]`
-    // (spillover, compact, merge, structural rewrite) will bump
-    // this counter. We re-check the counter on the way back
-    // (`debug_assert` below) to catch any drift.
-    //
-    // Phase 2.A status: parent latch is still held throughout
-    // this function call, so concurrent writers cannot touch the
-    // parent's BlobNode slot — the assert can only fire if Phase
-    // 1's bump invariant is broken or Phase 2.B prematurely
-    // released the parent guard. Phase 2.B will restructure to
-    // drop parent guard before pinning the child and turn the
-    // debug_assert into a real `restart-from-root` branch.
+    // Compatibility fallback: normal `insert_multi` reaches child
+    // blobs through `lock_coupled_insert_in_blob`, which releases
+    // ancestors before descendant mutation. This recursive arm is
+    // still kept for conservative single-frame retry paths and
+    // debug coverage. While it holds the parent latch, this
+    // version check must never drift.
     let parent_bn_version_at_descent = parent_frame.slot_version(bn_slot);
     let plen = bn.prefix_len as usize;
     if plen > BLOB_MAX_INLINE {
@@ -542,7 +675,6 @@ fn insert_at_blob_node(
     }
 
     let child_guid = bn.child_blob_guid;
-    let mut child_entry = bn.child_entry_ptr as u16;
     let child_depth = depth + plen;
 
     // Pin the child blob in the BM cache for the duration of the
@@ -557,6 +689,7 @@ fn insert_at_blob_node(
             let r = {
                 let mut guard = child_pin.write();
                 let mut cf = guard.frame();
+                let child_entry = cf.header().root_slot;
                 insert_at(
                     Some(bm),
                     &mut cf,
@@ -584,20 +717,6 @@ fn insert_at_blob_node(
                         let mut guard = child_pin.write();
                         compact_blob(&mut guard).map_err(|e| e.with_blob_guid(child_guid))?;
                     }
-                    // `compact_blob` rebuilds the child blob in
-                    // place and renumbers every slot index — the
-                    // entry slot we cached from the parent's
-                    // `BlobNode.child_entry_ptr` is now stale.
-                    // Re-pick it from the child's freshly-written
-                    // `header.root_slot` so the next retry walks
-                    // a valid slot. (The parent's BlobNode pointer
-                    // gets refreshed below after the loop exits via
-                    // the `slot_after` rewire.)
-                    child_entry = {
-                        let guard = child_pin.read();
-                        let cf = BlobFrameRef::wrap(guard.as_slice());
-                        cf.header().root_slot
-                    };
                 }
                 Err(e) => {
                     // Attach the child blob's GUID to NodeCorrupt
@@ -628,12 +747,10 @@ fn insert_at_blob_node(
         cf.header_mut().root_slot = child_result.slot_after;
     }
 
-    // Phase 2.A: validate parent BlobNode slot didn't drift while
-    // we were working in the child. While parent latch is held
-    // (current Phase 2.A status) this is a `debug_assert` since
-    // drift is impossible. Phase 2.B will replace this with a
-    // proper restart-on-mismatch path once parent latch is
-    // dropped before the child hop.
+    // Parent is still held in this recursive fallback, so drift is
+    // impossible. The root-level lock-coupled path avoids this
+    // parent repair entirely by treating the child header as the
+    // authoritative cross-blob entry.
     debug_assert_eq!(
         parent_frame.slot_version(bn_slot),
         parent_bn_version_at_descent,
@@ -642,12 +759,6 @@ fn insert_at_blob_node(
          violation (parent latch was supposed to be held throughout)",
         parent_frame.slot_version(bn_slot),
     );
-
-    if u32::from(child_result.slot_after) != bn.child_entry_ptr {
-        let mut new_bn = bn;
-        new_bn.child_entry_ptr = u32::from(child_result.slot_after);
-        write_struct_to_slot(parent_frame, bn_slot, &new_bn)?;
-    }
 
     drop(child_pin);
     // Hand the child blob to the unified checkpoint protocol —

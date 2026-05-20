@@ -14,8 +14,9 @@ pub enum LookupResult<'a> {
     NotFound,
     /// Descent reached a [`NodeType::Blob`] crossing. The caller
     /// (typically `Tree::get`) must load the child blob by its GUID
-    /// and call [`super::lookup_at`] on the child frame starting at
-    /// `child_slot` with `depth = child_depth`.
+    /// and continue with `depth = child_depth`. `child_slot` is the
+    /// parent-stored compatibility hint; multi-blob callers should
+    /// prefer the child blob's own `header.root_slot`.
     Crossing(BlobNodeCrossing),
 }
 
@@ -24,7 +25,9 @@ pub enum LookupResult<'a> {
 pub struct BlobNodeCrossing {
     /// GUID of the blob to walk into next.
     pub child_guid: BlobGuid,
-    /// Slot inside the child blob where the walk resumes.
+    /// Slot hint inside the child blob where the walk resumes.
+    /// The child blob's `header.root_slot` is authoritative.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub child_slot: u16,
     /// `depth` to pass to the next [`super::lookup_at`] call (the
     /// parent blob's depth plus the BlobNode's inline prefix length).

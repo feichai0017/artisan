@@ -11,7 +11,7 @@ use super::readers::read_prefix;
 use super::types::LookupResult;
 use super::writers::write_struct_to_slot;
 use crate::api::errors::Error;
-use crate::layout::{BlobGuid, NodeType, PAGE_SIZE};
+use crate::layout::{BlobGuid, BlobNode, NodeType, PAGE_SIZE};
 use crate::store::backend::AlignedBlobBuf;
 use crate::store::BlobFrame;
 
@@ -51,6 +51,14 @@ fn compact_in_place(buf: &mut [u8]) {
     ab.as_mut_slice().copy_from_slice(buf);
     compact_blob(&mut ab).unwrap();
     buf.copy_from_slice(ab.as_slice());
+}
+
+fn replace_root_with_stale_blob_node(buf: &mut AlignedBlobBuf, child_guid: BlobGuid) {
+    let mut frame = BlobFrame::wrap(buf.as_mut_slice());
+    let bn_out = frame.alloc_node(NodeType::Blob).unwrap();
+    let bn = BlobNode::new(b"", child_guid, 1);
+    write_struct_to_slot(&mut frame, bn_out.slot, &bn).unwrap();
+    frame.header_mut().root_slot = bn_out.slot;
 }
 
 #[test]
@@ -799,10 +807,12 @@ fn make_blob_from_node_preserves_existing_blob_node_crossings() {
     };
 
     let src_frame = BlobFrame::wrap(&mut src_buf);
+    assert_eq!(src_frame.header().num_ext_blobs, 1);
     let outcome = make_blob_from_node(&src_frame, bn_slot, [0x33; 16]).unwrap();
 
     let mut new_buf = outcome.buf;
     let new_frame = BlobFrame::wrap(new_buf.as_mut_slice());
+    assert_eq!(new_frame.header().num_ext_blobs, 1);
     let new_root = new_frame.header().root_slot;
     let entry = new_frame.slot_entry(new_root).unwrap();
     assert_eq!(entry.node_type(), Some(NodeType::Blob));
@@ -963,7 +973,8 @@ fn compact_blob_preserves_guid_and_lets_inserts_continue() {
 /// subtree into a fresh child blob, then rewrite the root blob's
 /// `header.root_slot` to point at a freshly-allocated `BlobNode`
 /// referencing the child. Verifies `Tree::get` follows the
-/// crossing even when it was built outside the spillover path.
+/// crossing even when it was built outside the spillover path and
+/// the parent-stored child-entry hint is stale.
 ///
 /// Lives here (not in `tests/tree_smoke.rs`) because it needs
 /// `engine::walker::*` internals (`make_blob_from_node`) that
@@ -973,8 +984,7 @@ fn compact_blob_preserves_guid_and_lets_inserts_continue() {
 /// friends; this test exists to keep BlobNode descent honest
 /// against a synthetic shape.
 #[test]
-fn tree_get_follows_blob_node_crossing_across_two_blobs() {
-    use crate::layout::BlobNode;
+fn tree_get_and_put_follow_child_header_root_across_blob_node() {
     use crate::store::backend::{Backend, MemoryBackend};
     use crate::TreeBuilder;
     use std::sync::Arc;
@@ -1006,37 +1016,128 @@ fn tree_get_follows_blob_node_crossing_across_two_blobs() {
 
     backend.write_blob(child_guid, &child_outcome.buf).unwrap();
 
-    {
-        let mut root_frame = BlobFrame::wrap(root_buf.as_mut_slice());
-        let bn_out = root_frame.alloc_node(NodeType::Blob).unwrap();
-        let bn = BlobNode::new(b"", child_guid, u32::from(child_outcome.entry_slot));
-        // SAFETY: layout types are #[repr(C)] POD; body has the
-        // right size; BlobFrame's bump allocator gives 8-byte
-        // alignment.
-        let body = root_frame.body_of_slot_mut(bn_out.slot).unwrap();
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                std::ptr::from_ref(&bn).cast::<u8>(),
-                body.as_mut_ptr(),
-                std::mem::size_of::<BlobNode>(),
-            );
-        }
-        root_frame.header_mut().root_slot = bn_out.slot;
-        let _ = saved_root_slot;
-    }
+    assert_ne!(
+        child_outcome.entry_slot, 1,
+        "test needs a stale child_entry_ptr that differs from child root"
+    );
+    replace_root_with_stale_blob_node(&mut root_buf, child_guid);
+    let _ = saved_root_slot;
     backend.write_blob(root_guid, &root_buf).unwrap();
 
     let tree = TreeBuilder::new("ignored")
         .open_with_backend(backend.clone())
         .unwrap();
+    tree.put(b"k00", b"updated").unwrap();
+    assert!(tree.delete(b"k01").unwrap());
     for i in 0..10u32 {
         let k = format!("k{i:02}").into_bytes();
         let v = format!("v{i}").into_bytes();
+        if i == 1 {
+            assert!(tree.get(&k).unwrap().is_none());
+            continue;
+        }
+        let expected: &[u8] = if i == 0 { b"updated" } else { &v };
         assert_eq!(
             tree.get(&k).unwrap().as_deref(),
-            Some(&v[..]),
+            Some(expected),
             "post-crossing lookup failed for key {k:?}",
         );
     }
+    let keys: Vec<Vec<u8>> = tree
+        .range()
+        .into_iter()
+        .map(|entry| match entry.unwrap() {
+            crate::RangeEntry::Key { key, .. } => key,
+            other => panic!("unexpected range entry: {other:?}"),
+        })
+        .collect();
+    assert_eq!(keys.len(), 9);
+    assert_eq!(keys[0], b"k00");
     assert!(tree.get(b"k99").unwrap().is_none());
+}
+
+/// Same stale-hint setup as the one-level test above, but with
+/// two consecutive BlobNode crossings. This exercises the
+/// recursive lock-coupled writer path, not just the root→child
+/// fast path.
+#[test]
+fn tree_put_and_delete_follow_nested_child_header_roots() {
+    use crate::store::backend::{Backend, MemoryBackend};
+    use crate::TreeBuilder;
+    use std::sync::Arc;
+
+    let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+    {
+        let tree = TreeBuilder::new("ignored")
+            .open_with_backend(backend.clone())
+            .unwrap();
+        for i in 0..12u32 {
+            let k = format!("k{i:02}").into_bytes();
+            let v = format!("v{i}").into_bytes();
+            tree.put(&k, &v).unwrap();
+        }
+    }
+
+    let root_guid = [0u8; 16];
+    let child_guid = [0xBB; 16];
+    let grandchild_guid = [0xCC; 16];
+
+    let mut root_buf = AlignedBlobBuf::zeroed();
+    backend.read_blob(root_guid, &mut root_buf).unwrap();
+
+    let child_outcome = {
+        let root_frame = BlobFrame::wrap(root_buf.as_mut_slice());
+        make_blob_from_node(&root_frame, root_frame.header().root_slot, child_guid).unwrap()
+    };
+    assert_ne!(
+        child_outcome.entry_slot, 1,
+        "test needs root's stale child_entry_ptr to differ from child root"
+    );
+
+    let mut child_buf = child_outcome.buf.clone();
+    let grandchild_outcome = {
+        let child_frame = BlobFrame::wrap(child_buf.as_mut_slice());
+        make_blob_from_node(
+            &child_frame,
+            child_frame.header().root_slot,
+            grandchild_guid,
+        )
+        .unwrap()
+    };
+    assert_ne!(
+        grandchild_outcome.entry_slot, 1,
+        "test needs child's stale child_entry_ptr to differ from grandchild root"
+    );
+
+    backend
+        .write_blob(grandchild_guid, &grandchild_outcome.buf)
+        .unwrap();
+    replace_root_with_stale_blob_node(&mut child_buf, grandchild_guid);
+    backend.write_blob(child_guid, &child_buf).unwrap();
+    replace_root_with_stale_blob_node(&mut root_buf, child_guid);
+    backend.write_blob(root_guid, &root_buf).unwrap();
+
+    let tree = TreeBuilder::new("ignored")
+        .open_with_backend(backend.clone())
+        .unwrap();
+    tree.put(b"k00", b"updated").unwrap();
+    tree.put(b"k99", b"new").unwrap();
+    assert!(tree.delete(b"k01").unwrap());
+
+    assert_eq!(tree.get(b"k00").unwrap().as_deref(), Some(&b"updated"[..]));
+    assert!(tree.get(b"k01").unwrap().is_none());
+    assert_eq!(tree.get(b"k02").unwrap().as_deref(), Some(&b"v2"[..]));
+    assert_eq!(tree.get(b"k99").unwrap().as_deref(), Some(&b"new"[..]));
+
+    let keys: Vec<Vec<u8>> = tree
+        .range()
+        .into_iter()
+        .map(|entry| match entry.unwrap() {
+            crate::RangeEntry::Key { key, .. } => key,
+            other => panic!("unexpected range entry: {other:?}"),
+        })
+        .collect();
+    assert_eq!(keys.len(), 12);
+    assert_eq!(keys.first().map(Vec::as_slice), Some(&b"k00"[..]));
+    assert_eq!(keys.last().map(Vec::as_slice), Some(&b"k99"[..]));
 }

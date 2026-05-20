@@ -733,14 +733,11 @@ fn compact_does_not_leak_pre_wal_state_to_backend() {
 fn multi_blob_compact_does_not_leak_pre_wal_state_to_backend() {
     // Same protocol assertion as
     // `compact_does_not_leak_pre_wal_state_to_backend`, but
-    // sized to force spillover so `Tree::compact` actually
-    // enters its **phase 1.5 `refresh_blob_node_pointers`**
-    // path — that path rewrites parent `BlobNode.child_entry_ptr`
-    // after `compact_blob` renumbers each child's slots. Before
-    // the fix it called `bm.commit(parent_guid)` inline, which
-    // pushed the parent's cache image (potentially carrying
-    // unflushed user mutations) to backend before the compact's
-    // trailing `flush_dirty_inline` could gate it under W2D.
+    // sized to force spillover so `Tree::compact` actually enters
+    // its phase 1.5 hint-refresh path. That path rewrites parent
+    // `BlobNode.child_entry_ptr` after `compact_blob` renumbers
+    // each child's slots. The hint is no longer authoritative for
+    // readers, but the refresh still must obey W2D.
     use holt::{Backend, MemoryBackend};
     use std::sync::Arc;
 
@@ -753,8 +750,7 @@ fn multi_blob_compact_does_not_leak_pre_wal_state_to_backend() {
     assert_eq!(inner.list_blobs().unwrap().len(), 1);
 
     // Stuff enough data to force at least two spillovers so the
-    // `refresh_blob_node_pointers` walk has multiple parent
-    // BlobNodes to consider.
+    // hint-refresh walk has multiple parent BlobNodes to consider.
     let payload = vec![b'q'; 1024];
     for i in 0..1500u32 {
         tree.put(format!("k{i:05}").as_bytes(), &payload).unwrap();

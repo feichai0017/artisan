@@ -426,7 +426,7 @@ impl RangeIter {
     }
 
     fn descend_blob_for_anchor(&mut self) -> Result<bool> {
-        let (child_guid, child_slot, p_bytes) = {
+        let (child_guid, p_bytes) = {
             let top = self.stack.last().expect("stack non-empty");
             let guard = top.pin.read();
             let frame = BlobFrameRef::wrap(guard.as_slice());
@@ -437,7 +437,6 @@ impl RangeIter {
             let plen = (b.prefix_len as usize).min(BLOB_MAX_INLINE);
             (
                 b.child_blob_guid,
-                b.child_entry_ptr as u16,
                 InlinePrefix::from_slice(&b.bytes[..plen]),
             )
         };
@@ -450,9 +449,11 @@ impl RangeIter {
         self.stack.last_mut().unwrap().next = 1;
         self.curr_key.extend_from_slice(p_bytes);
         let child_pin = self.bm.pin(child_guid)?;
-        let child_ntype = {
+        let (child_slot, child_ntype) = {
             let guard = child_pin.read();
-            ntype_of(BlobFrameRef::wrap(guard.as_slice()), child_slot)?
+            let frame = BlobFrameRef::wrap(guard.as_slice());
+            let child_slot = frame.header().root_slot;
+            (child_slot, ntype_of(frame, child_slot)?)
         };
         let pushed = p_bytes.len() as u16;
         self.stack.push(Frame {
@@ -567,7 +568,7 @@ impl RangeIter {
                 NodeType::Blob => {
                     if top.next == 0 {
                         top.next = 1;
-                        let (child_guid, child_slot, p_bytes) = {
+                        let (child_guid, p_bytes) = {
                             let guard = top.pin.read();
                             let frame = BlobFrameRef::wrap(guard.as_slice());
                             let body = frame.body_of_slot(top.slot).ok_or(Error::node_corrupt(
@@ -577,11 +578,10 @@ impl RangeIter {
                             let plen = (b.prefix_len as usize).min(BLOB_MAX_INLINE);
                             (
                                 b.child_blob_guid,
-                                b.child_entry_ptr as u16,
                                 InlinePrefix::from_slice(&b.bytes[..plen]),
                             )
                         };
-                        self.push_in_other_blob(child_guid, child_slot, p_bytes.as_slice())?;
+                        self.push_in_other_blob(child_guid, p_bytes.as_slice())?;
                     } else {
                         self.pop_frame();
                     }
@@ -641,16 +641,13 @@ impl RangeIter {
         Ok(())
     }
 
-    fn push_in_other_blob(
-        &mut self,
-        child_guid: BlobGuid,
-        child_slot: u16,
-        prefix_bytes: &[u8],
-    ) -> Result<()> {
+    fn push_in_other_blob(&mut self, child_guid: BlobGuid, prefix_bytes: &[u8]) -> Result<()> {
         let child_pin = self.bm.pin(child_guid)?;
-        let child_ntype = {
+        let (child_slot, child_ntype) = {
             let guard = child_pin.read();
-            ntype_of(BlobFrameRef::wrap(guard.as_slice()), child_slot)?
+            let frame = BlobFrameRef::wrap(guard.as_slice());
+            let child_slot = frame.header().root_slot;
+            (child_slot, ntype_of(frame, child_slot)?)
         };
         self.curr_key.extend_from_slice(prefix_bytes);
         self.stack.push(Frame {

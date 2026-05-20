@@ -234,7 +234,6 @@ pub fn merge_blob(
 ) -> Result<u16> {
     let bn = read_blob_node(parent_frame, parent_bn_slot)?;
     let child_guid = bn.child_blob_guid;
-    let child_entry_ptr = bn.child_entry_ptr as u16;
     let plen = (bn.prefix_len as usize).min(BLOB_MAX_INLINE);
     let prefix_bytes: Vec<u8> = bn.bytes[..plen].to_vec();
 
@@ -242,7 +241,8 @@ pub fn merge_blob(
         let child_pin = bm.pin(child_guid)?;
         let mut child_guard = child_pin.write();
         let child_frame = child_guard.frame();
-        clone_subtree(&child_frame, parent_frame, child_entry_ptr, false)?
+        let child_root = child_frame.header().root_slot;
+        clone_subtree(&child_frame, parent_frame, child_root, false)?
             .expect("preserve mode never returns None")
     };
 

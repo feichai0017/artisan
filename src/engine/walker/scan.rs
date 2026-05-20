@@ -142,17 +142,18 @@ fn scan_subtree(frame: BlobFrameRef<'_>, slot: u16, out: &mut Vec<BlobGuid>) -> 
     }
 }
 
-/// Bring every `BlobNode.child_entry_ptr` reachable from `root_guid`
-/// back into sync with the corresponding child blob's
-/// `header.root_slot`.
+/// Bring every parent-stored `BlobNode.child_entry_ptr` hint
+/// reachable from `root_guid` back into sync with the corresponding
+/// child blob's authoritative `header.root_slot`.
 ///
 /// `compact_blob` rewrites a blob's root in isolation — the child
 /// blob's `header.root_slot` advances to whatever slot the rebuilt
 /// subtree landed in, but parents have no way to learn that from
-/// inside `compact_blob`. Insert / erase keep the pair in lock-step
-/// inline, so this sweep is only needed after a structural rewrite
-/// (today: post-compact). Returns the number of `BlobNode`
-/// crossings whose pointer it had to update.
+/// inside `compact_blob`. Modern cross-blob walkers ignore the hint
+/// and enter children through their own header root, so this sweep
+/// is for compatibility/debuggability rather than correctness.
+/// Returns the number of `BlobNode` crossings whose hint it had to
+/// update.
 pub fn refresh_blob_node_pointers(bm: &BufferManager, root_guid: BlobGuid) -> Result<u32> {
     let guids = collect_blob_guids(bm, root_guid)?;
     let mut updated: u32 = 0;

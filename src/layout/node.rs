@@ -14,7 +14,7 @@ pub enum NodeType {
     /// inline bytes).
     Prefix = 2,
     /// In-tree blob crossing (128-byte body carrying
-    /// `child_blob_guid` + `child_entry_ptr`).
+    /// `child_blob_guid` plus a child-entry hint).
     Blob = 3,
     /// 1..4 children, parallel sorted `keys[4]` + `children[4]`.
     Node4 = 4,

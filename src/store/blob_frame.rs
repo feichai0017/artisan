@@ -203,8 +203,10 @@ impl<'a> BlobFrameRef<'a> {
 ///   with `Release` ordering. The walker's write paths construct
 ///   this variant via [`crate::store::BlobWriteGuard::frame`] so observers
 ///   reading the slot after the latch release can detect the
-///   mutation. Foundation for cross-blob lock-coupling (queued
-///   Phases 2-3 of the per-node-latch milestone).
+///   mutation. The current cross-blob writer path uses latch
+///   coupling plus child-header roots; these counters remain the
+///   fine-grained validation token for compatibility checks and
+///   future per-slot optimistic readers.
 pub struct BlobFrame<'a> {
     /// Backing buffer (must be exactly `PAGE_SIZE` bytes).
     buf: &'a mut [u8],
@@ -298,16 +300,12 @@ impl<'a> BlobFrame<'a> {
     /// index is out of range.
     ///
     /// Pairs with [`Self::bump_slot_version`]'s `Release` store.
-    /// Walker uses this on cross-blob descent boundaries: capture
-    /// the parent slot's version before descending into the child
-    /// blob, then re-load on the way back to verify the parent
-    /// slot didn't move during the child work.
-    ///
-    /// Phase 2.A (current): the validate is a `debug_assert`
-    /// because parent latch is held throughout the cross-blob
-    /// descent — version cannot drift while the latch is held.
-    /// Phase 2.B will drop the parent guard before child work
-    /// and turn the validate into a real restart-on-mismatch.
+    /// The conservative cross-blob fallback uses this as a debug
+    /// invariant while it holds the parent latch across a child
+    /// call. The lock-coupled writer path does not need a parent
+    /// re-acquire token for normal child-local root changes
+    /// because the child blob's own `header.root_slot` is
+    /// authoritative.
     #[must_use]
     pub(crate) fn slot_version(&self, slot: u16) -> u64 {
         let Some(svs) = self.slot_versions else {
@@ -456,6 +454,9 @@ impl<'a> BlobFrame<'a> {
     /// who captured a version before the latch was acquired.
     pub fn alloc_node(&mut self, ntype: NodeType) -> Result<AllocOutcome, AllocError> {
         let outcome = self.alloc_node_inner(ntype)?;
+        if ntype == NodeType::Blob {
+            self.header_mut().num_ext_blobs = self.header().num_ext_blobs.saturating_add(1);
+        }
         self.bump_slot_version(outcome.slot);
         Ok(outcome)
     }
@@ -550,7 +551,15 @@ impl<'a> BlobFrame<'a> {
     /// captured a version before the latch was acquired will see
     /// the mismatch on re-validate.
     pub fn free_node(&mut self, slot: u16) -> Result<(), FreeError> {
+        let e = self.slot_entry(slot).ok_or(FreeError::InvalidSlot(slot))?;
+        let ntype = e.node_type().ok_or(FreeError::TypeMismatch {
+            slot,
+            tag: e.ntype_or_next_free,
+        })?;
         self.free_node_inner(slot)?;
+        if ntype == NodeType::Blob {
+            self.header_mut().num_ext_blobs = self.header().num_ext_blobs.saturating_sub(1);
+        }
         self.bump_slot_version(slot);
         Ok(())
     }
@@ -689,6 +698,28 @@ mod tests {
         // Re-alloc — should pop slot 3 (LIFO).
         let r = frame.alloc_node(NodeType::Leaf).unwrap();
         assert_eq!(r.slot, 3);
+    }
+
+    #[test]
+    fn num_ext_blobs_tracks_live_blob_nodes() {
+        let mut buf = fresh();
+        let mut frame = BlobFrame::init(&mut buf, [0; 16]).unwrap();
+        assert_eq!(frame.header().num_ext_blobs, 0);
+
+        let blob = frame.alloc_node(NodeType::Blob).unwrap();
+        assert_eq!(frame.header().num_ext_blobs, 1);
+        frame.free_node(blob.slot).unwrap();
+        assert_eq!(frame.header().num_ext_blobs, 0);
+
+        let prefix = frame.alloc_node(NodeType::Prefix).unwrap();
+        assert_eq!(frame.header().num_ext_blobs, 0);
+        frame.free_node(prefix.slot).unwrap();
+        assert_eq!(frame.header().num_ext_blobs, 0);
+
+        let blob_from_prefix_slot = frame.alloc_node(NodeType::Blob).unwrap();
+        assert_eq!(frame.header().num_ext_blobs, 1);
+        frame.free_node(blob_from_prefix_slot.slot).unwrap();
+        assert_eq!(frame.header().num_ext_blobs, 0);
     }
 
     #[test]

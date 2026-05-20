@@ -439,13 +439,10 @@ impl Tree {
     /// [`Tree::remove`] when the caller actually needs the prior
     /// value back.
     ///
-    /// Walks across `BlobNode` crossings. When a child blob
-    /// becomes empty as a result of the erase, its parent's
-    /// `BlobNode` is freed and the orphaned child blob is queued
-    /// for deferred deletion via the BM — the actual
-    /// `backend.delete_blob` runs from the checkpoint round
-    /// after the WAL record covering this erase is durable
-    /// (invariant W2D).
+    /// Walks across `BlobNode` crossings. Child-local mutations
+    /// are staged through the BM dirty set; any conservative
+    /// fallback that unlinks a child blob queues the manifest
+    /// delete through the same W2D-safe pending-delete protocol.
     pub fn delete(&self, key: &[u8]) -> Result<bool> {
         self.delete_inner(key, /*wants_prev=*/ false)
             .map(|outcome| outcome.mutated)
@@ -514,10 +511,8 @@ impl Tree {
                 // durability path. snapshot_dirty drains all
                 // entries; we commit each through the backend.
                 self.flush_dirty_inline()?;
-                // Plus drain any deferred deletes the SubtreeGone
-                // path queued — the cache image of those children
-                // is gone, but the backend slot is still alive
-                // until we apply `backend.delete_blob`.
+                // Plus drain any deferred deletes queued by a
+                // conservative parent-unlink path.
                 self.flush_pending_deletes_inline()?;
             }
             outcome
@@ -712,8 +707,8 @@ impl Tree {
             if self.cfg.memory_flush_on_write {
                 // Every inner op may have dirtied root + cross-blob
                 // children — drain the whole set rather than just
-                // the root. Inner deletes/renames may also have
-                // queued SubtreeGone deferred deletes.
+                // the root. Some fallback paths may also have
+                // queued deferred deletes.
                 self.flush_dirty_inline()?;
                 self.flush_pending_deletes_inline()?;
             }
@@ -1211,16 +1206,14 @@ impl Tree {
     /// The caller must guarantee no other thread is calling
     /// `Tree::{put, get, delete, rename, txn, range, scan_prefix}`
     /// for the duration of `compact()`. Phase 1 rebuilds each
-    /// blob in place, which renumbers slot indices inside the
-    /// child blob; phase 1.5 then walks the tree and fixes every
-    /// parent `BlobNode.child_entry_ptr` to match the child's
-    /// freshly-rewritten `header.root_slot`. In the window
-    /// between phase 1 and phase 1.5 a concurrent reader can
-    /// pull a stale `child_entry_ptr` from the parent and
-    /// descend into a slot that no longer means what it used
-    /// to. A tree-wide maintenance latch (writers stall while
-    /// compact runs) is the planned v0.3 fix; until then,
-    /// schedule `compact()` during a quiescent window.
+    /// blob in place. Cross-blob readers use the child blob's own
+    /// `header.root_slot` as the authoritative entry, so stale
+    /// parent `BlobNode.child_entry_ptr` hints no longer break
+    /// descent. The remaining unsafe part is broader: `compact`
+    /// still collects and rewrites blobs without a tree-wide
+    /// maintenance latch, so concurrent structural writers can
+    /// race the maintenance pass. Schedule `compact()` during a
+    /// quiescent window until that latch lands.
     ///
     /// ## Two phases:
     ///
@@ -1275,11 +1268,11 @@ impl Tree {
             self.backend.mark_dirty(*guid, STRUCTURAL_SEQ);
         }
 
-        // Phase 1.5 — restore the `BlobNode.child_entry_ptr ==
-        // child.header.root_slot` invariant that compact_blob broke
-        // when it rebuilt each child's root inside its own blob in
-        // isolation. Insert / erase rewrite the pair in lock-step
-        // inline, so this sweep only matters after a compact.
+        // Phase 1.5 — refresh the parent-stored child-entry hint.
+        // Cross-blob walkers treat child.header.root_slot as
+        // authoritative, so this is no longer required for lookup
+        // correctness; keeping the hint fresh preserves older
+        // inspection/debug tooling and keeps the on-disk shape tidy.
         engine::refresh_blob_node_pointers(&self.backend, self.root_guid)?;
 
         // Phase 2 — tree-wide merge pass. Walk parents in BFS order
