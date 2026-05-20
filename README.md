@@ -32,10 +32,10 @@ It is **not** a general-purpose KV store; if you need full-text
 or vector similarity, reach for the right tool. For this shape,
 holt beats LMDB / RocksDB / SQLite cleanly on point lookup and
 prefix scan at every dataset size we test through 2 M keys, and
-on point writes at every size + workload we test except one
-(2 M `fs_put` vs RocksDB, where LSM write amortization is
-structurally the right answer — see
-[`benches/RESULTS.md`](benches/RESULTS.md)).
+on point writes at every size + workload in the current scale-put
+run. The narrowest cell is 2 M `fs_put` vs RocksDB, where holt is
+effectively at parity rather than decisively ahead — see
+[`benches/RESULTS.md`](benches/RESULTS.md).
 
 ## Why "holt"?
 
@@ -76,9 +76,9 @@ failpoint-injected) pass on Ubuntu + macOS CI.
 
 See [`CHANGELOG.md`](CHANGELOG.md) for the per-feature
 breakdown and [`ROADMAP.md`](ROADMAP.md) for what's queued
-(slot-versioned lock coupling, journal-worker group commit,
-batched `io_uring` / NVMe checkpoint I/O, SIMD / memory hot-path
-work, and large-tree shape control).
+(journal-worker group commit, batched `io_uring` / NVMe
+checkpoint I/O, SIMD / memory hot-path work, online maintenance
+latching, and large-tree shape control).
 
 `cargo bench --bench main` runs a side-by-side comparison with
 RocksDB and SQLite across three metadata workload shapes — see

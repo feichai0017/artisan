@@ -233,17 +233,15 @@ the blind path:
   skip the `Vec` clone + bytes copy that the v0.2.x always-encoded
   path paid.
 
-Measured improvements (M3 Pro, scale curve, 100× data growth):
-- **kv put**: -6 % at 2 M (1 296 → 1 217 ns); -14 % at 20 k.
-- **objstore put**: -1 % at 2 M (1 503 → 1 486 ns); -23 % at 20 k.
-- **fs put**: -11 % at 2 M (1 492 → 1 333 ns); -23 % at 20 k.
+Current scale-put re-run after the cross-blob latch-coupling and
+`BlobNode` format break (M3 Pro, non-quick Criterion):
+- **kv put @ 2 M**: 1 276 ns (vs RocksDB 1 577 ns, SQLite 1 616 ns).
+- **objstore put @ 2 M**: 1 463 ns (vs RocksDB 1 532 ns, SQLite 1 547 ns).
+- **fs put @ 2 M**: 1 436 ns (vs RocksDB 1 446 ns, SQLite 1 517 ns).
 
-At 2 M vs RocksDB: kv flipped from tied to **1.16×** ahead;
-objstore went from 0.87× behind to **1.10×** ahead; fs went from
-0.82× behind to 0.95× (still slightly behind, see RESULTS.md
-for the structural reason — LSM write amortization at working-
-set ≫ buffer-pool is the regime where ART-over-blobs isn't yet
-competitive). Full table in [benches/RESULTS.md](benches/RESULTS.md).
+At 2 M vs RocksDB: kv is **1.24×** ahead, objstore is **1.05×**
+ahead, and fs is **1.01×** ahead / effectively tied. Full table in
+[benches/RESULTS.md](benches/RESULTS.md).
 
 ### Changed — internal types
 
@@ -435,13 +433,10 @@ competitive). Full table in [benches/RESULTS.md](benches/RESULTS.md).
   (~192 MB payload) forces full eviction churn. **Get** scales
   beautifully on all three workloads (holt wins every cell with
   the lead vs RocksDB widening to 5.4× / 2.8× / 2.2× at 2 M).
-  **Put** wins at 20 k / 100 k / 500 k, ties RocksDB at 2 M kv,
-  but loses 8-22 % to RocksDB / SQLite at 2 M on objstore / fs
-  — the regime where LSM-style write amortization is the right
-  choice and ART-over-blobs isn't competitive. The recursive
-  cross-blob latch-coupling work above targets this exact gap;
-  the next benchmark pass should re-measure the 2 M objstore / fs
-  put cells.
+  **Put** now wins every point in the current scale-put run;
+  the hard cell is 2 M fs put, where holt is only **1.01×**
+  ahead of RocksDB and should be treated as parity rather than a
+  decisive write win.
 - **Group C — p95/p99 under maintenance interference**
   (`tests/bench_contention_p95.rs`, `#[ignore]`). 4 writer
   threads + 5 ms-cadence background checkpointer + concurrent

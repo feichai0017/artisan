@@ -16,6 +16,9 @@ cargo bench --bench main -- --output-format bencher
 
 # One group only — e.g. just KV.
 cargo bench --bench main -- kv_ --output-format bencher
+
+# Put-only scale curve refreshed for the current v0.3 branch.
+cargo bench --bench main -- _scale_put --noplot --output-format bencher
 ```
 
 Each criterion sample is one op. Numbers are mean ± noise band
@@ -30,9 +33,10 @@ comparison.
 - **OS**: macOS 26.3 (Darwin 25.0.0)
 - **Rust**: 1.94.0 stable, release profile (`lto=thin`,
   `codegen-units=1`, `opt-level=3`)
-- **holt**: commit `63b181d` (v0.2 release-class — `wal.lock`
-  W2D protocol, sharded BufferManager, 3-thread bg
-  checkpointer, SIMD CRC32 + node scans).
+- **holt**: code commit `104ac23` for the refreshed scale-put
+  tables (BlobNode child-entry removal + recursive cross-blob
+  latch coupling). Older get/list tables are from the same M3 Pro
+  benchmark track and should be refreshed before a release tag.
 - **RocksDB**: 0.24 (`librocksdb-sys` 0.18, bundled)
 - **SQLite**: rusqlite 0.39 (bundled libsqlite3)
 - **Knob alignment**: all three engines use comparable
@@ -50,17 +54,18 @@ crossings beats seek-iterator-per-leaf hands down).
 
 The scale curve in Group B (below) extends this across
 `{ 20 k, 100 k, 500 k, 2 M }` keys × three workload shapes
-(numbers below are v0.3.0):
+(scale-put tables refreshed on the current v0.3 branch; get
+tables are from the earlier v0.3 M3 Pro run):
 
 - **Get scales beautifully**: holt wins every get cell at every
   tier. The lead vs RocksDB widens to **5.4× / 2.8× / 2.2×** at
   2 M (kv / objstore / fs) as the LSM's read-amplification
   finally bites.
-- **Put wins essentially everywhere now**: holt wins puts at
-  every tier ≤ 500 k. At 2 M: **1.16×** ahead of RocksDB on kv,
-  **1.10×** ahead on objstore, **0.95×** (5 % behind) on fs.
-  The one remaining loss is a structural LSM-amortization
-  regime that the v0.3 extreme performance track should close.
+- **Put wins every point in the current scale-put run**: holt wins
+  puts at every tier through 2 M. At 2 M: **1.24×** ahead of
+  RocksDB on kv, **1.05×** ahead on objstore, and **1.01×** on
+  fs. Treat the fs cell as effectively tied rather than a large
+  win — the point estimate is ahead, but the margin is tiny.
 
 ## KV workload (short random keys + short values)
 
@@ -158,14 +163,14 @@ cargo bench --bench main -- _scale_ --output-format bencher
 | **500 k** |   **591** |        1 503 |       1 157 |       2.5× |      2.0× |
 |  **2 M**  | **1 015** |    **5 509** |       1 418 |   **5.4×** |      1.4× |
 
-`kv_scale_put` (v0.3.0 — blind `put` with walker hot-path opts):
+`kv_scale_put` (v0.3 current — blind `put` + cross-blob latch coupling):
 
 | n        | Holt (ns) | RocksDB (ns) | SQLite (ns) | vs RocksDB | vs SQLite |
 | -------- | --------: | -----------: | ----------: | ---------: | --------: |
-|  **20 k** |   **279** |        1 290 |         613 |       4.6× |      2.2× |
-| **100 k** |   **506** |        1 639 |         933 |       3.2× |      1.8× |
-| **500 k** |   **798** |        1 498 |       1 233 |       1.9× |      1.5× |
-|  **2 M**  | **1 217** |        1 407 |       1 495 |   **1.16×** |     1.23× |
+|  **20 k** |   **263** |        1 333 |         631 |       5.1× |      2.4× |
+| **100 k** |   **529** |        1 355 |         994 |       2.6× |      1.9× |
+| **500 k** |   **816** |        1 504 |       1 270 |       1.8× |      1.6× |
+|  **2 M**  | **1 276** |        1 577 |       1 616 |   **1.24×** |     1.27× |
 
 ### `objstore` (S3-shaped path keys with ~30-byte shared prefix per bucket)
 
@@ -178,14 +183,14 @@ cargo bench --bench main -- _scale_ --output-format bencher
 | **500 k** |   **824** |        1 227 |       1 121 |       1.5× |      1.4× |
 |  **2 M**  | **1 088** |    **3 066** |       1 358 |   **2.8×** |      1.2× |
 
-`objstore_scale_put` (v0.3.0):
+`objstore_scale_put` (v0.3 current):
 
 | n        | Holt (ns) | RocksDB (ns) | SQLite (ns) | vs RocksDB | vs SQLite |
 | -------- | --------: | -----------: | ----------: | ---------: | --------: |
-|  **20 k** |   **347** |        1 319 |         610 |       3.8× |      1.8× |
-| **100 k** |   **696** |        1 468 |         972 |       2.1× |      1.4× |
-| **500 k** | **1 122** |        1 485 |       1 283 |       1.3× |      1.1× |
-|  **2 M**  | **1 486** |        1 640 |       1 509 |   **1.10×** |     1.02× |
+|  **20 k** |   **349** |        1 400 |         619 |       4.0× |      1.8× |
+| **100 k** |   **683** |        1 465 |         952 |       2.1× |      1.4× |
+| **500 k** | **1 155** |        1 450 |       1 268 |       1.3× |      1.1× |
+|  **2 M**  | **1 463** |        1 532 |       1 547 |   **1.05×** |     1.06× |
 
 ### `fs` (POSIX paths, very long common prefix per directory)
 
@@ -198,14 +203,14 @@ cargo bench --bench main -- _scale_ --output-format bencher
 | **500 k** |   **803** |        1 257 |       1 144 |       1.6× |      1.4× |
 |  **2 M**  | **1 105** |    **2 382** |       1 353 |   **2.2×** |      1.2× |
 
-`fs_scale_put` (v0.3.0):
+`fs_scale_put` (v0.3 current):
 
 | n        | Holt (ns) | RocksDB (ns) | SQLite (ns) | vs RocksDB | vs SQLite |
 | -------- | --------: | -----------: | ----------: | ---------: | --------: |
-|  **20 k** |   **342** |        1 110 |         624 |       3.2× |      1.8× |
-| **100 k** |   **572** |        1 749 |         784 |       3.1× |      1.4× |
-| **500 k** | **1 023** |        1 352 |       1 161 |       1.3× |      1.1× |
-|  **2 M**  |     1 333 |        1 269 |       1 459 |       0.95× | **1.09×** |
+|  **20 k** |   **322** |        1 338 |         648 |       4.2× |      2.0× |
+| **100 k** |   **676** |        1 448 |         949 |       2.1× |      1.4× |
+| **500 k** | **1 086** |        1 522 |       1 260 |       1.4× |      1.2× |
+|  **2 M**  | **1 436** |        1 446 |       1 517 |   **1.01×** |     1.06× |
 
 ### Observations
 
@@ -239,18 +244,15 @@ keeps lookup depth dominated by index height, which grows slowly.
 #### Put path: v0.3 close-out
 
 v0.2.1 had an honest gap on 2 M path-shaped put: -13 % vs
-RocksDB on objstore, -18 % vs RocksDB on fs. **v0.3.0 closes
-most of it.**
+RocksDB on objstore, -18 % vs RocksDB on fs. **The current v0.3
+line closes that gap in this run**, although the 2 M fs cell is
+best read as a tie rather than a meaningful win.
 
-| 2 M put  | v0.2.1 | v0.3.0 | Δ      | v0.3.0 vs Rocks | vs SQLite |
-| -------- | -----: | -----: | -----: | --------------: | --------: |
-| kv       | 1 296  | 1 217  | -6 %   | **1.16×** ahead | 1.23× ahead |
-| objstore | 1 503  | 1 486  | -1 %   | **1.10×** ahead | 1.02× ahead |
-| fs       | 1 492  | 1 333  | -11 %  |  0.95× (5 % behind) | 1.09× ahead |
-
-At smaller tiers (20 k–500 k) the wins are larger: -14 % to
--23 % on the 20 k tier across all three workloads, -6 % to -11 %
-on 100 k, -6 % to -11 % on 500 k.
+| 2 M put  | v0.2.1 | current v0.3 | Δ      | current v0.3 vs Rocks | vs SQLite |
+| -------- | -----: | -----------: | -----: | --------------------: | --------: |
+| kv       | 1 296  |        1 276 | -2 %   | **1.24×** ahead | 1.27× ahead |
+| objstore | 1 503  |        1 463 | -3 %   | **1.05×** ahead | 1.06× ahead |
+| fs       | 1 492  |        1 436 | -4 %   | 1.01× ahead / effectively tied | 1.06× ahead |
 
 The root cause of the v0.2.1 gap was **API + walker constant-
 factor overhead**, not the cross-blob descent cost we initially
@@ -274,21 +276,23 @@ v0.3.0 split `put` (blind, `Result<()>`) from `insert` (returning,
 walker path skips the leaf-extent value read, drops the prefix
 `.to_vec()`, and writes `Option::None` into the WAL `prev_value`
 slot. All three are pure constant-factor wins (no algorithmic
-change), and they compound to the -1 % to -23 % deltas above.
+change). The later cross-blob latch-coupling + `BlobNode`
+format break removes the parent-held fallback path and the
+child-entry repair work, which is what makes the final 2 M
+path-shaped put cells no longer lose to RocksDB in this run.
 
-**v0.3.1 follow-up.** The bench numbers above are unchanged in
-v0.3.1 — the bench exercises blind `put` / `delete` and Vec-
-returning `get`, all of which v0.3.0 had already optimised. v0.3.1
-ships three additional wins that *aren't* visible on this bench
-shape but matter for adjacent workloads:
+**Adjacent v0.3 wins.** These scale-put benches exercise blind
+`put` on a single op at a time. Several v0.3 changes matter more
+for adjacent surfaces than for this exact table:
 
 - **WAL format v3** (`Insert.prev_value` / `Erase.value` slots
   removed entirely). Bench writes are blind, so the v0.3.0 path
   already wrote `Option::None` for those slots — saving one
   presence byte per record. The full win lands on the *returning*
   `Tree::insert` / `Tree::remove` paths, which v0.3.0 still
-  wrote `Some(prev)` for; v0.3.1 doesn't write the prev value to
-  the WAL at all (the walker hands it straight to the caller).
+  wrote `Some(prev)` for; the current v0.3 line doesn't write the
+  prev value to the WAL at all (the walker hands it straight to
+  the caller).
 - **`Tree::get_with` zero-copy primitive.** `Tree::get` (the
   Vec-returning convenience this bench uses) is unchanged. Hot
   read paths that opt in to the callback skip the per-call
@@ -299,16 +303,14 @@ shape but matter for adjacent workloads:
   clones that the v0.3.0 `wal_ops: Vec<TxnOp>` aggregator forced.
   Bench doesn't exercise `txn`.
 
-The remaining **0.95×** cell (`fs_scale_put` at 2 M vs RocksDB)
-is structural — LSM write amortization (WAL append + memtable
-insert, both O(1) regardless of working-set size) genuinely wins
-at this regime. ART-over-blobs pays per-op cross-blob descent +
-spillover/compact retry cost that grows with depth, and on fs
-keys (very long shared prefixes → deeper Prefix chains → bigger
-leaves → fewer keys per blob → more blobs) that compounds. The
-v0.3 follow-up cross-blob lock-coupling work (queued as the v0.4
-milestone) should close most of this remaining gap by letting
-writers on disjoint child blobs release the root early.
+The hard cell remains **`fs_scale_put` at 2 M**. The current
+point estimate is slightly ahead of RocksDB, but the margin is
+only ~1 %. This is still the regime where LSM write amortization
+is most competitive: WAL append + memtable insert stay cheap
+regardless of working-set size, while ART-over-blobs pays
+cross-blob descent plus deeper Prefix chains on long POSIX
+paths. Treat this as "closed to parity", not as a decisive write
+win.
 
 #### What this means in practice
 
@@ -316,12 +318,12 @@ writers on disjoint child blobs release the root early.
   cleanly across kv / objstore / fs / list / list_dir, with the
   lead widening at larger working sets (5.4× / 2.8× / 2.2× at
   2 M get).
-- **Mixed workloads**: holt wins puts too at every tier ≤ 500 k
-  and on most cells at 2 M. The one remaining loss is fs put at
-  2 M vs RocksDB (5 % behind) — a structural regime where LSM
-  amortization is the right answer. If your workload sits there
-  with a heavy write skew, either size the holt buffer pool to
-  hold the hot set, or use a write-optimized engine.
+- **Mixed workloads**: holt wins puts too at every tier in the
+  current scale-put run. The caveat is 2 M fs put: it is
+  effectively parity with RocksDB, not a large win. If your
+  workload sits there with a heavy write skew, either size the
+  holt buffer pool to hold the hot set, or use a write-optimized
+  engine.
 
 ## Group C — p95 / p99 latency under maintenance interference
 
