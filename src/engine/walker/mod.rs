@@ -57,6 +57,7 @@ mod writers;
 
 pub use erase::erase_multi;
 pub use insert::insert_multi;
+pub use types::EraseOutcome;
 pub use lookup::lookup_multi;
 pub use merge::try_merge_children;
 pub use migrate::compact_blob;

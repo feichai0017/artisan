@@ -3,14 +3,14 @@
 //! + `erase_at_blob_node` cross-blob arm.
 
 use crate::api::errors::{Error, Result};
-use crate::layout::{BlobNode, Leaf, NodeType, BLOB_MAX_INLINE};
+use crate::layout::{BlobNode, NodeType, BLOB_MAX_INLINE};
 use std::sync::Arc;
 
 use crate::store::{BlobFrame, BufferManager, CachedBlob};
 
 use super::cast;
 use super::readers::{
-    ntype_of, read_leaf_kv, read_node16, read_node256, read_node4, read_node48, read_prefix,
+    ntype_of, read_leaf_key_only, read_node16, read_node256, read_node4, read_node48, read_prefix,
 };
 use super::types::{EraseOutcome, EraseReturn, EraseSignal};
 use super::writers::{
@@ -33,10 +33,13 @@ use super::writers::{
 pub(super) fn erase(frame: &mut BlobFrame<'_>, root_slot: u16, key: &[u8]) -> Result<EraseOutcome> {
     // Single-blob path passes `None` for `bm`, which rejects the
     // BlobNode arm — so the `seq` argument is dead. Pass `0`.
-    let r = erase_at(None, frame, root_slot, key, 0, 0)?;
+    // Single-blob `erase` is test-only today and always returns
+    // the prior value — preserves the existing test surface.
+    let r = erase_at(None, frame, root_slot, key, 0, 0, true)?;
     let new_root = resolve_new_root_after_erase(frame, root_slot, &r.signal)?;
     Ok(EraseOutcome {
         new_root_slot: new_root,
+        mutated: r.mutated,
         previous: r.previous,
     })
 }
@@ -46,11 +49,17 @@ pub(super) fn erase(frame: &mut BlobFrame<'_>, root_slot: u16, key: &[u8]) -> Re
 /// becomes empty (signal = `SubtreeGone`) the parent's `BlobNode`
 /// is freed and the orphaned child blob is dropped from the BM
 /// cache + the inner backend in the same step — no GC pass needed.
+///
+/// `wants_prev` mirrors `insert_multi`'s flag — `true` for
+/// [`crate::Tree::remove`] (returning API) and `false` for
+/// [`crate::Tree::delete`] (blind API, returns `bool`). The blind
+/// path saves a per-leaf `value_size`-byte read + clone.
 pub fn erase_multi(
     bm: &BufferManager,
     root_pin: &Arc<CachedBlob>,
     key: &[u8],
     seq: u64,
+    wants_prev: bool,
 ) -> Result<EraseOutcome> {
     // The caller (typically `Tree`) keeps `root_pin` alive across
     // every op so we skip `BufferManager`'s pin-Mutex on the hot
@@ -68,7 +77,7 @@ pub fn erase_multi(
     let r = {
         let mut frame = BlobFrame::wrap(guard.as_mut_slice());
         let root_slot = frame.header().root_slot;
-        erase_at(Some(bm), &mut frame, root_slot, key, 0, seq)?
+        erase_at(Some(bm), &mut frame, root_slot, key, 0, seq, wants_prev)?
     };
     let new_root = {
         let mut frame = BlobFrame::wrap(guard.as_mut_slice());
@@ -81,6 +90,7 @@ pub fn erase_multi(
     }
     Ok(EraseOutcome {
         new_root_slot: new_root,
+        mutated: r.mutated,
         previous: r.previous,
     })
 }
@@ -105,6 +115,7 @@ fn resolve_new_root_after_erase(
 
 // ---------- recursive dispatch ----------
 
+#[allow(clippy::too_many_arguments)] // wants_prev threads through every arm
 pub(super) fn erase_at(
     bm: Option<&BufferManager>,
     frame: &mut BlobFrame<'_>,
@@ -112,6 +123,7 @@ pub(super) fn erase_at(
     key: &[u8],
     depth: usize,
     seq: u64,
+    wants_prev: bool,
 ) -> Result<EraseReturn> {
     let ntype = ntype_of(frame.as_ref(), slot)?;
     match ntype {
@@ -120,15 +132,16 @@ pub(super) fn erase_at(
         )),
         NodeType::EmptyRoot => Ok(EraseReturn {
             signal: EraseSignal::Unchanged,
+            mutated: false,
             previous: None,
         }),
-        NodeType::Leaf => erase_at_leaf(frame, slot, key),
-        NodeType::Prefix => erase_at_prefix(bm, frame, slot, key, depth, seq),
+        NodeType::Leaf => erase_at_leaf(frame, slot, key, wants_prev),
+        NodeType::Prefix => erase_at_prefix(bm, frame, slot, key, depth, seq, wants_prev),
         NodeType::Node4 | NodeType::Node16 | NodeType::Node48 | NodeType::Node256 => {
-            erase_at_inner(bm, frame, slot, ntype, key, depth, seq)
+            erase_at_inner(bm, frame, slot, ntype, key, depth, seq, wants_prev)
         }
         NodeType::Blob => match bm {
-            Some(b) => erase_at_blob_node(b, frame, slot, key, depth, seq),
+            Some(b) => erase_at_blob_node(b, frame, slot, key, depth, seq, wants_prev),
             None => Err(Error::NotYetImplemented(
                 "walker::erase_at: BlobNode crossing requires BufferManager — use erase_multi",
             )),
@@ -149,27 +162,39 @@ pub(super) fn erase_at(
 /// no-op: `previous` returns `None` (the prior value was not
 /// visible to readers when this erase fired the second time) and
 /// the counter is not double-bumped.
-fn erase_at_leaf(frame: &mut BlobFrame<'_>, leaf_slot: u16, key: &[u8]) -> Result<EraseReturn> {
-    let (existing_key, existing_value) = read_leaf_kv(frame.as_ref(), leaf_slot)?;
+fn erase_at_leaf(
+    frame: &mut BlobFrame<'_>,
+    leaf_slot: u16,
+    key: &[u8],
+    wants_prev: bool,
+) -> Result<EraseReturn> {
+    // Always read the existing key (needed for the key-match
+    // check). Only materialise the prev value when the caller
+    // (`Tree::remove`) actually asks for it — `Tree::delete` (blind)
+    // sets `wants_prev = false` and saves the leaf-extent value
+    // clone per op.
+    let (existing_key, leaf) = read_leaf_key_only(frame.as_ref(), leaf_slot)?;
     if existing_key != key {
         return Ok(EraseReturn {
             signal: EraseSignal::Unchanged,
+            mutated: false,
             previous: None,
         });
     }
-    let leaf = {
-        let body = frame
-            .body_of_slot(leaf_slot)
-            .ok_or(Error::node_corrupt("erase_at_leaf: body resolution failed"))?;
-        *cast::<Leaf>(body)
-    };
     if leaf.tombstone != 0 {
         // Already soft-deleted — replay-idempotent.
         return Ok(EraseReturn {
             signal: EraseSignal::Unchanged,
+            mutated: false,
             previous: None,
         });
     }
+    let prev = if wants_prev {
+        let (_k, v) = super::readers::leaf_extent(frame.as_ref(), &leaf)?;
+        Some(v.to_vec())
+    } else {
+        None
+    };
     let mut new_leaf = leaf;
     new_leaf.tombstone = 1;
     write_struct_to_slot(frame, leaf_slot, &new_leaf)?;
@@ -177,10 +202,12 @@ fn erase_at_leaf(frame: &mut BlobFrame<'_>, leaf_slot: u16, key: &[u8]) -> Resul
     h.tombstone_leaf_cnt = h.tombstone_leaf_cnt.saturating_add(1);
     Ok(EraseReturn {
         signal: EraseSignal::Unchanged,
-        previous: Some(existing_value),
+        mutated: true,
+        previous: prev,
     })
 }
 
+#[allow(clippy::too_many_arguments)] // wants_prev added by API split
 fn erase_at_prefix(
     bm: Option<&BufferManager>,
     frame: &mut BlobFrame<'_>,
@@ -188,29 +215,37 @@ fn erase_at_prefix(
     key: &[u8],
     depth: usize,
     seq: u64,
+    wants_prev: bool,
 ) -> Result<EraseReturn> {
+    // `Prefix` is `Copy` — `p` is owned on the stack, so we can
+    // hold `&p.bytes[..plen]` across the `frame.*` mutations
+    // without needing a `.to_vec()` (mirror of `insert_into_prefix`'s
+    // borrow-only descent).
     let p = read_prefix(frame.as_ref(), pfx_slot)?;
     let plen = p.prefix_len as usize;
-    let prefix_bytes_copy: Vec<u8> = p.bytes[..plen].to_vec();
+    let prefix_bytes = &p.bytes[..plen];
     let child_slot = p.child as u16;
 
-    if depth + plen > key.len() || prefix_bytes_copy[..] != key[depth..depth + plen] {
+    if depth + plen > key.len() || prefix_bytes != &key[depth..depth + plen] {
         return Ok(EraseReturn {
             signal: EraseSignal::Unchanged,
+            mutated: false,
             previous: None,
         });
     }
 
-    let r = erase_at(bm, frame, child_slot, key, depth + plen, seq)?;
+    let r = erase_at(bm, frame, child_slot, key, depth + plen, seq, wants_prev)?;
     match r.signal {
         EraseSignal::Unchanged => Ok(EraseReturn {
             signal: EraseSignal::Unchanged,
+            mutated: r.mutated,
             previous: r.previous,
         }),
         EraseSignal::Replaced(new_child) => {
             set_prefix_child(frame, pfx_slot, u32::from(new_child))?;
             Ok(EraseReturn {
                 signal: EraseSignal::Unchanged,
+                mutated: r.mutated,
                 previous: r.previous,
             })
         }
@@ -218,12 +253,14 @@ fn erase_at_prefix(
             frame.free_node(pfx_slot)?;
             Ok(EraseReturn {
                 signal: EraseSignal::SubtreeGone,
+                mutated: r.mutated,
                 previous: r.previous,
             })
         }
     }
 }
 
+#[allow(clippy::too_many_arguments)] // wants_prev added by API split
 fn erase_at_inner(
     bm: Option<&BufferManager>,
     frame: &mut BlobFrame<'_>,
@@ -232,10 +269,12 @@ fn erase_at_inner(
     key: &[u8],
     depth: usize,
     seq: u64,
+    wants_prev: bool,
 ) -> Result<EraseReturn> {
     if depth >= key.len() {
         return Ok(EraseReturn {
             signal: EraseSignal::Unchanged,
+            mutated: false,
             previous: None,
         });
     }
@@ -243,20 +282,23 @@ fn erase_at_inner(
     let Some(child) = inner_find_child(frame, inner_slot, ntype, byte)? else {
         return Ok(EraseReturn {
             signal: EraseSignal::Unchanged,
+            mutated: false,
             previous: None,
         });
     };
 
-    let r = erase_at(bm, frame, child, key, depth + 1, seq)?;
+    let r = erase_at(bm, frame, child, key, depth + 1, seq, wants_prev)?;
     match r.signal {
         EraseSignal::Unchanged => Ok(EraseReturn {
             signal: EraseSignal::Unchanged,
+            mutated: r.mutated,
             previous: r.previous,
         }),
         EraseSignal::Replaced(new_child) => {
             inner_update_child(frame, inner_slot, ntype, byte, u32::from(new_child))?;
             Ok(EraseReturn {
                 signal: EraseSignal::Unchanged,
+                mutated: r.mutated,
                 previous: r.previous,
             })
         }
@@ -264,6 +306,7 @@ fn erase_at_inner(
             let sig = inner_remove_child_and_collapse(frame, inner_slot, ntype, byte)?;
             Ok(EraseReturn {
                 signal: sig,
+                mutated: r.mutated,
                 previous: r.previous,
             })
         }
@@ -448,6 +491,7 @@ fn inner_remove_child_and_collapse(
 ///   BlobNode slot, drop the orphaned child blob from cache + disk,
 ///   propagate `SubtreeGone` upward so the grandparent collapses
 ///   too.
+#[allow(clippy::too_many_arguments)] // wants_prev added by API split
 fn erase_at_blob_node(
     bm: &BufferManager,
     parent_frame: &mut BlobFrame<'_>,
@@ -455,6 +499,7 @@ fn erase_at_blob_node(
     key: &[u8],
     depth: usize,
     seq: u64,
+    wants_prev: bool,
 ) -> Result<EraseReturn> {
     let bn = {
         let body = parent_frame
@@ -474,6 +519,7 @@ fn erase_at_blob_node(
     if depth + plen > key.len() || key[depth..depth + plen] != bn.bytes[..plen] {
         return Ok(EraseReturn {
             signal: EraseSignal::Unchanged,
+            mutated: false,
             previous: None,
         });
     }
@@ -490,20 +536,24 @@ fn erase_at_blob_node(
         // Errors propagating up are about something the recursive
         // descent found inside `child_guid`'s frame; tag them so
         // logs / panics carry actionable blob context.
-        erase_at(Some(bm), &mut cf, child_entry, key, child_depth, seq)
+        erase_at(Some(bm), &mut cf, child_entry, key, child_depth, seq, wants_prev)
             .map_err(|e| e.with_blob_guid(child_guid))?
     };
 
     // Mark the child blob dirty when the descent actually mutated
-    // its cached image (any non-`Unchanged-with-no-previous`
-    // outcome). The bg checkpointer / `Tree::checkpoint` will
-    // flush the bytes to backend **after** the WAL record for
-    // this op is on disk (invariant W2D — see `BufferManager`
+    // its cached image. The bg checkpointer / `Tree::checkpoint`
+    // will flush the bytes to backend **after** the WAL record
+    // for this op is on disk (invariant W2D — see `BufferManager`
     // module docs). An inline `bm.commit(child_guid)` here would
     // let child bytes reach backend before the WAL record,
     // breaking the invariant.
-    let child_touched = matches!(r.signal, EraseSignal::Replaced(_))
-        || (matches!(r.signal, EraseSignal::Unchanged) && r.previous.is_some());
+    //
+    // `r.mutated` is the authoritative "the child blob's bytes
+    // changed" signal — it tracks the actual tombstone bump
+    // regardless of whether the caller asked for the prev value.
+    // The Replaced arm is structural (slot pointer rewrite, no
+    // necessarily-a-tombstone) so it's tracked separately.
+    let child_touched = matches!(r.signal, EraseSignal::Replaced(_)) || r.mutated;
 
     match r.signal {
         EraseSignal::Unchanged => {
@@ -513,6 +563,7 @@ fn erase_at_blob_node(
             }
             Ok(EraseReturn {
                 signal: EraseSignal::Unchanged,
+                mutated: r.mutated,
                 previous: r.previous,
             })
         }
@@ -529,6 +580,7 @@ fn erase_at_blob_node(
             bm.mark_dirty(child_guid, seq);
             Ok(EraseReturn {
                 signal: EraseSignal::Unchanged,
+                mutated: r.mutated,
                 previous: r.previous,
             })
         }
@@ -549,6 +601,7 @@ fn erase_at_blob_node(
             bm.mark_for_delete(child_guid, seq);
             Ok(EraseReturn {
                 signal: EraseSignal::SubtreeGone,
+                mutated: r.mutated,
                 previous: r.previous,
             })
         }

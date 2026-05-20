@@ -57,7 +57,19 @@ pub const FILE_MAGIC: u32 = 0x414C_4157;
 /// Format version stored in the file header. New format revisions
 /// bump this and grow the header (in the reserved tail) rather
 /// than moving existing fields.
-pub const FORMAT_VERSION: u32 = 1;
+///
+/// v0.3.0 bumps `1 → 2`: `TxnOp::Erase.value` changed from
+/// `Vec<u8>` (always present) to `Option<Vec<u8>>` (`None` on
+/// the new blind `Tree::delete` path, `Some` on `Tree::remove`).
+/// Wire shape: the trailing `bytes(value)` became
+/// `optional_bytes(value)`. A v0.2 binary reading a v0.3 WAL
+/// would mis-decode the optional marker as a length prefix;
+/// the file-header check rejects the upgrade with a clear
+/// "format version unsupported" error rather than silently
+/// corrupting state on replay. Upgrade path: checkpoint the
+/// v0.2 tree (which truncates the WAL) before swapping in the
+/// v0.3 binary.
+pub const FORMAT_VERSION: u32 = 2;
 
 /// File-header byte size. The record stream starts at this offset.
 pub const FILE_HEADER_SIZE: usize = 32;
@@ -238,12 +250,21 @@ pub fn encode_insert_record(
     });
 }
 
-/// Encode an `Erase` record directly from refs.
-pub fn encode_erase_record(out: &mut Vec<u8>, seq: u64, tree_id: u64, key: &[u8], value: &[u8]) {
+/// Encode an `Erase` record directly from refs. `value = Some(_)`
+/// matches the `Tree::remove` (returning) call path; `None`
+/// matches the blind `Tree::delete` path that did not materialise
+/// the prior value.
+pub fn encode_erase_record(
+    out: &mut Vec<u8>,
+    seq: u64,
+    tree_id: u64,
+    key: &[u8],
+    value: Option<&[u8]>,
+) {
     write_record(out, seq, TY_ERASE, |buf| {
         buf.extend_from_slice(&tree_id.to_le_bytes());
         write_bytes(buf, key);
-        write_bytes(buf, value);
+        write_optional_bytes(buf, value);
     });
 }
 
@@ -302,7 +323,7 @@ fn encode_body(op: &TxnOp, out: &mut Vec<u8>) {
         } => {
             out.extend_from_slice(&tree_id.to_le_bytes());
             write_bytes(out, key);
-            write_bytes(out, value);
+            write_optional_bytes(out, value.as_deref());
         }
         TxnOp::Split {
             parent_blob,
@@ -491,7 +512,7 @@ fn decode_body_into(ty: u8, body: &mut &[u8], seq: u64) -> Result<TxnOp> {
         TY_ERASE => {
             let tree_id = read_u64(body)?;
             let key = read_bytes(body)?;
-            let value = read_bytes(body)?;
+            let value = read_optional_bytes(body)?;
             TxnOp::Erase {
                 tree_id,
                 seq,
@@ -711,7 +732,7 @@ mod tests {
                 tree_id: 3,
                 seq: 99,
                 key: b"img/02.jpg".to_vec(),
-                value: b"v".to_vec(),
+                value: Some(b"v".to_vec()),
             },
             99,
         );
@@ -919,7 +940,7 @@ mod tests {
                 tree_id: 0,
                 seq: 2,
                 key: b"k1".to_vec(),
-                value: b"v1".to_vec(),
+                value: Some(b"v1".to_vec()),
             },
             2,
             &mut buf,
@@ -952,7 +973,7 @@ mod tests {
                     tree_id: 0,
                     seq: base + 1,
                     key: b"b".to_vec(),
-                    value: b"v-b".to_vec(),
+                    value: Some(b"v-b".to_vec()),
                 },
                 TxnOp::RenameObject {
                     tree_id: 0,

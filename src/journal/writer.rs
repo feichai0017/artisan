@@ -182,7 +182,18 @@ impl WalWriter {
     }
 
     /// Fast-path: append an `Erase` record directly from refs.
-    pub fn append_erase(&mut self, seq: u64, tree_id: u64, key: &[u8], value: &[u8]) -> Result<()> {
+    /// `value = Some(_)` for the returning [`crate::Tree::remove`]
+    /// path; `None` for blind [`crate::Tree::delete`]. Replay
+    /// ignores the value field either way (it only redoes from
+    /// `key`); the field is purely audit metadata for tools that
+    /// scan the journal after the fact.
+    pub fn append_erase(
+        &mut self,
+        seq: u64,
+        tree_id: u64,
+        key: &[u8],
+        value: Option<&[u8]>,
+    ) -> Result<()> {
         encode_erase_record(&mut self.pending, seq, tree_id, key, value);
         self.maybe_drain()
     }

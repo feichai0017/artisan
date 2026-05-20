@@ -66,7 +66,7 @@ fn main() {
 
     // `DeleteObject`.
     let prev = tree
-        .delete(b"logs/2026-05-19/api.log.gz")
+        .remove(b"logs/2026-05-19/api.log.gz")
         .unwrap()
         .map(|v| v.len())
         .unwrap_or(0);

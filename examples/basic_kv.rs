@@ -37,7 +37,7 @@ fn main() {
         }
     }
 
-    let prev = tree.delete(b"meta/owner").unwrap();
+    let prev = tree.remove(b"meta/owner").unwrap();
     println!("\ndelete meta/owner returned previous = {prev:?}");
     println!("get meta/owner -> {:?}", tree.get(b"meta/owner").unwrap());
 

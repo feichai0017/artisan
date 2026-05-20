@@ -9,7 +9,7 @@ use std::sync::Arc;
 use crate::store::{BlobFrame, BlobFrameRef, BufferManager, CachedBlob};
 
 use super::cast;
-use super::readers::{longest_common, ntype_of, read_leaf_kv, read_prefix};
+use super::readers::{longest_common, ntype_of, read_leaf_key_only, read_prefix};
 use super::spillover::{compact_blob, spillover_blob};
 use super::types::{InsertOutcome, InsertReturn};
 use super::writers::{
@@ -42,7 +42,9 @@ pub(super) fn insert(
     if value.len() > u16::MAX as usize {
         return Err(Error::ValueTooLong { len: value.len() });
     }
-    let r = insert_at(None, frame, root_slot, key, value, 0, seq)?;
+    // Single-blob `insert` is test-only today and always returns
+    // the prior value — preserves the existing test surface.
+    let r = insert_at(None, frame, root_slot, key, value, 0, seq, true)?;
     Ok(InsertOutcome {
         new_root_slot: r.slot_after,
         previous: r.previous,
@@ -59,12 +61,21 @@ pub(super) fn insert(
 /// child via `bm.mark_dirty(child_guid, seq)`; the actual
 /// backend write is the checkpoint round's job (and only happens
 /// after the WAL record for `seq` is durable — invariant W2D).
+///
+/// `wants_prev` controls whether the walker reads + clones the
+/// existing leaf's value on a same-key update — set `true` for
+/// [`crate::Tree::insert`] (returning API) and `false` for
+/// [`crate::Tree::put`] (blind API). The blind path saves the
+/// `value_size`-byte allocation + clone + `Option<Vec<u8>>`
+/// plumbing per put; meaningful on path-shaped workloads where
+/// the leaf value is the dominant per-op heap traffic.
 pub fn insert_multi(
     bm: &BufferManager,
     root_pin: &Arc<CachedBlob>,
     key: &[u8],
     value: &[u8],
     seq: u64,
+    wants_prev: bool,
 ) -> Result<InsertOutcome> {
     if key.len() > u16::MAX as usize {
         return Err(Error::KeyTooLong { len: key.len() });
@@ -103,7 +114,7 @@ pub fn insert_multi(
         let r = {
             let mut frame = BlobFrame::wrap(guard.as_mut_slice());
             let root_slot = frame.header().root_slot;
-            insert_at(Some(bm), &mut frame, root_slot, key, value, 0, seq)
+            insert_at(Some(bm), &mut frame, root_slot, key, value, 0, seq, wants_prev)
         };
         match r {
             Ok(out) => {
@@ -133,6 +144,7 @@ pub fn insert_multi(
 
 // ---------- recursive dispatch ----------
 
+#[allow(clippy::too_many_arguments)] // wants_prev threads through every arm
 pub(super) fn insert_at(
     bm: Option<&BufferManager>,
     frame: &mut BlobFrame<'_>,
@@ -141,6 +153,7 @@ pub(super) fn insert_at(
     value: &[u8],
     depth: usize,
     seq: u64,
+    wants_prev: bool,
 ) -> Result<InsertReturn> {
     let ntype = ntype_of(frame.as_ref(), slot)?;
     match ntype {
@@ -148,13 +161,15 @@ pub(super) fn insert_at(
             "walker::insert_at: hit NodeType::Invalid",
         )),
         NodeType::EmptyRoot => insert_into_empty_root(frame, slot, key, value, seq),
-        NodeType::Leaf => insert_into_leaf(frame, slot, key, value, depth, seq),
-        NodeType::Prefix => insert_into_prefix(bm, frame, slot, key, value, depth, seq),
+        NodeType::Leaf => insert_into_leaf(frame, slot, key, value, depth, seq, wants_prev),
+        NodeType::Prefix => {
+            insert_into_prefix(bm, frame, slot, key, value, depth, seq, wants_prev)
+        }
         NodeType::Node4 | NodeType::Node16 | NodeType::Node48 | NodeType::Node256 => {
-            insert_into_inner(bm, frame, slot, ntype, key, value, depth, seq)
+            insert_into_inner(bm, frame, slot, ntype, key, value, depth, seq, wants_prev)
         }
         NodeType::Blob => match bm {
-            Some(b) => insert_at_blob_node(b, frame, slot, key, value, depth, seq),
+            Some(b) => insert_at_blob_node(b, frame, slot, key, value, depth, seq, wants_prev),
             None => Err(Error::NotYetImplemented(
                 "walker::insert_at: BlobNode crossing requires BufferManager — use insert_multi",
             )),
@@ -184,8 +199,15 @@ fn insert_into_leaf(
     new_value: &[u8],
     depth: usize,
     seq: u64,
+    wants_prev: bool,
 ) -> Result<InsertReturn> {
-    let (existing_key, existing_value) = read_leaf_kv(frame.as_ref(), leaf_slot)?;
+    // Always read the existing key (needed for both same-key
+    // update and divergence-split paths). Only read + clone the
+    // existing value when (a) we're on the same-key update path
+    // AND (b) the caller (`Tree::insert`) actually wants it back.
+    // `Tree::put` (blind) sets `wants_prev = false` and skips
+    // the leaf-extent value clone entirely.
+    let (existing_key, existing_leaf) = read_leaf_key_only(frame.as_ref(), leaf_slot)?;
 
     if existing_key == new_key {
         // Same-key update path (covers two semantic cases via the
@@ -203,21 +225,20 @@ fn insert_into_leaf(
         //
         // `Leaf::live` always pins `tombstone = 0` so both write
         // paths naturally clear the bit in the new leaf body.
-        let existing_leaf = {
-            let body = frame.body_of_slot(leaf_slot).ok_or(Error::node_corrupt(
-                "insert_into_leaf: body resolution failed",
-            ))?;
-            *cast::<Leaf>(body)
-        };
         let was_tombstoned = existing_leaf.tombstone != 0;
-        let prev = if was_tombstoned {
-            None
+        // Only materialise the prev value on the returning API
+        // (`Tree::insert`). The blind `Tree::put` path skips the
+        // `leaf_extent` walk + `.to_vec()` entirely.
+        let prev = if wants_prev && !was_tombstoned {
+            let (_k, v) = super::readers::leaf_extent(frame.as_ref(), &existing_leaf)?;
+            Some(v.to_vec())
         } else {
-            Some(existing_value.clone())
+            None
         };
         let key_off = existing_leaf.key_offset;
         let key_len_u32 = new_key.len() as u32;
-        let old_extent_size = leaf_extent_size(key_len_u32, u32::from(existing_value.len() as u16));
+        let old_extent_size =
+            leaf_extent_size(key_len_u32, u32::from(existing_leaf.value_size));
         let new_extent_size = leaf_extent_size(key_len_u32, new_value.len() as u32);
 
         if new_extent_size <= old_extent_size {
@@ -295,6 +316,7 @@ fn insert_into_leaf(
     })
 }
 
+#[allow(clippy::too_many_arguments)] // wants_prev added by API split
 fn insert_into_prefix(
     bm: Option<&BufferManager>,
     frame: &mut BlobFrame<'_>,
@@ -303,17 +325,26 @@ fn insert_into_prefix(
     value: &[u8],
     depth: usize,
     seq: u64,
+    wants_prev: bool,
 ) -> Result<InsertReturn> {
+    // `Prefix` is `Copy` and `read_prefix` returns it by value, so
+    // `p` is owned on the stack. The inline prefix bytes live in
+    // `p.bytes` — no need to allocate a `Vec` to keep them alive
+    // across the `frame.*` mutations below (those don't borrow
+    // from `p`). Previously this path called `p.bytes[..plen].to_vec()`
+    // on every Prefix descent, which dominated put cost on path-
+    // shaped workloads (objstore / fs) where Prefix chains are
+    // common.
     let p = read_prefix(frame.as_ref(), pfx_slot)?;
     let plen = p.prefix_len as usize;
-    let prefix_bytes_copy: Vec<u8> = p.bytes[..plen].to_vec();
+    let prefix_bytes = &p.bytes[..plen];
     let child_slot = p.child as u16;
 
     let key_tail = &key[depth.min(key.len())..];
-    let common = longest_common(&prefix_bytes_copy, key_tail);
+    let common = longest_common(prefix_bytes, key_tail);
 
     if common == plen {
-        let r = insert_at(bm, frame, child_slot, key, value, depth + plen, seq)?;
+        let r = insert_at(bm, frame, child_slot, key, value, depth + plen, seq, wants_prev)?;
         if r.slot_after != child_slot {
             set_prefix_child(frame, pfx_slot, u32::from(r.slot_after))?;
         }
@@ -329,8 +360,8 @@ fn insert_into_prefix(
         ));
     }
 
-    let existing_div_byte = prefix_bytes_copy[common];
-    let tail_bytes = &prefix_bytes_copy[common + 1..];
+    let existing_div_byte = prefix_bytes[common];
+    let tail_bytes = &prefix_bytes[common + 1..];
     let existing_branch_slot = if tail_bytes.is_empty() {
         child_slot
     } else {
@@ -350,7 +381,7 @@ fn insert_into_prefix(
     let final_slot = if common == 0 {
         n4
     } else {
-        write_prefix_chain(frame, &prefix_bytes_copy[..common], n4)?
+        write_prefix_chain(frame, &prefix_bytes[..common], n4)?
     };
 
     frame.free_node(pfx_slot)?;
@@ -361,7 +392,7 @@ fn insert_into_prefix(
     })
 }
 
-#[allow(clippy::too_many_arguments)] // 8 args mirror insert_at's call shape
+#[allow(clippy::too_many_arguments)] // mirrors insert_at's call shape
 fn insert_into_inner(
     bm: Option<&BufferManager>,
     frame: &mut BlobFrame<'_>,
@@ -371,6 +402,7 @@ fn insert_into_inner(
     value: &[u8],
     depth: usize,
     seq: u64,
+    wants_prev: bool,
 ) -> Result<InsertReturn> {
     if depth >= key.len() {
         return Err(Error::NotYetImplemented(
@@ -380,7 +412,7 @@ fn insert_into_inner(
     let byte = key[depth];
 
     if let Some(child_slot) = inner_find_child(frame, inner_slot, ntype, byte)? {
-        let r = insert_at(bm, frame, child_slot, key, value, depth + 1, seq)?;
+        let r = insert_at(bm, frame, child_slot, key, value, depth + 1, seq, wants_prev)?;
         if r.slot_after != child_slot {
             inner_update_child(frame, inner_slot, ntype, byte, u32::from(r.slot_after))?;
         }
@@ -414,6 +446,7 @@ fn insert_into_inner(
 /// similar to `insert_into_prefix`'s diverged path. Common-case
 /// workloads rarely hit this since spillover always installs a
 /// BlobNode with an empty inline prefix.
+#[allow(clippy::too_many_arguments)] // wants_prev added by API split
 fn insert_at_blob_node(
     bm: &BufferManager,
     parent_frame: &mut BlobFrame<'_>,
@@ -422,6 +455,7 @@ fn insert_at_blob_node(
     value: &[u8],
     depth: usize,
     seq: u64,
+    wants_prev: bool,
 ) -> Result<InsertReturn> {
     let bn = {
         let body = parent_frame
@@ -459,7 +493,16 @@ fn insert_at_blob_node(
             let r = {
                 let mut guard = child_pin.write();
                 let mut cf = BlobFrame::wrap(guard.as_mut_slice());
-                insert_at(Some(bm), &mut cf, child_entry, key, value, child_depth, seq)
+                insert_at(
+                    Some(bm),
+                    &mut cf,
+                    child_entry,
+                    key,
+                    value,
+                    child_depth,
+                    seq,
+                    wants_prev,
+                )
             };
             match r {
                 Ok(out) => {

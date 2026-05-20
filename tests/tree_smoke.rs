@@ -58,7 +58,7 @@ fn checkpoint_is_idempotent_on_memory_backend() {
 #[test]
 fn put_then_get_round_trip() {
     let tree = Tree::open(TreeConfig::memory()).unwrap();
-    assert!(tree.put(b"hello", b"world").unwrap().is_none());
+    assert!(tree.insert(b"hello", b"world").unwrap().is_none());
     assert_eq!(tree.get(b"hello").unwrap().as_deref(), Some(&b"world"[..]));
     assert!(tree.get(b"missing").unwrap().is_none());
 }
@@ -66,8 +66,8 @@ fn put_then_get_round_trip() {
 #[test]
 fn put_returns_previous_value_on_update() {
     let tree = Tree::open(TreeConfig::memory()).unwrap();
-    assert!(tree.put(b"k", b"v1").unwrap().is_none());
-    assert_eq!(tree.put(b"k", b"v2").unwrap().as_deref(), Some(&b"v1"[..]));
+    assert!(tree.insert(b"k", b"v1").unwrap().is_none());
+    assert_eq!(tree.insert(b"k", b"v2").unwrap().as_deref(), Some(&b"v1"[..]));
     assert_eq!(tree.get(b"k").unwrap().as_deref(), Some(&b"v2"[..]));
 }
 
@@ -175,21 +175,21 @@ fn empty_key_round_trips() {
 fn delete_existing_key_returns_value_and_removes_it() {
     let tree = Tree::open(TreeConfig::memory()).unwrap();
     tree.put(b"k", b"v").unwrap();
-    assert_eq!(tree.delete(b"k").unwrap().as_deref(), Some(&b"v"[..]));
+    assert_eq!(tree.remove(b"k").unwrap().as_deref(), Some(&b"v"[..]));
     assert!(tree.get(b"k").unwrap().is_none());
 }
 
 #[test]
 fn delete_missing_key_is_noop() {
     let tree = Tree::open(TreeConfig::memory()).unwrap();
-    assert!(tree.delete(b"missing").unwrap().is_none());
+    assert!(tree.remove(b"missing").unwrap().is_none());
 }
 
 #[test]
 fn delete_then_reinsert_round_trips() {
     let tree = Tree::open(TreeConfig::memory()).unwrap();
     tree.put(b"k", b"v1").unwrap();
-    assert_eq!(tree.delete(b"k").unwrap().as_deref(), Some(&b"v1"[..]));
+    assert_eq!(tree.remove(b"k").unwrap().as_deref(), Some(&b"v1"[..]));
     tree.put(b"k", b"v2").unwrap();
     assert_eq!(tree.get(b"k").unwrap().as_deref(), Some(&b"v2"[..]));
 }
@@ -209,7 +209,7 @@ fn delete_all_keys_then_reinsert_works() {
         tree.put(k, v).unwrap();
     }
     for (k, v) in &pairs {
-        assert_eq!(tree.delete(k).unwrap().as_deref(), Some(&v[..]));
+        assert_eq!(tree.remove(k).unwrap().as_deref(), Some(&v[..]));
     }
     for (k, _) in &pairs {
         assert!(tree.get(k).unwrap().is_none());
@@ -225,7 +225,7 @@ fn delete_keeps_siblings_under_shared_prefix() {
     tree.put(b"img/02.jpg", b"b").unwrap();
     tree.put(b"img/03.jpg", b"c").unwrap();
     assert_eq!(
-        tree.delete(b"img/02.jpg").unwrap().as_deref(),
+        tree.remove(b"img/02.jpg").unwrap().as_deref(),
         Some(&b"b"[..])
     );
     assert_eq!(tree.get(b"img/01.jpg").unwrap().as_deref(), Some(&b"a"[..]));
@@ -435,7 +435,7 @@ fn compact_then_insert_reclaims_extent_leak() {
     // Delete the lower half — leaves ~750 keys live + ~750
     // leaked extents.
     for i in 0..750u32 {
-        let prev = tree.delete(format!("k{i:08}").as_bytes()).unwrap();
+        let prev = tree.remove(format!("k{i:08}").as_bytes()).unwrap();
         assert_eq!(prev.as_deref(), Some(&val[..]));
     }
     // Now insert another 1500 — would not fit without compact
@@ -481,7 +481,7 @@ fn multi_blob_delete_round_trip() {
             continue;
         }
         let k = format!("k{i:08}").into_bytes();
-        let prev = tree.delete(&k).unwrap();
+        let prev = tree.remove(&k).unwrap();
         assert_eq!(
             prev.as_deref(),
             Some(&value[..]),
@@ -767,7 +767,7 @@ fn reinsert_at_tombstoned_key_resurrects_and_decrements_counter() {
     // the prior value isn't visible (it was deleted), so `put`
     // returns None as the previous value, and the tombstone counter
     // drops back to zero.
-    let prev = tree.put(b"k", b"v2").unwrap();
+    let prev = tree.insert(b"k", b"v2").unwrap();
     assert_eq!(prev, None, "resurrected leaf has no observable prior value");
     let stats = tree.stats().unwrap();
     assert_eq!(stats.total_tombstones, 0);

@@ -41,7 +41,7 @@ fn sample_ops() -> Vec<TxnOp> {
             tree_id: 0,
             seq: 3,
             key: b"img/01.jpg".to_vec(),
-            value: vec![0xAA; 64],
+            value: Some(vec![0xAA; 64]),
         },
         TxnOp::RenameObject {
             tree_id: 0,
@@ -122,7 +122,7 @@ fn open_existing_resumes_append_position() {
                 tree_id: 0,
                 seq: 2,
                 key: b"k1".to_vec(),
-                value: b"v1".to_vec(),
+                value: Some(b"v1".to_vec()),
             },
             2,
         )

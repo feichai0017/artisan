@@ -301,7 +301,7 @@ fn bench_scenario(c: &mut Criterion, name: &str, pairs: &[(Vec<u8>, Vec<u8>)]) {
             b.iter(|| {
                 let idx = (rng.next_u32() as usize) % key_count;
                 let (k, v) = &pairs[idx];
-                black_box(holt.put(black_box(k), black_box(v)).unwrap());
+                holt.put(black_box(k), black_box(v)).unwrap();
             });
         });
 
@@ -352,7 +352,7 @@ fn bench_scenario(c: &mut Criterion, name: &str, pairs: &[(Vec<u8>, Vec<u8>)]) {
                 if r & 1 == 0 {
                     black_box(holt.get(black_box(k)).unwrap());
                 } else {
-                    black_box(holt.put(black_box(k), black_box(v)).unwrap());
+                    holt.put(black_box(k), black_box(v)).unwrap();
                 }
             });
         });
@@ -469,7 +469,7 @@ fn bench_scenario_persistent(c: &mut Criterion, name: &str, pairs: &[(Vec<u8>, V
             b.iter(|| {
                 let idx = (rng.next_u32() as usize) % key_count;
                 let (k, v) = &pairs[idx];
-                black_box(holt.put(black_box(k), black_box(v)).unwrap());
+                holt.put(black_box(k), black_box(v)).unwrap();
             });
         });
 
@@ -522,7 +522,7 @@ fn bench_scenario_persistent(c: &mut Criterion, name: &str, pairs: &[(Vec<u8>, V
                 if r & 1 == 0 {
                     black_box(holt.get(black_box(k)).unwrap());
                 } else {
-                    black_box(holt.put(black_box(k), black_box(v)).unwrap());
+                    holt.put(black_box(k), black_box(v)).unwrap();
                 }
             });
         });
@@ -742,7 +742,7 @@ fn bench_scale_put_workload(
             |b, &kc| {
                 b.iter(|| {
                     let (k, v) = &pairs[(rng.next_u32() as usize) % kc];
-                    black_box(holt.put(black_box(k), black_box(v)).unwrap());
+                    holt.put(black_box(k), black_box(v)).unwrap();
                 });
             },
         );

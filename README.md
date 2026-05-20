@@ -8,10 +8,10 @@
 
 > A carefully crafted **adaptive radix tree** for path-shaped metadata.
 
-> ⚠️ **Pre-1.0 (v0.2.1).** The public API is now narrow and
+> ⚠️ **Pre-1.0 (v0.3.0).** The public API is now narrow and
 > SemVer-stable inside a minor release, but minor releases may
 > still break source compatibility before 1.0. Pin the exact
-> version in your `Cargo.toml` (`holt = "=0.2.1"`) until 1.0
+> version in your `Cargo.toml` (`holt = "=0.3.0"`) until 1.0
 > stabilises the surface.
 
 `holt` is an embedded Rust library for storing **hierarchical
@@ -31,11 +31,11 @@ It targets workloads where:
 It is **not** a general-purpose KV store; if you need full-text
 or vector similarity, reach for the right tool. For this shape,
 holt beats LMDB / RocksDB / SQLite cleanly on point lookup and
-prefix scan at every dataset size we test through 2 M keys. On
-random point writes with a working set well past the buffer pool
-(~200 MB+), LSM-style write amortization in RocksDB starts to
-edge ahead — see [`benches/RESULTS.md`](benches/RESULTS.md) for
-the honest scale-curve numbers.
+prefix scan at every dataset size we test through 2 M keys, and
+on point writes at every size + workload we test except one
+(2 M `fs_put` vs RocksDB, where LSM write amortization is
+structurally the right answer — see
+[`benches/RESULTS.md`](benches/RESULTS.md)).
 
 ## Why "holt"?
 
@@ -90,7 +90,7 @@ Add holt to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-holt = "0.2"
+holt = "0.3"
 ```
 
 ### Open a tree

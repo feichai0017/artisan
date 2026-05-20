@@ -83,7 +83,7 @@ fn apply(tree: &Tree, ops: &[Op]) -> HashMap<Vec<u8>, Vec<u8>> {
                 oracle.insert(k.clone(), v.clone());
             }
             Op::Delete(k) => {
-                let prev = tree.delete(k).unwrap();
+                let prev = tree.remove(k).unwrap();
                 assert_eq!(prev.as_deref(), oracle.get(k).map(|v| v.as_slice()));
                 oracle.remove(k);
             }

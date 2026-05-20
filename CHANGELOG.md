@@ -7,6 +7,99 @@ versioning follows [Semantic Versioning](https://semver.org/).
 For design background see [ARCHITECTURE.md](ARCHITECTURE.md);
 fine-grained per-commit history is in `git log`.
 
+## [0.3.0] — 2026-05-20
+
+### Breaking — API redesign (split returning from blind)
+
+The v0.2 `put` / `delete` returned `Option<Vec<u8>>` by default,
+forcing every caller to pay the read-old-leaf + value-clone cost
+even when the prior value wasn't needed. This worked but
+contradicted the "metadata hot path" design goal — for a storage
+engine, the HashMap-style "give me the old value for free" contract
+is anything but free. Aligned with RocksDB / LevelDB / FoundationDB
+convention: blind by default, returning by explicit opt-in.
+
+The new surface:
+
+```rust
+// blind hot paths — no leaf-extent value read
+put(&self, k: &[u8], v: &[u8]) -> Result<()>
+delete(&self, k: &[u8]) -> Result<bool>
+
+// returning variants — pay the read + clone explicitly
+insert(&self, k: &[u8], v: &[u8]) -> Result<Option<Vec<u8>>>
+remove(&self, k: &[u8]) -> Result<Option<Vec<u8>>>
+```
+
+Migrating from v0.2.x:
+- `tree.put(k, v).unwrap()` → unchanged (returns `()` now; `.unwrap()` works the same).
+- `let prev = tree.put(k, v).unwrap();` → `let prev = tree.insert(k, v).unwrap();`
+- `tree.delete(k).unwrap().is_some()` → `tree.delete(k).unwrap()` (already a `bool`).
+- `let prev = tree.delete(k).unwrap();` → `let prev = tree.remove(k).unwrap();`
+
+### Breaking — WAL format
+
+`TxnOp::Erase.value` changed from `Vec<u8>` (always present) to
+`Option<Vec<u8>>`: `Some(prev)` on the returning `Tree::remove`
+path, `None` on the blind `Tree::delete` path. Wire shape: the
+trailing `bytes(value)` became `optional_bytes(value)`.
+
+**File format version bumped 1 → 2.** A v0.3 binary opening a
+v0.2 WAL fails with `Error::ReplaySanityFailed` /
+`"WAL file format version unsupported"` rather than mis-decoding.
+**Upgrade path: run `Tree::checkpoint()` on the v0.2 tree
+before swapping in the v0.3 binary** — checkpoint truncates the
+WAL to header-only, so the next open writes a v0.3 header.
+
+### Performance — walker hot-path optimizations
+
+The walker now threads a `wants_prev: bool` flag through
+`insert_at` / `erase_at` and all their arms. Concrete savings on
+the blind path:
+
+- **`read_leaf_key_only`** (new helper): same-key check reads
+  only the leaf's key bytes, not value. Saves a per-op
+  `value_size`-byte clone on every same-key `put` / `delete`.
+- **`insert_into_prefix` + `erase_at_prefix` borrow-only
+  descent**: `Prefix` is `Copy` so `let p = read_prefix(...)`
+  is an owned stack value; the inline prefix bytes can be held
+  via `&p.bytes[..plen]` across the subsequent `frame.*`
+  mutations without the previous `.to_vec()` allocation. Hot on
+  path-shaped workloads (objstore / fs) where prefix chains are
+  long.
+- **WAL `Insert.prev_value` encoded as `None`** on blind put;
+  **WAL `Erase.value` encoded as `None`** on blind delete. Both
+  skip the `Vec` clone + bytes copy that the v0.2.x always-encoded
+  path paid.
+
+Measured improvements (M3 Pro, scale curve, 100× data growth):
+- **kv put**: -6 % at 2 M (1 296 → 1 217 ns); -14 % at 20 k.
+- **objstore put**: -1 % at 2 M (1 503 → 1 486 ns); -23 % at 20 k.
+- **fs put**: -11 % at 2 M (1 492 → 1 333 ns); -23 % at 20 k.
+
+At 2 M vs RocksDB: kv flipped from tied to **1.16×** ahead;
+objstore went from 0.87× behind to **1.10×** ahead; fs went from
+0.82× behind to 0.95× (still slightly behind, see RESULTS.md
+for the structural reason — LSM write amortization at working-
+set ≫ buffer-pool is the regime where ART-over-blobs isn't yet
+competitive). Full table in [benches/RESULTS.md](benches/RESULTS.md).
+
+### Changed — internal types
+
+- **`EraseOutcome` and the walker-internal `EraseReturn`** gain a
+  `mutated: bool` field separate from `previous: Option<Vec<u8>>`.
+  `mutated` is the authoritative "did the walker tombstone a
+  leaf" signal regardless of whether the caller asked for the
+  prior value; previously this was inferred from
+  `previous.is_some()`, which conflated "no mutation" with
+  "blind erase".
+
+### Internal
+
+- `BufferManager` and other crate-private types unchanged in
+  shape; only the walker entry-point signatures and WAL codec
+  changed.
+
 ## [0.2.1] — 2026-05-20
 
 ### Fixed — durability (silent data loss path)

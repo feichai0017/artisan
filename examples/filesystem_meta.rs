@@ -128,7 +128,7 @@ fn main() {
     println!("renamed: original path gone, new path present");
 
     // unlink.
-    let prev = tree.delete(b"/home/bob/.bashrc").unwrap();
+    let prev = tree.remove(b"/home/bob/.bashrc").unwrap();
     println!(
         "unlink /home/bob/.bashrc -> previous {} bytes",
         prev.map(|v| v.len()).unwrap_or(0),

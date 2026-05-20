@@ -51,8 +51,12 @@ pub enum TxnOp {
         seq: u64,
         /// Key bytes.
         key: Vec<u8>,
-        /// Erased value bytes.
-        value: Vec<u8>,
+        /// Erased value bytes — `Some` when the caller used
+        /// `Tree::remove` (returning API), `None` when the caller
+        /// used `Tree::delete` (blind API). Replay only redoes
+        /// from `key`, so this field is purely audit metadata
+        /// for tooling that scans the journal after the fact.
+        value: Option<Vec<u8>>,
     },
     /// `splitBlob` — subtree moved to a new blob.
     Split {

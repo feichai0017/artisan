@@ -57,7 +57,7 @@ fn main() {
     println!("lookup 2/ghi789 -> {:?}", std::str::from_utf8(&s).unwrap(),);
 
     // Revoke a session.
-    let prev = tree.delete(&session_key(1, "abc123")).unwrap();
+    let prev = tree.remove(&session_key(1, "abc123")).unwrap();
     println!(
         "revoked 1/abc123 -> previous = {:?}",
         prev.as_deref().map(String::from_utf8_lossy),

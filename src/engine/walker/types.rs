@@ -56,9 +56,17 @@ pub struct EraseOutcome {
     /// updates `root_slot` in place under the BM's write guard.
     #[cfg_attr(not(test), allow(dead_code))]
     pub new_root_slot: u16,
-    /// If a matching leaf was removed, the value it carried.
-    /// `None` means "key was not in the tree" — the call is then
-    /// a no-op.
+    /// `true` iff the walker actually tombstoned a live leaf —
+    /// independent of whether the caller asked for the prior
+    /// value. `Tree::delete` (blind) uses this to decide
+    /// dirty-mark + WAL-append without paying for the prev-value
+    /// read. `false` means "key was not in the tree" / "leaf was
+    /// already tombstoned" — the call is then a no-op.
+    pub mutated: bool,
+    /// If a matching leaf was removed **and** the caller asked
+    /// for the prior value (`wants_prev = true`), the value it
+    /// carried. `None` either means "no mutation" or "caller
+    /// didn't ask" — disambiguate via `mutated`.
     pub previous: Option<Vec<u8>>,
 }
 
@@ -103,6 +111,14 @@ pub(super) enum EraseSignal {
 #[derive(Debug)]
 pub(super) struct EraseReturn {
     pub(super) signal: EraseSignal,
+    /// `true` iff a live leaf was tombstoned during the descent.
+    /// Tracked separately from `previous` so the blind delete
+    /// path can drop the leaf-extent value read and still know
+    /// whether to mark dirty + emit a WAL Erase record.
+    pub(super) mutated: bool,
+    /// `Some(bytes)` only when `mutated && wants_prev`. `None`
+    /// otherwise. The `mutated` flag is the authoritative
+    /// "did anything happen" signal.
     pub(super) previous: Option<Vec<u8>>,
 }
 

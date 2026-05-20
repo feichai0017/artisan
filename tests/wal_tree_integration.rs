@@ -185,8 +185,8 @@ fn delete_through_wal_replays_correctly() {
         // Delete every even key.
         for i in 0..10u32 {
             if i % 2 == 0 {
-                let prev = tree.delete(format!("k{i}").as_bytes()).unwrap();
-                assert!(prev.is_some());
+                let removed = tree.delete(format!("k{i}").as_bytes()).unwrap();
+                assert!(removed);
             }
         }
     }
