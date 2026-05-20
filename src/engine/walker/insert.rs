@@ -6,12 +6,13 @@ use crate::layout::{leaf_extent_size, BlobNode, Leaf, NodeType, BLOB_MAX_INLINE}
 use std::sync::Arc;
 
 use crate::store::buffer_manager::BlobWriteGuard;
-use crate::store::{BlobFrame, BufferManager, CachedBlob};
+use crate::store::{BlobFrame, BlobFrameRef, BufferManager, CachedBlob};
 
 use super::cast;
+use super::lookup::lookup_at;
 use super::readers::{longest_common, ntype_of, read_leaf_key_ref, read_prefix};
 use super::spillover::{compact_blob, spillover_blob};
-use super::types::{InsertOutcome, InsertReturn};
+use super::types::{InsertOutcome, InsertReturn, LookupResult};
 use super::writers::{
     inner_add_child, inner_find_child, inner_update_child, set_prefix_child, write_leaf,
     write_node4_with, write_prefix_chain, write_struct_to_slot,
@@ -47,6 +48,7 @@ pub(super) fn insert(
     let r = insert_at(frame, root_slot, key, value, 0, seq, true)?;
     Ok(InsertOutcome {
         new_root_slot: r.slot_after,
+        root_dirty: true,
         previous: r.previous,
     })
 }
@@ -84,19 +86,54 @@ pub fn insert_multi(
         return Err(Error::ValueTooLong { len: value.len() });
     }
 
-    // The caller (typically `Tree`) keeps `root_pin` alive across
-    // every op so we skip `BufferManager`'s pin-Mutex on the hot
-    // root hop. The guard-aware walker performs a single descent:
-    // it mutates the current blob directly, or if the path reaches
-    // a BlobNode it lock-couples into the child and releases the
-    // parent before descendant mutation.
+    let mut blob_hops = 0u64;
+    let mut max_cross_blob_depth = 0usize;
+
+    // Fast path for the large-tree steady state: the root blob is
+    // often just a router to child blobs. Hold the root in shared
+    // mode long enough to acquire the child write guard, then let
+    // the normal lock-coupled writer mutate from that child down.
+    // This preserves the parent->child edge-stability rule without
+    // making every cross-blob put take the root's exclusive latch.
+    {
+        let root_read = root_pin.read();
+        let frame = BlobFrameRef::wrap(root_read.as_slice());
+        let root_slot = frame.header().root_slot;
+        if let LookupResult::Crossing(crossing) = lookup_at(frame, root_slot, key, 0)? {
+            let child_pin = bm.pin(crossing.child_guid)?;
+            let child_guard = child_pin.write();
+            drop(root_read);
+
+            blob_hops = 1;
+            let outcome = lock_coupled_insert_in_blob(
+                bm,
+                child_guard,
+                crossing.child_guid,
+                root_slot,
+                false,
+                key,
+                value,
+                seq,
+                wants_prev,
+                crossing.child_depth,
+                &mut blob_hops,
+                &mut max_cross_blob_depth,
+            );
+            drop(child_pin);
+            if outcome.is_ok() {
+                bm.note_walker_blob_hops(blob_hops, max_cross_blob_depth);
+            }
+            return outcome;
+        }
+        drop(root_read);
+    }
+
+    // Root-local mutation fallback.
     let mut guard = root_pin.write();
     let (root_guid, root_slot) = {
         let frame = guard.frame();
         (frame.header().blob_guid, frame.header().root_slot)
     };
-    let mut blob_hops = 0u64;
-    let mut max_cross_blob_depth = 0usize;
     let outcome = lock_coupled_insert_in_blob(
         bm,
         guard,
@@ -172,6 +209,7 @@ fn lock_coupled_insert_in_blob(
                     } else {
                         top_root_slot
                     },
+                    root_dirty: is_top_blob,
                     previous: out.previous,
                 });
             }
@@ -180,7 +218,7 @@ fn lock_coupled_insert_in_blob(
                 let child_guard = child_pin.write();
                 drop(guard);
 
-                let outcome = lock_coupled_insert_in_blob(
+                let mut outcome = lock_coupled_insert_in_blob(
                     bm,
                     child_guard,
                     crossing.child_guid,
@@ -198,6 +236,9 @@ fn lock_coupled_insert_in_blob(
 
                 if outcome.is_ok() && current_dirty && !is_top_blob {
                     bm.mark_dirty(current_guid, seq);
+                }
+                if let Ok(outcome) = &mut outcome {
+                    outcome.root_dirty |= is_top_blob && current_dirty;
                 }
                 return outcome;
             }

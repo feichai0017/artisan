@@ -175,10 +175,11 @@ Concretely:
 The remaining v0.3 concurrency cleanup is now in place:
 
 - Foreground mutation paths (`put` / `insert` / `delete` /
-  `remove` / `rename` / `txn`) take the shared side of a narrow
-  `maintenance_lock` while they may cross `BlobNode` boundaries.
+  `remove` / `rename` / `txn`) enter the shared side of a narrow
+  atomic `maintenance_gate` while they may cross `BlobNode`
+  boundaries.
   `Tree::compact()` and the background checkpointer's merge pass
-  take the exclusive side before folding child blobs back into
+  enter the exclusive side before folding child blobs back into
   parents and queuing those children for deferred delete.
 - Point reads (`get` / `get_with`) also take the shared
   maintenance gate so a merge cannot delete a child after a reader
@@ -193,6 +194,23 @@ The remaining v0.3 concurrency cleanup is now in place:
   expose walker/shape counters: mutation walker ops, total and
   average blob hops, max blob hops, max cross-blob boundary depth,
   foreground spillovers, and child-blob merges.
+- Cross-blob `put` no longer takes the root's exclusive latch just
+  to read a `BlobNode`. The root is held shared while the child
+  write latch is acquired, then the mutation proceeds from the
+  child down. Cross-blob updates also return a precise
+  `root_dirty` bit so child-only writes do not mark the root dirty
+  or take the dirty-map mutex for an unchanged blob.
+- Checkpoint dirty snapshots now move drained blobs into an
+  in-flight `flushing` protection set until `write_through`
+  completes. Eviction skips both live dirty and flushing entries,
+  closing the pressure-window where a background sweep could drop
+  the only cached image after `snapshot_dirty()` drained the dirty
+  map but before the checkpoint planner copied the bytes.
+- Short-key padding now uses the 256-byte inline path without
+  clearing the full stack buffer on every operation, and tree
+  sequence allocation uses relaxed atomics because ordering is
+  provided by WAL/dirty/latch synchronization rather than by the
+  counter itself.
 
 ### Breaking — API redesign (split returning from blind)
 

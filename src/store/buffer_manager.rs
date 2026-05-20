@@ -33,10 +33,13 @@
 //!
 //! Every walker write tags its target blob via
 //! [`BufferManager::mark_dirty`] with the WAL seq that authored
-//! the change. The internal `dirty: Mutex<HashMap<BlobGuid, u64>>`
-//! keeps the **lowest** unflushed seq per blob — that value is
-//! the WAL trim watermark for that blob (records below it are
-//! already in backend, so the WAL doesn't need them).
+//! the change. The internal dirty state keeps the **lowest**
+//! unflushed seq per blob — that value is the WAL trim watermark
+//! for that blob (records below it are already in backend, so the
+//! WAL doesn't need them). A checkpoint round moves drained
+//! entries into an in-flight `flushing` set until their cached
+//! bytes have reached the backend; eviction treats both maps as
+//! protected.
 //!
 //! Erase ops that empty a child blob queue a deferred deletion
 //! via [`BufferManager::mark_for_delete`] — the `backend.delete_blob`
@@ -146,6 +149,26 @@ use super::backend::{AlignedBlobBuf, Backend};
 /// the truncate gate already refuses to fire).
 pub const STRUCTURAL_SEQ: u64 = u64::MAX;
 
+#[derive(Default)]
+struct DirtyState {
+    /// New dirty entries not yet claimed by a checkpoint round.
+    dirty: HashMap<BlobGuid, u64>,
+    /// Dirty entries drained by a checkpoint round whose cached
+    /// image still has to survive until `write_through` completes.
+    flushing: HashMap<BlobGuid, u64>,
+}
+
+impl DirtyState {
+    fn is_protected(&self, guid: &BlobGuid) -> bool {
+        self.dirty.contains_key(guid) || self.flushing.contains_key(guid)
+    }
+
+    fn remove_all(&mut self, guid: &BlobGuid) {
+        self.dirty.remove(guid);
+        self.flushing.remove(guid);
+    }
+}
+
 /// LRU-bounded blob cache; see the module docs.
 pub struct BufferManager {
     backend: Arc<dyn Backend>,
@@ -162,7 +185,7 @@ pub struct BufferManager {
     /// (invariant **I1**; see module docs). Drained atomically by
     /// [`BufferManager::snapshot_dirty`] so checkpoint rounds and
     /// concurrent writers don't step on each other.
-    dirty: Mutex<HashMap<BlobGuid, u64>>,
+    dirty: Mutex<DirtyState>,
     /// Blobs the walker has unlinked from their parent in cache
     /// but whose backend slot can't be released yet — invariant
     /// W2D forbids removing them from the manifest before the WAL
@@ -380,7 +403,7 @@ impl BufferManager {
             backend,
             capacity: capacity.max(1),
             cache: DashMap::new(),
-            dirty: Mutex::new(HashMap::new()),
+            dirty: Mutex::new(DirtyState::default()),
             pending_deletes: Mutex::new(HashMap::new()),
             clock: AtomicU64::new(1),
             cache_hits: AtomicU64::new(0),
@@ -424,7 +447,7 @@ impl BufferManager {
     pub(crate) fn try_evict_cold(&self, guid: BlobGuid) -> bool {
         {
             let dirty_guard = self.dirty.lock().unwrap();
-            if dirty_guard.contains_key(&guid) {
+            if dirty_guard.is_protected(&guid) {
                 return false;
             }
         }
@@ -653,7 +676,7 @@ impl BufferManager {
         // remove_if guard keeps the hot path lock-free.
         let dirty_snap: std::collections::HashSet<BlobGuid> = {
             let d = self.dirty.lock().unwrap();
-            d.keys().copied().collect()
+            d.dirty.keys().chain(d.flushing.keys()).copied().collect()
         };
         let pending_snap: std::collections::HashSet<BlobGuid> = {
             let p = self.pending_deletes.lock().unwrap();
@@ -690,7 +713,7 @@ impl BufferManager {
                         return false;
                     }
                     let d = self.dirty.lock().unwrap();
-                    if d.contains_key(&guid) {
+                    if d.is_protected(&guid) {
                         return false;
                     }
                     drop(d);
@@ -712,7 +735,7 @@ impl BufferManager {
     /// backend.
     fn evict_from_cache(&self, guid: BlobGuid) {
         self.cache.remove(&guid);
-        self.dirty.lock().unwrap().remove(&guid);
+        self.dirty.lock().unwrap().remove_all(&guid);
     }
 
     /// Pin a blob in cache and return an `Arc<CachedBlob>` over it.
@@ -817,7 +840,7 @@ impl BufferManager {
     pub fn commit(&self, guid: BlobGuid) -> Result<()> {
         let drained = {
             let mut d = self.dirty.lock().unwrap();
-            d.remove(&guid)
+            d.dirty.remove(&guid)
         };
         if let Some(entry) = self.get_cached(guid) {
             let buf = entry.read();
@@ -827,7 +850,8 @@ impl BufferManager {
                 // racing writer already re-added an entry.
                 if let Some(t) = drained {
                     let mut d = self.dirty.lock().unwrap();
-                    d.entry(guid)
+                    d.dirty
+                        .entry(guid)
                         .and_modify(|cur| *cur = (*cur).min(t))
                         .or_insert(t);
                 }
@@ -856,7 +880,8 @@ impl BufferManager {
     /// [`Self::snapshot_dirty`].
     pub fn mark_dirty(&self, guid: BlobGuid, txn_id: u64) {
         let mut d = self.dirty.lock().unwrap();
-        d.entry(guid)
+        d.dirty
+            .entry(guid)
             .and_modify(|cur| *cur = (*cur).min(txn_id))
             .or_insert(txn_id);
     }
@@ -871,7 +896,14 @@ impl BufferManager {
     #[must_use]
     pub fn snapshot_dirty(&self) -> HashMap<BlobGuid, u64> {
         let mut d = self.dirty.lock().unwrap();
-        std::mem::take(&mut *d)
+        let snap = std::mem::take(&mut d.dirty);
+        for (guid, txn_id) in &snap {
+            d.flushing
+                .entry(*guid)
+                .and_modify(|cur| *cur = (*cur).min(*txn_id))
+                .or_insert(*txn_id);
+        }
+        snap
     }
 
     /// Merge `entries` back into the dirty map, preserving the
@@ -888,7 +920,11 @@ impl BufferManager {
         }
         let mut d = self.dirty.lock().unwrap();
         for (guid, t) in entries {
-            d.entry(guid)
+            if matches!(d.flushing.get(&guid), Some(cur) if *cur == t) {
+                d.flushing.remove(&guid);
+            }
+            d.dirty
+                .entry(guid)
                 .and_modify(|cur| *cur = (*cur).min(t))
                 .or_insert(t);
         }
@@ -910,14 +946,14 @@ impl BufferManager {
     #[must_use]
     pub fn min_unflushed_txn(&self) -> Option<u64> {
         let d = self.dirty.lock().unwrap();
-        d.values().copied().min()
+        d.dirty.values().copied().min()
     }
 
     /// Number of distinct dirty blobs currently tracked. Useful for
     /// metrics + checkpoint-policy thresholds.
     #[must_use]
     pub fn dirty_count(&self) -> usize {
-        self.dirty.lock().unwrap().len()
+        self.dirty.lock().unwrap().dirty.len()
     }
 
     // ---------- deferred delete (W2D for erase) ----------
@@ -944,7 +980,7 @@ impl BufferManager {
     /// be truncated.
     pub fn mark_for_delete(&self, guid: BlobGuid, txn_id: u64) {
         self.cache.remove(&guid);
-        self.dirty.lock().unwrap().remove(&guid);
+        self.dirty.lock().unwrap().remove_all(&guid);
         let mut p = self.pending_deletes.lock().unwrap();
         p.entry(guid)
             .and_modify(|cur| *cur = (*cur).min(txn_id))
@@ -1012,13 +1048,16 @@ impl BufferManager {
     /// orchestrator under a shared read guard.
     ///
     /// `expected_seq` is the dirty-map value the checkpointer
-    /// observed when it snapshotted this blob. On a successful
-    /// backend write the dirty entry is removed **only if it
-    /// still equals `expected_seq`** — if a writer raced in
-    /// between snapshot and write and bumped the entry to a newer
-    /// seq, the new entry survives so the next round picks it up
-    /// (the snapshot's bytes don't include that writer's mutation,
-    /// so we mustn't claim the blob is clean).
+    /// observed when it snapshotted this blob. `snapshot_dirty`
+    /// moves that value into the in-flight flushing set; on a
+    /// successful backend write `write_through` releases that
+    /// flushing protection. A racing writer lands in the fresh
+    /// dirty map and survives unless its value exactly matches a
+    /// real WAL seq `expected_seq` (the snapshot's bytes don't
+    /// include that writer's mutation, so we mustn't claim the blob
+    /// is clean). `STRUCTURAL_SEQ` is intentionally excluded from
+    /// the equality retire path because it is a shared sentinel, not
+    /// a unique mutation sequence.
     ///
     /// On failure both the unflushed-snapshot fact and any racing
     /// writer's entry survive in the dirty map — restoration is
@@ -1031,14 +1070,19 @@ impl BufferManager {
     ) -> Result<()> {
         self.backend.write_blob(guid, bytes)?;
         let mut d = self.dirty.lock().unwrap();
-        if let std::collections::hash_map::Entry::Occupied(e) = d.entry(guid) {
-            // Only retire the entry when no racing writer has
-            // bumped it. `mark_dirty` keeps the **minimum**
-            // unflushed seq, so a survivor here has a seq newer
-            // than ours iff a racer landed after we drained.
-            if *e.get() == expected_seq {
-                e.remove();
+        if expected_seq != STRUCTURAL_SEQ {
+            if let std::collections::hash_map::Entry::Occupied(e) = d.dirty.entry(guid) {
+                // Only retire the entry when no racing writer has
+                // bumped it. `mark_dirty` keeps the **minimum**
+                // unflushed seq, so a survivor here has a seq newer
+                // than ours iff a racer landed after we drained.
+                if *e.get() == expected_seq {
+                    e.remove();
+                }
             }
+        }
+        if matches!(d.flushing.get(&guid), Some(seq) if *seq == expected_seq) {
+            d.flushing.remove(&guid);
         }
         Ok(())
     }
@@ -1080,7 +1124,8 @@ impl BufferManager {
         // entry below will also keep the lowest seq across both).
         self.cache.insert(guid, entry);
         let mut d = self.dirty.lock().unwrap();
-        d.entry(guid)
+        d.dirty
+            .entry(guid)
             .and_modify(|cur| *cur = (*cur).min(seq))
             .or_insert(seq);
     }
@@ -1112,7 +1157,7 @@ impl Backend for BufferManager {
         // Backend now holds these exact bytes; any pending dirty
         // entry for this blob is satisfied. Subsequent writes via
         // the pin/write-guard path will re-mark it.
-        self.dirty.lock().unwrap().remove(&guid);
+        self.dirty.lock().unwrap().remove_all(&guid);
         Ok(())
     }
 
@@ -1406,6 +1451,44 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_dirty_protects_flushing_entry_from_eviction() {
+        let inner: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        let guid = [0x55; 16];
+        inner.write_blob(guid, &make_buf(1)).unwrap();
+        let bm = BufferManager::new(inner, 1);
+
+        {
+            let pin = bm.pin(guid).unwrap();
+            let mut guard = pin.write();
+            guard.as_mut_slice()[123] = 0xAB;
+        }
+        bm.mark_dirty(guid, 42);
+
+        let snap = bm.snapshot_dirty();
+        assert_eq!(snap[&guid], 42);
+        assert_eq!(
+            bm.dirty_count(),
+            0,
+            "snapshot drains the live dirty map for racing writers",
+        );
+
+        assert!(
+            !bm.try_evict_cold(guid),
+            "checkpoint-owned flushing entries must stay cached until write_through",
+        );
+        let bytes = bm
+            .snapshot_bytes(guid)
+            .expect("flushing protection must preserve cached bytes");
+        assert_eq!(bytes.as_slice()[123], 0xAB);
+
+        bm.write_through(guid, &bytes, 42).unwrap();
+        assert!(
+            bm.try_evict_cold(guid),
+            "successful write_through releases flushing protection",
+        );
+    }
+
+    #[test]
     fn restore_dirty_merges_keeping_min() {
         let bm = BufferManager::new(Arc::new(MemoryBackend::new()), 4);
         // Pretend a flush snapshot drained these:
@@ -1474,6 +1557,31 @@ mod tests {
         );
         let live = bm.snapshot_dirty();
         assert_eq!(live[&[0xAA; 16]], 200, "racing writer's seq survives");
+    }
+
+    #[test]
+    fn write_through_keeps_racing_structural_dirty_entry() {
+        // `STRUCTURAL_SEQ` is a shared sentinel, not a unique WAL
+        // sequence. A fresh structural mutation can therefore have
+        // the same dirty value as a checkpoint's older snapshot;
+        // equality alone must not retire it.
+        let inner: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        inner.write_blob([0xA5; 16], &make_buf(0)).unwrap();
+        let bm = BufferManager::new(inner, 4);
+        let _pin = bm.pin([0xA5; 16]).unwrap();
+
+        bm.mark_dirty([0xA5; 16], STRUCTURAL_SEQ);
+        let snap_bytes = bm.snapshot_bytes([0xA5; 16]).unwrap();
+
+        bm.write_through([0xA5; 16], &snap_bytes, STRUCTURAL_SEQ)
+            .unwrap();
+        assert_eq!(
+            bm.dirty_count(),
+            1,
+            "structural sentinel equality is not enough to retire a racing entry",
+        );
+        let live = bm.snapshot_dirty();
+        assert_eq!(live[&[0xA5; 16]], STRUCTURAL_SEQ);
     }
 
     #[test]

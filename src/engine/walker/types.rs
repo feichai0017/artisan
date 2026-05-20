@@ -39,6 +39,11 @@ pub struct InsertOutcome {
     /// place under the BM's write guard.
     #[cfg_attr(not(test), allow(dead_code))]
     pub new_root_slot: u16,
+    /// `true` iff the root blob's cached bytes changed. Cross-
+    /// blob updates usually mutate only a child blob; the walker
+    /// marks those children dirty itself, and the `Tree` caller
+    /// should only mark the root when this flag is set.
+    pub root_dirty: bool,
     /// If the key already existed, the value it carried before.
     pub previous: Option<Vec<u8>>,
 }
@@ -54,6 +59,11 @@ pub struct EraseOutcome {
     /// updates `root_slot` in place under the BM's write guard.
     #[cfg_attr(not(test), allow(dead_code))]
     pub new_root_slot: u16,
+    /// `true` iff the root blob's cached bytes changed. Cross-
+    /// blob erases usually mutate only a child blob; the walker
+    /// marks those children dirty itself, and the `Tree` caller
+    /// should only mark the root when this flag is set.
+    pub root_dirty: bool,
     /// `true` iff the walker actually tombstoned a live leaf —
     /// independent of whether the caller asked for the prior
     /// value. `Tree::delete` (blind) uses this to decide

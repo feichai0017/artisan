@@ -397,7 +397,7 @@ pub(super) fn run_round(shared: &Arc<Shared>) -> Result<()> {
 fn run_merge_pass(shared: &Arc<Shared>) -> Result<u64> {
     use crate::store::buffer_manager::STRUCTURAL_SEQ;
 
-    let _maintenance = shared.maintenance_lock.write().unwrap();
+    let _maintenance = shared.maintenance_gate.enter_exclusive();
     let parents = engine::collect_blob_guids(shared.bm.as_ref(), shared.root_guid)?;
     let mut merged_total = 0u64;
     for guid in parents {

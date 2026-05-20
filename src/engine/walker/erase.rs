@@ -34,9 +34,11 @@ pub(super) fn erase(frame: &mut BlobFrame<'_>, root_slot: u16, key: &[u8]) -> Re
     // Single-blob `erase` is test-only today and always returns
     // the prior value — preserves the existing test surface.
     let r = erase_at(frame, root_slot, key, 0, true)?;
+    let root_dirty = r.mutated || !matches!(r.signal, EraseSignal::Unchanged);
     let new_root = resolve_new_root_after_erase(frame, root_slot, &r.signal)?;
     Ok(EraseOutcome {
         new_root_slot: new_root,
+        root_dirty,
         mutated: r.mutated,
         previous: r.previous,
     })
@@ -176,6 +178,7 @@ fn lock_coupled_erase_in_blob(
         } else {
             top_root_slot
         },
+        root_dirty: is_top_blob && child_touched,
         mutated: r.mutated,
         previous: r.previous,
     })

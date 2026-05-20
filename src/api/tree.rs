@@ -36,13 +36,15 @@
 //!   `rename_lock` (a `Mutex<()>` scoped to rename only) to
 //!   prevent racing renames from interleaving.
 
+use std::mem::MaybeUninit;
 use std::ops::Deref;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex};
 
 use super::config::{Storage, TreeConfig};
 use super::errors::{Error, Result};
 use super::stats::{BlobStats, CheckpointerStats, TreeStats};
+use crate::concurrency::MaintenanceGate;
 use crate::engine;
 use crate::engine::RangeBuilder;
 use crate::journal::reader::replay;
@@ -76,8 +78,8 @@ use super::txn::{BatchOp, TxnBatch};
 ///   **no** Tree-wide writer mutex; concurrent writers on
 ///   disjoint blobs do not serialize on each other.
 /// - **Maintenance** (`compact`, background merge) takes the
-///   write side of `maintenance_lock`; foreground reads and
-///   writers take the read side around tree traversal. This
+///   exclusive side of `maintenance_gate`; foreground reads and
+///   writers enter the shared side around tree traversal. This
 ///   blocks subtree merge/delete while an operation is crossing
 ///   blobs, while keeping all ordinary operations mutually
 ///   concurrent.
@@ -107,16 +109,16 @@ pub struct Tree {
     rename_lock: Arc<Mutex<()>>,
     /// Tree-wide structural-maintenance gate.
     ///
-    /// Foreground read and mutation paths hold a shared guard while
-    /// they may cross `BlobNode` boundaries. `compact()` and the
-    /// background merge pass hold an exclusive guard before folding
-    /// a child blob back into its parent and queuing the child for
-    /// delete.
+    /// Foreground read and mutation paths enter the shared side
+    /// while they may cross `BlobNode` boundaries. `compact()` and
+    /// the background merge pass enter the exclusive side before
+    /// folding a child blob back into its parent and queuing the
+    /// child for delete.
     /// Point reads participate too: per-blob optimistic validation
     /// handles in-place rewrites, while the maintenance gate keeps
     /// a merge pass from deleting a child blob after a reader has
     /// observed the parent `BlobNode` but before it pins the child.
-    maintenance_lock: Arc<RwLock<()>>,
+    maintenance_gate: Arc<MaintenanceGate>,
     /// Monotonically-increasing sequence stamped on every record.
     /// On open the tree replays the WAL and resumes at
     /// `highest_seq + 1`.
@@ -147,7 +149,7 @@ pub(crate) const ROOT_BLOB_GUID: BlobGuid = [0; 16];
 const INLINE_PADDED_KEY_CAP: usize = 256;
 
 struct PaddedKey {
-    inline: [u8; INLINE_PADDED_KEY_CAP],
+    inline: [MaybeUninit<u8>; INLINE_PADDED_KEY_CAP],
     len: usize,
     heap: Option<Vec<u8>>,
 }
@@ -157,7 +159,12 @@ impl PaddedKey {
     fn as_slice(&self) -> &[u8] {
         match &self.heap {
             Some(heap) => heap,
-            None => &self.inline[..self.len],
+            None => {
+                // SAFETY: `pad_key` initializes exactly `len`
+                // bytes in the inline buffer: the user key bytes
+                // plus the trailing internal terminator.
+                unsafe { std::slice::from_raw_parts(self.inline.as_ptr().cast::<u8>(), self.len) }
+            }
         }
     }
 }
@@ -177,8 +184,15 @@ impl Deref for PaddedKey {
 fn pad_key(key: &[u8]) -> PaddedKey {
     let len = key.len() + 1;
     if len <= INLINE_PADDED_KEY_CAP {
-        let mut inline = [0; INLINE_PADDED_KEY_CAP];
-        inline[..key.len()].copy_from_slice(key);
+        let mut inline = [MaybeUninit::uninit(); INLINE_PADDED_KEY_CAP];
+        let ptr = inline.as_mut_ptr().cast::<u8>();
+        // SAFETY: `len <= INLINE_PADDED_KEY_CAP`; we write the
+        // first `key.len()` bytes from `key`, then exactly one
+        // terminator byte after them.
+        unsafe {
+            ptr.copy_from_nonoverlapping(key.as_ptr(), key.len());
+            ptr.add(key.len()).write(0);
+        }
         return PaddedKey {
             inline,
             len,
@@ -190,7 +204,7 @@ fn pad_key(key: &[u8]) -> PaddedKey {
     padded.extend_from_slice(key);
     padded.push(0u8);
     PaddedKey {
-        inline: [0; INLINE_PADDED_KEY_CAP],
+        inline: [MaybeUninit::uninit(); INLINE_PADDED_KEY_CAP],
         len: 0,
         heap: Some(padded),
     }
@@ -281,7 +295,7 @@ impl Tree {
 
         // Shared structural gate for foreground writers, manual
         // compact, and the background merge pass.
-        let maintenance_lock = Arc::new(RwLock::new(()));
+        let maintenance_gate = Arc::new(MaintenanceGate::new());
 
         // Spawn the background checkpointer if opted-in.
         // `Checkpointer::spawn` returns `None` for disabled
@@ -290,7 +304,7 @@ impl Tree {
             Arc::clone(&bm),
             wal.clone(),
             root_guid,
-            Arc::clone(&maintenance_lock),
+            Arc::clone(&maintenance_gate),
             cfg.checkpoint.clone(),
         )
         .map(Arc::new);
@@ -301,7 +315,7 @@ impl Tree {
             root_guid,
             root_pin,
             rename_lock: Arc::new(Mutex::new(())),
-            maintenance_lock,
+            maintenance_gate,
             next_seq: Arc::new(AtomicU64::new(next_seq)),
             wal,
             checkpointer,
@@ -360,7 +374,7 @@ impl Tree {
     where
         F: FnMut(&[u8]) -> R,
     {
-        let _maintenance = self.maintenance_lock.read().unwrap();
+        let _maintenance = self.maintenance_gate.enter_shared();
         let padded = pad_key(key);
         engine::lookup_multi_with(&self.backend, &self.root_pin, &padded, consume)
     }
@@ -418,9 +432,9 @@ impl Tree {
     /// `wal.flush` makes it durable). Concurrent writers serialise
     /// on `wal.lock` — that's the intentional barrier.
     fn put_inner(&self, key: &[u8], value: &[u8], wants_prev: bool) -> Result<Option<Vec<u8>>> {
-        let _maintenance = self.maintenance_lock.read().unwrap();
+        let _maintenance = self.maintenance_gate.enter_shared();
         let padded = pad_key(key);
-        let seq = self.next_seq.fetch_add(1, Ordering::SeqCst);
+        let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
 
         let outcome = if let Some(wal) = &self.wal {
             let mut w = wal.lock().unwrap();
@@ -432,7 +446,9 @@ impl Tree {
                 seq,
                 wants_prev,
             )?;
-            self.backend.mark_dirty(self.root_guid, seq);
+            if outcome.root_dirty {
+                self.backend.mark_dirty(self.root_guid, seq);
+            }
             // Fast-path encoder: writes (tree_id, key, value) only.
             // Replay redoes from those three; the caller's
             // `wants_prev` outcome is delivered through the return
@@ -455,7 +471,9 @@ impl Tree {
                 seq,
                 wants_prev,
             )?;
-            self.backend.mark_dirty(self.root_guid, seq);
+            if outcome.root_dirty {
+                self.backend.mark_dirty(self.root_guid, seq);
+            }
             if self.cfg.memory_flush_on_write {
                 self.flush_dirty_inline()?;
                 self.flush_pending_deletes_inline()?;
@@ -503,7 +521,7 @@ impl Tree {
     /// `EraseOutcome.mutated` is the authoritative "anything
     /// happened" signal, independent of `EraseOutcome.previous`.
     fn delete_inner(&self, key: &[u8], wants_prev: bool) -> Result<engine::EraseOutcome> {
-        let _maintenance = self.maintenance_lock.read().unwrap();
+        let _maintenance = self.maintenance_gate.enter_shared();
         let padded = pad_key(key);
         // Pre-allocate the seq before the walker descends so any
         // child blob the walker touches can `mark_dirty(child, seq)`
@@ -512,18 +530,19 @@ impl Tree {
         // A no-op delete (key absent) still burns the seq; that's
         // fine — `next_seq` is monotonic and the unused seq doesn't
         // appear in any WAL record or dirty entry.
-        let seq = self.next_seq.fetch_add(1, Ordering::SeqCst);
+        let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
 
         let outcome = if let Some(wal) = &self.wal {
             let mut w = wal.lock().unwrap();
             let outcome =
                 engine::erase_multi(&self.backend, &self.root_pin, &padded, seq, wants_prev)?;
             if outcome.mutated {
-                // Only mark the **root** dirty on an actual erase
-                // — a no-op delete (key absent) leaves the root
-                // image byte-identical to the backend, and the
-                // walker already mark_dirty'd any child it touched.
-                self.backend.mark_dirty(self.root_guid, seq);
+                // Only mark the root if the root blob changed.
+                // Cross-blob erases mark their child blob inside
+                // the walker; absent-key no-ops mark nothing.
+                if outcome.root_dirty {
+                    self.backend.mark_dirty(self.root_guid, seq);
+                }
                 // Fast-path encoder: writes (tree_id, key) only.
                 // The prior value (if `Tree::remove` asked for it)
                 // is delivered through the return path, not the WAL.
@@ -537,7 +556,7 @@ impl Tree {
         } else {
             let outcome =
                 engine::erase_multi(&self.backend, &self.root_pin, &padded, seq, wants_prev)?;
-            if outcome.mutated {
+            if outcome.mutated && outcome.root_dirty {
                 self.backend.mark_dirty(self.root_guid, seq);
             }
             if self.cfg.memory_flush_on_write {
@@ -569,11 +588,11 @@ impl Tree {
     /// `RenameObject` WAL record so its erase + insert phases
     /// recover atomically on replay.
     pub fn rename(&self, src: &[u8], dst: &[u8], force: bool) -> Result<()> {
-        let _maintenance = self.maintenance_lock.read().unwrap();
+        let _maintenance = self.maintenance_gate.enter_shared();
         let src_padded = pad_key(src);
         let dst_padded = pad_key(dst);
 
-        let seq = self.next_seq.fetch_add(1, Ordering::SeqCst);
+        let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
         let _r = self.rename_lock.lock().unwrap();
 
         // Probe src across all blobs — zero-copy via BM pin.
@@ -615,8 +634,9 @@ impl Tree {
         // dropped on the floor.
         if let Some(wal) = &self.wal {
             let mut w = wal.lock().unwrap();
-            engine::erase_multi(&self.backend, &self.root_pin, &src_padded, seq, false)?;
-            engine::insert_multi(
+            let erase_out =
+                engine::erase_multi(&self.backend, &self.root_pin, &src_padded, seq, false)?;
+            let insert_out = engine::insert_multi(
                 &self.backend,
                 &self.root_pin,
                 &dst_padded,
@@ -624,7 +644,9 @@ impl Tree {
                 seq,
                 false,
             )?;
-            self.backend.mark_dirty(self.root_guid, seq);
+            if erase_out.root_dirty || insert_out.root_dirty {
+                self.backend.mark_dirty(self.root_guid, seq);
+            }
             // Fast-path: skips the `TxnOp::RenameObject` enum's
             // two `Vec` clones (src_key, dst_key).
             w.append_rename_object(seq, 0, src, dst, force)?;
@@ -632,8 +654,9 @@ impl Tree {
                 w.flush()?;
             }
         } else {
-            engine::erase_multi(&self.backend, &self.root_pin, &src_padded, seq, false)?;
-            engine::insert_multi(
+            let erase_out =
+                engine::erase_multi(&self.backend, &self.root_pin, &src_padded, seq, false)?;
+            let insert_out = engine::insert_multi(
                 &self.backend,
                 &self.root_pin,
                 &dst_padded,
@@ -641,7 +664,9 @@ impl Tree {
                 seq,
                 false,
             )?;
-            self.backend.mark_dirty(self.root_guid, seq);
+            if erase_out.root_dirty || insert_out.root_dirty {
+                self.backend.mark_dirty(self.root_guid, seq);
+            }
             if self.cfg.memory_flush_on_write {
                 // Walker may have dirtied child blobs across the
                 // erase + insert sequence — drain the full set.
@@ -708,7 +733,7 @@ impl Tree {
     }
 
     fn apply_batch(&self, pending: Vec<BatchOp>) -> Result<()> {
-        let _maintenance = self.maintenance_lock.read().unwrap();
+        let _maintenance = self.maintenance_gate.enter_shared();
         let count = pending.len() as u64;
         // Serialise batches against renames + other batches so the
         // ops here see a coherent rename-free view across the
@@ -719,7 +744,7 @@ impl Tree {
         // per-inner seqs in the body. Pure no-op deletes burn their
         // seq (BM dirty tracking is unaffected since no mutation
         // happened); `next_seq` is monotonic regardless.
-        let base_seq = self.next_seq.fetch_add(count, Ordering::SeqCst);
+        let base_seq = self.next_seq.fetch_add(count, Ordering::Relaxed);
 
         // W2D-strict protocol: all inner ops' walker mutations +
         // `mark_dirty` calls, plus the single envelope WAL append,
@@ -772,7 +797,7 @@ impl Tree {
             match op {
                 BatchOp::Put { key, value } => {
                     let padded = pad_key(&key);
-                    engine::insert_multi(
+                    let outcome = engine::insert_multi(
                         &self.backend,
                         &self.root_pin,
                         &padded,
@@ -780,7 +805,9 @@ impl Tree {
                         seq,
                         false,
                     )?;
-                    self.backend.mark_dirty(self.root_guid, seq);
+                    if outcome.root_dirty {
+                        self.backend.mark_dirty(self.root_guid, seq);
+                    }
                     if let Some(enc) = enc.as_deref_mut() {
                         enc.push_insert(0, &key, &value);
                     }
@@ -790,7 +817,9 @@ impl Tree {
                     let outcome =
                         engine::erase_multi(&self.backend, &self.root_pin, &padded, seq, false)?;
                     if outcome.mutated {
-                        self.backend.mark_dirty(self.root_guid, seq);
+                        if outcome.root_dirty {
+                            self.backend.mark_dirty(self.root_guid, seq);
+                        }
                         if let Some(enc) = enc.as_deref_mut() {
                             enc.push_erase(0, &key);
                         }
@@ -822,14 +851,14 @@ impl Tree {
                         {
                             return Err(Error::DstExists);
                         }
-                        engine::erase_multi(
+                        let erase_out = engine::erase_multi(
                             &self.backend,
                             &self.root_pin,
                             &src_padded,
                             seq,
                             false,
                         )?;
-                        engine::insert_multi(
+                        let insert_out = engine::insert_multi(
                             &self.backend,
                             &self.root_pin,
                             &dst_padded,
@@ -837,7 +866,9 @@ impl Tree {
                             seq,
                             false,
                         )?;
-                        self.backend.mark_dirty(self.root_guid, seq);
+                        if erase_out.root_dirty || insert_out.root_dirty {
+                            self.backend.mark_dirty(self.root_guid, seq);
+                        }
                     }
                     if let Some(enc) = enc.as_deref_mut() {
                         enc.push_rename_object(0, &src, &dst, force);
@@ -871,7 +902,7 @@ impl Tree {
         RangeBuilder::new(
             Arc::clone(&self.backend),
             self.root_guid,
-            Arc::clone(&self.maintenance_lock),
+            Arc::clone(&self.maintenance_gate),
         )
     }
 
@@ -1016,7 +1047,7 @@ impl Tree {
     pub fn checkpoint(&self) -> Result<()> {
         use std::collections::HashMap;
 
-        let _maintenance = self.maintenance_lock.read().unwrap();
+        let _maintenance = self.maintenance_gate.enter_shared();
 
         // Phase 1: snapshot under wal.lock so racing writers can't
         // slip a not-yet-WAL-durable dirty entry past us. WAL flush
@@ -1173,7 +1204,7 @@ impl Tree {
     /// another's are read. Acceptable for observability; pause writes
     /// externally if you need a quiescent snapshot.
     pub fn stats(&self) -> Result<TreeStats> {
-        let _maintenance = self.maintenance_lock.read().unwrap();
+        let _maintenance = self.maintenance_gate.enter_shared();
         // `Tree::stats` is an introspection path — used by users
         // checking on the tree, and (via `holt::metrics`) by
         // Prometheus scrapes that read `bm_cache_hits`,
@@ -1312,7 +1343,7 @@ impl Tree {
     pub fn compact(&self) -> Result<()> {
         use crate::store::buffer_manager::STRUCTURAL_SEQ;
 
-        let _maintenance = self.maintenance_lock.write().unwrap();
+        let _maintenance = self.maintenance_gate.enter_exclusive();
 
         // Phase 1 — per-blob compact.
         let guids = engine::collect_blob_guids(&self.backend, self.root_guid)?;
@@ -1386,16 +1417,13 @@ impl Tree {
 /// ## Dirty tracking on replay
 ///
 /// Walker calls (`insert_multi` / `erase_multi`) mutate the
-/// BM-cached root + any cross-blob children, but the root's
-/// `mark_dirty` is the **caller's** responsibility (see
-/// `Tree::put`). Replay must honour that contract — every
-/// logical op that landed in cache is mirrored by
-/// `bm.mark_dirty(root_guid, seq)`. Without this, a `Tree::open`
-/// → `Tree::checkpoint` immediately after replay would find an
-/// empty dirty set, write nothing to backend, then truncate the
-/// WAL — silently losing every replayed record (the cached image
-/// matched the in-memory state but the backend image was still
-/// pre-replay; truncating the WAL removed the only durable copy).
+/// BM-cached root + any cross-blob children. The walker marks
+/// touched child blobs dirty itself; the root's `mark_dirty` is
+/// the **caller's** responsibility when the returned outcome says
+/// `root_dirty`. Replay must honour that contract. Without this,
+/// a `Tree::open` → `Tree::checkpoint` immediately after replay
+/// could find an empty dirty set, write nothing to backend, then
+/// truncate the WAL — silently losing every replayed record.
 fn replay_wal(path: &std::path::Path, bm: &Arc<BufferManager>, root_guid: BlobGuid) -> Result<u64> {
     // Pin the root once for the entire replay loop; saves a
     // BM-Mutex per op (replays can be thousands of ops on a
@@ -1411,22 +1439,20 @@ fn replay_wal(path: &std::path::Path, bm: &Arc<BufferManager>, root_guid: BlobGu
         // already-used seq.
         highest = highest.max(seq);
 
-        // `touched_root` tracks whether this op actually mutated
+        // `root_dirty` tracks whether this op actually mutated
         // the BM-cached root image. No-op replays (e.g. an erase
         // for a key already absent because a prior replay pass
         // reconciled it) leave the cache byte-identical to
         // backend — skipping `mark_dirty` for those is a small
         // win and matches `Tree::delete`'s same-shape branch.
-        let touched_root = match op {
+        let root_dirty = match op {
             TxnOp::Insert { key, value, .. } => {
                 let padded = pad_key(key);
-                engine::insert_multi(bm, &root_pin, &padded, value, seq, false)?;
-                true
+                engine::insert_multi(bm, &root_pin, &padded, value, seq, false)?.root_dirty
             }
             TxnOp::Erase { key, .. } => {
                 let padded = pad_key(key);
-                let outcome = engine::erase_multi(bm, &root_pin, &padded, seq, false)?;
-                outcome.mutated
+                engine::erase_multi(bm, &root_pin, &padded, seq, false)?.root_dirty
             }
             TxnOp::RenameObject {
                 src_key,
@@ -1452,9 +1478,10 @@ fn replay_wal(path: &std::path::Path, bm: &Arc<BufferManager>, root_guid: BlobGu
                 }
                 let value = engine::lookup_multi_with(bm, &root_pin, &src_padded, <[u8]>::to_vec)?
                     .unwrap_or_default();
-                engine::erase_multi(bm, &root_pin, &src_padded, seq, false)?;
-                engine::insert_multi(bm, &root_pin, &dst_padded, &value, seq, false)?;
-                true
+                let erase_out = engine::erase_multi(bm, &root_pin, &src_padded, seq, false)?;
+                let insert_out =
+                    engine::insert_multi(bm, &root_pin, &dst_padded, &value, seq, false)?;
+                erase_out.root_dirty || insert_out.root_dirty
             }
             // Structural / multi-tenant / marker variants don't
             // affect logical state at the single-tree API surface.
@@ -1470,12 +1497,9 @@ fn replay_wal(path: &std::path::Path, bm: &Arc<BufferManager>, root_guid: BlobGu
             | TxnOp::MemMarker { .. }
             | TxnOp::Batch { .. } => false,
         };
-        if touched_root {
+        if root_dirty {
             // Honour the walker's caller-side `mark_dirty(root,
-            // seq)` contract — see the module doc above. The
-            // walker itself only marks cross-blob children dirty
-            // while lock-coupling into descendants; the root is
-            // always the caller's job.
+            // seq)` contract — see the module doc above.
             bm.mark_dirty(root_guid, seq);
         }
         Ok(())
@@ -1515,7 +1539,7 @@ mod tests {
         let tree = Tree::open(TreeConfig::memory()).unwrap();
         tree.put(b"k", b"v").unwrap();
 
-        let read_guard = tree.maintenance_lock.read().unwrap();
+        let read_guard = tree.maintenance_gate.enter_shared();
         let worker_tree = tree.clone();
         let (started_tx, started_rx) = sync_channel(0);
         let (done_tx, done_rx) = sync_channel(0);

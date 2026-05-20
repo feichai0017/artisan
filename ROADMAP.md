@@ -5,7 +5,7 @@
 holt is a single-node, Unix-only ART-over-blobs metadata engine.
 The algorithm core, persistent backend, WAL + replay, sharded
 buffer manager, 3-thread background checkpointer, and the curated
-public API are all in place. 251 tests (unit + property + crash +
+public API are all in place. 260+ tests (unit + property + crash +
 failpoint + multi-reader stress); zero clippy / rustdoc warnings
 under `-D warnings`; ubuntu + macOS CI; `cargo deny` supply-chain
 job.
@@ -97,17 +97,29 @@ v0.3's concurrency cut is implemented in the codebase:
   retains ancestor guards across child mutation. That gives the
   same latch lifetime as the flattened state-machine design
   without self-referential guard plumbing.
-- **Maintenance is separated.** Foreground writers take only the
-  shared side of a narrow `maintenance_lock` while they may cross
-  `BlobNode` boundaries. `compact()` and the background merge pass
-  take the exclusive side before folding/deleting child blobs.
+- **Maintenance is separated.** Foreground writers enter only the
+  shared side of a narrow atomic `maintenance_gate` while they may
+  cross `BlobNode` boundaries. `compact()` and the background
+  merge pass enter the exclusive side before folding/deleting
+  child blobs.
   Point reads also take the shared side, but blob-local access
   remains optimistic; ordinary readers and writers still run
   concurrently with each other.
+- **Large-tree puts avoid root write-latch traffic.** Cross-blob
+  puts route through the root under a shared latch, acquire the
+  child write latch while the edge is stable, then mutate only
+  from the child down. Child-only writes also return a precise
+  `root_dirty = false`, so the caller does not mark the root dirty
+  or take the dirty-map mutex for a blob it did not change.
 - **Shape counters are exposed.** `Tree::stats()` now reports
   mutation walker ops, total/average/max blob hops, max
   cross-blob boundary depth, spillovers, merges, and optimistic
   read restarts. Prometheus export includes the same counters.
+- **Checkpoint/eviction interlock is closed.** Dirty entries
+  drained by a checkpoint round stay protected as in-flight
+  `flushing` entries until their snapshotted bytes complete
+  `write_through`, so eviction cannot drop the cache image in the
+  gap between `snapshot_dirty()` and the planner's byte copy.
 
 Still intentionally not in P0: per-op latch wait histograms. The
 current `HybridLatch` API has no timed acquisition boundary, and
@@ -172,7 +184,7 @@ threads. v0.3 makes the I/O side worth that structure:
   blob boundary can recover into a high-fanout structure.
 - Make merge/rebalance incremental. `compact()` and background
   merge are now online with respect to foreground writers through
-  `maintenance_lock`; the remaining large-tree work is policy
+  the atomic `maintenance_gate`; the remaining large-tree work is policy
   quality (when to split/merge/rebalance), not basic safety.
 - Add targeted benchmarks for skewed path prefixes, hot
   directories, delete-heavy churn, and working sets larger than

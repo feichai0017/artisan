@@ -21,8 +21,9 @@ cargo bench --bench main -- kv_ --output-format bencher
 cargo bench --bench main -- _scale_put --noplot --output-format bencher
 ```
 
-Each criterion sample is one op. Numbers are mean ± noise band
-in nanoseconds; lower is better. Holt's per-op numbers are
+Each criterion sample is one op. Numbers are Criterion bencher
+`ns/iter` point estimates in nanoseconds, with noise bands printed
+by the command; lower is better. Holt's per-op numbers are
 randomised over a 10 000-key dataset (see `gen_*_dataset`);
 RocksDB / SQLite are driven by the same dataset for fair
 comparison.
@@ -33,10 +34,11 @@ comparison.
 - **OS**: macOS 26.3 (Darwin 25.0.0)
 - **Rust**: 1.94.0 stable, release profile (`lto=thin`,
   `codegen-units=1`, `opt-level=3`)
-- **holt**: code commit `104ac23` for the refreshed scale-put
-  tables (BlobNode child-entry removal + recursive cross-blob
-  latch coupling). Older get/list tables are from the same M3 Pro
-  benchmark track and should be refreshed before a release tag.
+- **holt**: current v0.3 working tree for the refreshed scale-put
+  tables (atomic maintenance gate, root-dirty precision, and
+  root shared-routing for cross-blob puts). Older get/list tables
+  are from the same M3 Pro benchmark track and should be
+  refreshed before a release tag.
 - **RocksDB**: 0.24 (`librocksdb-sys` 0.18, bundled)
 - **SQLite**: rusqlite 0.39 (bundled libsqlite3)
 - **Knob alignment**: all three engines use comparable
@@ -61,11 +63,12 @@ tables are from the earlier v0.3 M3 Pro run):
   tier. The lead vs RocksDB widens to **5.4× / 2.8× / 2.2×** at
   2 M (kv / objstore / fs) as the LSM's read-amplification
   finally bites.
-- **Put wins every point in the current scale-put run**: holt wins
-  puts at every tier through 2 M. At 2 M: **1.24×** ahead of
-  RocksDB on kv, **1.05×** ahead on objstore, and **1.01×** on
-  fs. Treat the fs cell as effectively tied rather than a large
-  win — the point estimate is ahead, but the margin is tiny.
+- **Put wins every point estimate in the current scale-put run**:
+  holt wins puts at every tier through 2 M. At 2 M: **1.38×**
+  ahead of RocksDB on kv, **1.13×** ahead on objstore, and
+  **1.05×** on fs; vs SQLite the same cells are **1.32× /
+  1.22× / 1.09×**. Treat fs-vs-RocksDB as the tight remaining
+  write cell, not as a large win.
 
 ## KV workload (short random keys + short values)
 
@@ -167,10 +170,10 @@ cargo bench --bench main -- _scale_ --output-format bencher
 
 | n        | Holt (ns) | RocksDB (ns) | SQLite (ns) | vs RocksDB | vs SQLite |
 | -------- | --------: | -----------: | ----------: | ---------: | --------: |
-|  **20 k** |   **263** |        1 333 |         631 |       5.1× |      2.4× |
-| **100 k** |   **529** |        1 355 |         994 |       2.6× |      1.9× |
-| **500 k** |   **816** |        1 504 |       1 270 |       1.8× |      1.6× |
-|  **2 M**  | **1 276** |        1 577 |       1 616 |   **1.24×** |     1.27× |
+|  **20 k** |   **294** |        1 608 |         644 |       5.5× |      2.2× |
+| **100 k** |   **531** |        1 545 |       1 008 |       2.9× |      1.9× |
+| **500 k** |   **818** |        1 716 |       1 346 |       2.1× |      1.6× |
+|  **2 M**  | **1 313** |        1 806 |       1 729 |   **1.38×** |     1.32× |
 
 ### `objstore` (S3-shaped path keys with ~30-byte shared prefix per bucket)
 
@@ -187,10 +190,10 @@ cargo bench --bench main -- _scale_ --output-format bencher
 
 | n        | Holt (ns) | RocksDB (ns) | SQLite (ns) | vs RocksDB | vs SQLite |
 | -------- | --------: | -----------: | ----------: | ---------: | --------: |
-|  **20 k** |   **349** |        1 400 |         619 |       4.0× |      1.8× |
-| **100 k** |   **683** |        1 465 |         952 |       2.1× |      1.4× |
-| **500 k** | **1 155** |        1 450 |       1 268 |       1.3× |      1.1× |
-|  **2 M**  | **1 463** |        1 532 |       1 547 |   **1.05×** |     1.06× |
+|  **20 k** |   **338** |        1 507 |         636 |       4.5× |      1.9× |
+| **100 k** |   **659** |        1 724 |       1 014 |       2.6× |      1.5× |
+| **500 k** | **1 161** |        1 671 |       1 390 |       1.4× |      1.2× |
+|  **2 M**  | **1 511** |        1 713 |       1 842 |   **1.13×** |     1.22× |
 
 ### `fs` (POSIX paths, very long common prefix per directory)
 
@@ -207,10 +210,10 @@ cargo bench --bench main -- _scale_ --output-format bencher
 
 | n        | Holt (ns) | RocksDB (ns) | SQLite (ns) | vs RocksDB | vs SQLite |
 | -------- | --------: | -----------: | ----------: | ---------: | --------: |
-|  **20 k** |   **322** |        1 338 |         648 |       4.2× |      2.0× |
-| **100 k** |   **676** |        1 448 |         949 |       2.1× |      1.4× |
-| **500 k** | **1 086** |        1 522 |       1 260 |       1.4× |      1.2× |
-|  **2 M**  | **1 436** |        1 446 |       1 517 |   **1.01×** |     1.06× |
+|  **20 k** |   **326** |        1 542 |         700 |       4.7× |      2.1× |
+| **100 k** |   **695** |        1 608 |         979 |       2.3× |      1.4× |
+| **500 k** | **1 116** |        1 787 |       1 365 |       1.6× |      1.2× |
+|  **2 M**  | **1 482** |        1 556 |       1 617 |   **1.05×** |     1.09× |
 
 ### Observations
 
@@ -245,14 +248,18 @@ keeps lookup depth dominated by index height, which grows slowly.
 
 v0.2.1 had an honest gap on 2 M path-shaped put: -13 % vs
 RocksDB on objstore, -18 % vs RocksDB on fs. **The current v0.3
-line closes that gap in this run**, although the 2 M fs cell is
-best read as a tie rather than a meaningful win.
+line closes that comparative gap in this run**: all three 2 M
+put cells are ahead of both RocksDB and SQLite, including the
+path-shaped metadata workloads. Do not over-read absolute deltas
+against the older v0.2.1 numbers; the table below is useful for
+direction, while the speedup columns come from the current
+same-run baselines.
 
 | 2 M put  | v0.2.1 | current v0.3 | Δ      | current v0.3 vs Rocks | vs SQLite |
 | -------- | -----: | -----------: | -----: | --------------------: | --------: |
-| kv       | 1 296  |        1 276 | -2 %   | **1.24×** ahead | 1.27× ahead |
-| objstore | 1 503  |        1 463 | -3 %   | **1.05×** ahead | 1.06× ahead |
-| fs       | 1 492  |        1 436 | -4 %   | 1.01× ahead / effectively tied | 1.06× ahead |
+| kv       | 1 296  |        1 313 | +1 %   | **1.38×** ahead | 1.32× ahead |
+| objstore | 1 503  |        1 511 | +1 %   | **1.13×** ahead | 1.22× ahead |
+| fs       | 1 492  |        1 482 | -1 %   | **1.05×** ahead | 1.09× ahead |
 
 The root cause of the v0.2.1 gap was **API + walker constant-
 factor overhead**, not the cross-blob descent cost we initially
@@ -275,11 +282,22 @@ v0.3.0 split `put` (blind, `Result<()>`) from `insert` (returning,
 `Result<Option<Vec<u8>>>`); same for `delete` / `remove`. Blind
 walker path skips the leaf-extent value read, drops the prefix
 `.to_vec()`, and writes `Option::None` into the WAL `prev_value`
-slot. All three are pure constant-factor wins (no algorithmic
-change). The later cross-blob latch-coupling + `BlobNode`
-format break removes the parent-held fallback path and the
-child-entry repair work, which is what makes the final 2 M
-path-shaped put cells no longer lose to RocksDB in this run.
+slot. The later cross-blob latch-coupling + `BlobNode` format
+break removes the parent-held fallback path and the child-entry
+repair work.
+
+The current v0.3 line adds three more hot-path fixes on top:
+
+1. Cross-blob updates return a precise `root_dirty` bit, so a
+   child-only update no longer takes the dirty-map mutex again to
+   mark the root dirty.
+2. Cross-blob puts route through the root under a shared latch,
+   acquire the child write latch while the edge is still stable,
+   then mutate only from the child down. This removes the root
+   exclusive latch from the large-tree steady state.
+3. Padded-key construction keeps the 256-byte inline fast path
+   but writes only the live key bytes + terminator, avoiding a
+   full stack-buffer clear per op.
 
 **Adjacent v0.3 wins.** These scale-put benches exercise blind
 `put` on a single op at a time. Several v0.3 changes matter more
@@ -303,14 +321,14 @@ for adjacent surfaces than for this exact table:
   clones that the v0.3.0 `wal_ops: Vec<TxnOp>` aggregator forced.
   Bench doesn't exercise `txn`.
 
-The hard cell remains **`fs_scale_put` at 2 M**. The current
-point estimate is slightly ahead of RocksDB, but the margin is
-only ~1 %. This is still the regime where LSM write amortization
-is most competitive: WAL append + memtable insert stay cheap
-regardless of working-set size, while ART-over-blobs pays
-cross-blob descent plus deeper Prefix chains on long POSIX
-paths. Treat this as "closed to parity", not as a decisive write
-win.
+The weakest remaining cell is **`fs_scale_put` at 2 M**. It now
+wins by point estimate (1.05× over RocksDB, 1.09× over SQLite),
+but the RocksDB comparison is still tight. This is the regime
+where LSM and B-tree write paths are most competitive: WAL append
++ memtable/page update stay cheap regardless of working-set size,
+while ART-over-blobs pays cross-blob descent plus deeper Prefix
+chains on long path keys. Treat this as "ahead, but not a large
+write win"; the larger claims are still on get/list/list_dir.
 
 #### What this means in practice
 
@@ -319,11 +337,10 @@ win.
   lead widening at larger working sets (5.4× / 2.8× / 2.2× at
   2 M get).
 - **Mixed workloads**: holt wins puts too at every tier in the
-  current scale-put run. The caveat is 2 M fs put: it is
-  effectively parity with RocksDB, not a large win. If your
-  workload sits there with a heavy write skew, either size the
-  holt buffer pool to hold the hot set, or use a write-optimized
-  engine.
+  current scale-put run. The caveat is 2 M fs put: it is a small
+  win, not a large one. If your workload sits there with heavy
+  write skew, size the holt buffer pool to hold the hot set and
+  benchmark the exact key shape before making a durability choice.
 
 ## Group C — p95 / p99 latency under maintenance interference
 
@@ -343,37 +360,36 @@ cargo test --release --test bench_contention_p95 \
 
 | Metric           | Value         |
 | ---------------- | ------------: |
-| ops              |   6 152 095   |
-| throughput       |   306 918 ops/s |
-| **mean**         |     12.79 µs  |
-| **p50**          |      1.96 µs  |
-| **p95**          |     28.54 µs  |
-| **p99**          |    107.58 µs  |
-| p99.9            |   2 310.14 µs |
-| max              |  30 654.46 µs |
+| ops              |   6 391 929   |
+| throughput       |   266 957 ops/s |
+| **mean**         |     12.31 µs  |
+| **p50**          |      1.71 µs  |
+| **p95**          |     22.88 µs  |
+| **p99**          |    108.09 µs  |
+| p99.9            |     688.13 µs |
+| max              |  48 365.57 µs |
 
 ### Observations
 
-- **307 k ops/s sustained** with 4 writer threads + a
+- **267 k ops/s sustained** with 4 writer threads + a
   background checkpointer + concurrent `compact()`. Each
-  writer averages ~77 k ops/s on its own, so the wal-lock
+  writer averages ~67 k ops/s on its own, so the wal-lock
   serialization tax is modest.
-- **p50 ≈ 2 µs** — most puts hit only the common "walker
+- **p50 ≈ 1.7 µs** — most puts hit only the common "walker
   mutate + mark_dirty + wal.append + flush" critical section
   with no maintenance interference.
-- **p99 ≈ 100 µs** — tail dominated by the wal.lock
+- **p95 ≈ 23 µs / p99 ≈ 108 µs** — tail dominated by the wal.lock
   serialization point during checkpoint snapshots (rounds run
   every ~5 ms and briefly take the lock to drain dirty +
   pending_deletes + flush WAL).
-- **p99.9 ≈ 2 ms** and **max ≈ 30 ms** — the spikes are
-  `compact()` calls themselves (which take the wal.lock for
-  the duration of phase 1 / 1.5 / 2 since `compact` is not
-  yet online — see the docstring on `Tree::compact`). These
-  bound the worst case under maintenance; the v0.3 maintenance
-  latch will reduce them further by serializing compact
-  against writers more cleanly.
+- **p99.9 ≈ 0.69 ms** with one max outlier near 48 ms — online
+  compact no longer dominates the steady tail, but rare scheduler
+  / checkpoint interference still shows up at the extreme max.
+- This refreshed run also exercises the dirty-snapshot / eviction
+  interlock: checkpoint-owned `flushing` entries remain protected
+  until `write_through` completes, so the run finishes without the
+  previous `dirty entry lost cache image` invariant failure.
 
-The mean-vs-p50 gap (12.8 µs mean vs 2 µs p50) reflects that
-the slow tail (compact calls hit a handful of writes hard) is
-real but bounded — the distribution isn't long-tailed enough
-to perturb the median.
+The mean-vs-p50 gap (12.3 µs mean vs 1.7 µs p50) reflects that
+the slow tail is real but bounded — the distribution is not
+long-tailed enough to perturb the median.
