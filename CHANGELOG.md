@@ -12,7 +12,8 @@ fine-grained per-commit history is in `git log`.
 The v0.3 milestone is still unreleased. Everything in this
 section is queued for the first v0.3 tag: the API split, walker
 hot-path optimizations, WAL format cleanup, batch-WAL encoding,
-recursive cross-blob latch coupling, and journal group commit.
+recursive cross-blob latch coupling, journal group commit, and
+candidate-driven online maintenance.
 
 The three breaking-but-surgical wins below land first; the
 extreme metadata-engine performance track builds on them.
@@ -158,10 +159,19 @@ The remaining v0.3 concurrency cleanup is now in place:
   atomic `maintenance_gate` while they may cross `BlobNode`
   boundaries.
   `Tree::compact()` runs blob-local compaction on the shared side,
-  skips clean blobs after a shared-latch header check, and both
-  manual compact plus the background checkpointer's merge pass
-  enter the exclusive side only around one parent merge/delete
-  window at a time.
+  skips clean stale candidates after a shared-latch header check,
+  and both manual compact plus the background checkpointer's merge
+  pass enter the exclusive side only around one parent
+  merge/delete window at a time.
+- Online maintenance is now candidate-driven. Deletes and
+  leaf-slot churn enqueue blob-local compaction candidates;
+  spillovers enqueue parent-merge candidates. `Tree::compact()`
+  cold-seeds the queues only when no hints exist, then drains a
+  bounded batch instead of sweeping every blob on every call.
+  Background auto-merge drains the same queued parent candidates,
+  and too-large parent candidates are consumed until fresh shape
+  debt requeues them, so idle checkpoint rounds avoid a large-tree
+  merge scan.
 - Point reads (`get`) also take the shared
   maintenance gate so a merge cannot delete a child after a reader
   observes the parent `BlobNode`. Blob-local reads still use
@@ -495,9 +505,9 @@ ahead, and fs is **1.01×** ahead / effectively tied. Full table in
 - **Group C — p95/p99 under maintenance interference**
   (`tests/bench_contention_p95.rs`, `#[ignore]`). 4 writer
   threads + 5 ms-cadence background checkpointer + concurrent
-  `Tree::compact()`; tracks every `put` latency via
-  `hdrhistogram`. M3 Pro: 307k ops/s sustained, p50 = 2 µs,
-  p99 = 108 µs.
+  `Tree::compact()` triggered from a put counter; tracks every
+  `put` latency via `hdrhistogram`. Latest local run: 840k ops/s
+  sustained, p50 = 1.29 µs, p99 = 4.58 µs, p99.9 = 144 µs.
 - **PGO build profile docs** in [`PGO.md`](PGO.md).
 
 Full numbers in [`benches/RESULTS.md`](benches/RESULTS.md).

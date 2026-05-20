@@ -5,7 +5,7 @@
 //!
 //! - [`walker`] — the recursive walker, split into focused
 //!   files: `lookup` / `insert` / `erase` / `range` / `merge`
-//!   / `scan` (read-side walkers + tree-wide passes),
+//!   / `scan` (read-side walkers + stats/cold-seed scans),
 //!   `spillover` / `migrate` (write-side restructuring), and
 //!   the internal `readers` / `writers` / `types` primitives
 //!   they share.

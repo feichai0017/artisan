@@ -125,9 +125,9 @@
 //! workloads.
 
 use std::cell::UnsafeCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ops::{Deref, DerefMut};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use dashmap::DashMap;
@@ -161,6 +161,16 @@ struct MutationState {
     /// backend manifest because WAL/checkpoint ordering still owns
     /// them.
     pending_deletes: HashMap<BlobGuid, u64>,
+    /// In-memory maintenance hints for blobs whose local garbage
+    /// is worth checking before the next online compact pass.
+    ///
+    /// This is advisory only. Dirty / flushing / pending-delete own
+    /// correctness; candidate loss can only delay maintenance until
+    /// a later seed scan or explicit compact pass rediscovers it.
+    compact_candidates: MaintenanceQueue,
+    /// In-memory maintenance hints for parent blobs that own at
+    /// least one `BlobNode` crossing and may be worth a merge pass.
+    merge_candidates: MaintenanceQueue,
 }
 
 impl MutationState {
@@ -175,6 +185,47 @@ impl MutationState {
     fn remove_dirty(&mut self, guid: &BlobGuid) {
         self.dirty.remove(guid);
         self.flushing.remove(guid);
+    }
+
+    fn remove_maintenance_candidates(&mut self, guid: &BlobGuid) -> (bool, bool) {
+        (
+            self.compact_candidates.remove(guid),
+            self.merge_candidates.remove(guid),
+        )
+    }
+}
+
+#[derive(Default)]
+struct MaintenanceQueue {
+    set: HashSet<BlobGuid>,
+    queue: VecDeque<BlobGuid>,
+}
+
+impl MaintenanceQueue {
+    fn insert(&mut self, guid: BlobGuid) -> bool {
+        if self.set.insert(guid) {
+            self.queue.push_back(guid);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn remove(&mut self, guid: &BlobGuid) -> bool {
+        self.set.remove(guid)
+    }
+
+    fn pop_batch(&mut self, limit: usize) -> Vec<BlobGuid> {
+        let mut out = Vec::new();
+        while out.len() < limit {
+            let Some(guid) = self.queue.pop_front() else {
+                break;
+            };
+            if self.set.remove(&guid) {
+                out.push(guid);
+            }
+        }
+        out
     }
 }
 
@@ -192,6 +243,43 @@ fn bookkeeping_shard_idx(guid: &BlobGuid) -> usize {
     h = h.wrapping_mul(0xff51_afd7_ed55_8ccd);
     h ^= h >> 33;
     (h as usize) & (BOOKKEEPING_SHARDS - 1)
+}
+
+#[derive(Debug, Clone, Copy)]
+enum CandidateKind {
+    Compact,
+    Merge,
+}
+
+fn pop_candidate_batch(
+    shards: &[Mutex<MutationState>; BOOKKEEPING_SHARDS],
+    cursor: &AtomicUsize,
+    total: &AtomicUsize,
+    kind: CandidateKind,
+    limit: usize,
+) -> Vec<BlobGuid> {
+    if limit == 0 {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let start = cursor.fetch_add(1, Ordering::Relaxed) & (BOOKKEEPING_SHARDS - 1);
+    for offset in 0..BOOKKEEPING_SHARDS {
+        let idx = (start + offset) & (BOOKKEEPING_SHARDS - 1);
+        let shard = &shards[idx];
+        let mut state = shard.lock().unwrap();
+        let queue = match kind {
+            CandidateKind::Compact => &mut state.compact_candidates,
+            CandidateKind::Merge => &mut state.merge_candidates,
+        };
+        let remaining = limit - out.len();
+        let popped = queue.pop_batch(remaining);
+        total.fetch_sub(popped.len(), Ordering::Relaxed);
+        out.extend(popped);
+        if out.len() == limit {
+            return out;
+        }
+    }
+    out
 }
 
 /// LRU-bounded blob cache; see the module docs.
@@ -213,6 +301,13 @@ pub struct BufferManager {
     /// one short critical section with no global dirty mutex on the
     /// persistent write hot path.
     mutation: [Mutex<MutationState>; BOOKKEEPING_SHARDS],
+    /// Rotating shard cursors for advisory maintenance queues.
+    /// Without this, a fixed shard-0-first drain can starve later
+    /// shards when online maintenance has a small per-call budget.
+    compact_candidate_cursor: AtomicUsize,
+    merge_candidate_cursor: AtomicUsize,
+    compact_candidate_total: AtomicUsize,
+    merge_candidate_total: AtomicUsize,
     /// Monotonic logical clock used by the eviction thread to
     /// classify cache entries as cold. Every `pin` / `get_cached`
     /// stamps the touched entry's `last_touched` with
@@ -419,6 +514,10 @@ impl BufferManager {
             capacity: capacity.max(1),
             cache: DashMap::new(),
             mutation: std::array::from_fn(|_| Mutex::new(MutationState::default())),
+            compact_candidate_cursor: AtomicUsize::new(0),
+            merge_candidate_cursor: AtomicUsize::new(0),
+            compact_candidate_total: AtomicUsize::new(0),
+            merge_candidate_total: AtomicUsize::new(0),
             clock: AtomicU64::new(1),
             cache_hits: AtomicU64::new(0),
             cache_misses: AtomicU64::new(0),
@@ -450,6 +549,15 @@ impl BufferManager {
             .iter()
             .map(|kv| (*kv.key(), Arc::clone(kv.value())))
             .collect()
+    }
+
+    fn decrement_candidate_totals(&self, removed: (bool, bool)) {
+        if removed.0 {
+            self.compact_candidate_total.fetch_sub(1, Ordering::Relaxed);
+        }
+        if removed.1 {
+            self.merge_candidate_total.fetch_sub(1, Ordering::Relaxed);
+        }
     }
 
     /// Drop the cache entry for `guid` if (a) it's still cached,
@@ -766,10 +874,11 @@ impl BufferManager {
     /// backend.
     fn evict_from_cache(&self, guid: BlobGuid) {
         self.cache.remove(&guid);
-        self.mutation_shard(guid)
-            .lock()
-            .unwrap()
-            .remove_dirty(&guid);
+        let mut state = self.mutation_shard(guid).lock().unwrap();
+        state.remove_dirty(&guid);
+        let removed = state.remove_maintenance_candidates(&guid);
+        drop(state);
+        self.decrement_candidate_totals(removed);
     }
 
     /// Pin a blob in cache and return an `Arc<CachedBlob>` over it.
@@ -979,15 +1088,16 @@ impl BufferManager {
     /// the deletions have been applied — only then can the WAL
     /// be truncated.
     pub fn mark_for_delete(&self, guid: BlobGuid, txn_id: u64) {
-        {
-            let mut state = self.mutation_shard(guid).lock().unwrap();
-            state
-                .pending_deletes
-                .entry(guid)
-                .and_modify(|cur| *cur = (*cur).min(txn_id))
-                .or_insert(txn_id);
-            state.remove_dirty(&guid);
-        }
+        let mut state = self.mutation_shard(guid).lock().unwrap();
+        state
+            .pending_deletes
+            .entry(guid)
+            .and_modify(|cur| *cur = (*cur).min(txn_id))
+            .or_insert(txn_id);
+        state.remove_dirty(&guid);
+        let removed = state.remove_maintenance_candidates(&guid);
+        drop(state);
+        self.decrement_candidate_totals(removed);
         self.cache.remove(&guid);
     }
 
@@ -1031,6 +1141,70 @@ impl BufferManager {
             .iter()
             .map(|shard| shard.lock().unwrap().pending_deletes.len())
             .sum()
+    }
+
+    // ---------- online-maintenance candidates ----------
+
+    /// Mark `guid` as a blob-local compaction candidate.
+    ///
+    /// Candidate state is an advisory in-memory scheduler hint. It
+    /// is intentionally not persisted and not part of the WAL
+    /// protocol: dirty / flushing / pending-delete bookkeeping owns
+    /// correctness and eviction safety.
+    pub(crate) fn note_compaction_candidate(&self, guid: BlobGuid) {
+        let mut state = self.mutation_shard(guid).lock().unwrap();
+        if !state.pending_deletes.contains_key(&guid) && state.compact_candidates.insert(guid) {
+            self.compact_candidate_total.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Mark `guid` as a parent-merge candidate.
+    pub(crate) fn note_merge_candidate(&self, guid: BlobGuid) {
+        let mut state = self.mutation_shard(guid).lock().unwrap();
+        if !state.pending_deletes.contains_key(&guid) && state.merge_candidates.insert(guid) {
+            self.merge_candidate_total.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Pop up to `limit` blob-local compaction candidates.
+    ///
+    /// Popped candidates are removed from the queue. Callers that
+    /// discover remaining debt should call `note_*_candidate`
+    /// again, which pushes the guid to the back and prevents one
+    /// stubborn candidate from starving later ones.
+    #[must_use]
+    pub(crate) fn pop_compaction_candidates(&self, limit: usize) -> Vec<BlobGuid> {
+        pop_candidate_batch(
+            &self.mutation,
+            &self.compact_candidate_cursor,
+            &self.compact_candidate_total,
+            CandidateKind::Compact,
+            limit,
+        )
+    }
+
+    /// Pop up to `limit` parent-merge candidates.
+    #[must_use]
+    pub(crate) fn pop_merge_candidates(&self, limit: usize) -> Vec<BlobGuid> {
+        pop_candidate_batch(
+            &self.mutation,
+            &self.merge_candidate_cursor,
+            &self.merge_candidate_total,
+            CandidateKind::Merge,
+            limit,
+        )
+    }
+
+    /// Number of blob-local compaction hints currently queued.
+    #[must_use]
+    pub(crate) fn compaction_candidate_count(&self) -> usize {
+        self.compact_candidate_total.load(Ordering::Relaxed)
+    }
+
+    /// Number of parent-merge hints currently queued.
+    #[must_use]
+    pub(crate) fn merge_candidate_count(&self) -> usize {
+        self.merge_candidate_total.load(Ordering::Relaxed)
     }
 
     /// Execute a queued deletion against the inner backend.
@@ -1178,10 +1352,11 @@ impl Backend for BufferManager {
         // Backend now holds these exact bytes; any pending dirty
         // entry for this blob is satisfied. Subsequent writes via
         // the pin/write-guard path will re-mark it.
-        self.mutation_shard(guid)
-            .lock()
-            .unwrap()
-            .remove_dirty(&guid);
+        let mut state = self.mutation_shard(guid).lock().unwrap();
+        state.remove_dirty(&guid);
+        let removed = state.remove_maintenance_candidates(&guid);
+        drop(state);
+        self.decrement_candidate_totals(removed);
         Ok(())
     }
 
@@ -1359,6 +1534,66 @@ mod tests {
             bm.snapshot_bytes(g_a).is_some(),
             "dirty entry's cache image must be snapshottable",
         );
+    }
+
+    #[test]
+    fn maintenance_candidates_are_unique_and_fifo_budgeted() {
+        let inner: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        let bm = BufferManager::new(inner, 4);
+        let mut buckets = vec![Vec::<BlobGuid>::new(); BOOKKEEPING_SHARDS];
+        for i in 0..=u8::MAX {
+            let mut g = [0u8; 16];
+            g[0] = i;
+            buckets[bookkeeping_shard_idx(&g)].push(g);
+        }
+        let same_shard = buckets.into_iter().find(|b| b.len() >= 3).unwrap();
+        let a = same_shard[0];
+        let b = same_shard[1];
+        let c = same_shard[2];
+
+        bm.note_compaction_candidate(a);
+        bm.note_compaction_candidate(b);
+        bm.note_compaction_candidate(a);
+        bm.note_compaction_candidate(c);
+
+        assert_eq!(bm.compaction_candidate_count(), 3);
+        assert_eq!(bm.pop_compaction_candidates(2), vec![a, b]);
+        assert_eq!(bm.compaction_candidate_count(), 1);
+
+        // Re-queued candidates go to the back rather than
+        // starving entries that were already waiting.
+        bm.note_compaction_candidate(a);
+        assert_eq!(bm.pop_compaction_candidates(8), vec![c, a]);
+        assert_eq!(bm.compaction_candidate_count(), 0);
+    }
+
+    #[test]
+    fn maintenance_candidate_drain_rotates_across_shards() {
+        let inner: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        let bm = BufferManager::new(inner, 4);
+        let mut by_shard = [None::<BlobGuid>; BOOKKEEPING_SHARDS];
+        let mut counter = 0u32;
+        while by_shard.iter().any(Option::is_none) {
+            assert!(
+                counter < 100_000,
+                "test helper could not cover every bookkeeping shard"
+            );
+            let mut guid = [0u8; 16];
+            guid[0..4].copy_from_slice(&counter.to_le_bytes());
+            let shard = bookkeeping_shard_idx(&guid);
+            by_shard[shard].get_or_insert(guid);
+            counter += 1;
+        }
+
+        for guid in by_shard.iter().flatten() {
+            bm.note_compaction_candidate(*guid);
+        }
+
+        for expected_shard in 0..4 {
+            let batch = bm.pop_compaction_candidates(1);
+            assert_eq!(batch.len(), 1);
+            assert_eq!(bookkeeping_shard_idx(&batch[0]), expected_shard);
+        }
     }
 
     // Note on pending-delete + cache: `mark_for_delete` removes

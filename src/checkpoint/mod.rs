@@ -84,7 +84,6 @@ use std::time::Duration;
 
 use crate::concurrency::{CommitGate, MaintenanceGate};
 use crate::journal::group_commit::Journal;
-use crate::layout::BlobGuid;
 use crate::store::BufferManager;
 
 use self::io::IoTask;
@@ -133,10 +132,11 @@ pub struct CheckpointConfig {
     /// pathological". For a single-root workload the dirty
     /// count is usually ≤ 1, so the timer dominates.
     pub dirty_blob_threshold: usize,
-    /// Run the tree-wide merge pass at the start of each round.
-    /// Cheap when nothing's mergeable; expensive on large
-    /// multi-blob trees where most rounds would have nothing to
-    /// do.
+    /// Drain queued parent-merge candidates at the start of each
+    /// round. The queue is populated by foreground spillovers and
+    /// manual maintenance seeding, so idle rounds avoid walking
+    /// every reachable blob just to rediscover that nothing can
+    /// merge.
     ///
     /// Default `true` — keeping the blob tree in equilibrium
     /// against split/merge pressure is the whole point.
@@ -196,8 +196,6 @@ pub(super) struct Shared {
     /// cloning bytes so backend writes never include unjournaled
     /// mutations.
     pub(super) commit_gate: Arc<CommitGate>,
-    /// GUID of the tree root — entry point for the merge-pass walk.
-    pub(super) root_guid: BlobGuid,
     /// Shared structural gate with `Tree`: the merge pass enters
     /// the exclusive side so it cannot fold/delete a child blob
     /// while a foreground writer is lock-coupling through that
@@ -245,7 +243,6 @@ impl Checkpointer {
     pub(crate) fn spawn(
         bm: Arc<BufferManager>,
         journal: Option<Arc<Journal>>,
-        root_guid: BlobGuid,
         maintenance_gate: Arc<MaintenanceGate>,
         commit_gate: Arc<CommitGate>,
         cfg: CheckpointConfig,
@@ -258,7 +255,6 @@ impl Checkpointer {
             bm,
             journal,
             commit_gate,
-            root_guid,
             maintenance_gate,
             cfg,
             io_tx,
@@ -433,36 +429,20 @@ mod tests {
         }
     }
 
-    const TEST_ROOT_GUID: BlobGuid = [0; 16];
-
     #[test]
     fn disabled_config_spawns_nothing() {
         let bm = make_bm();
         let cfg = CheckpointConfig::default();
         assert!(!cfg.enabled);
-        let ck = Checkpointer::spawn(
-            bm,
-            None,
-            TEST_ROOT_GUID,
-            maintenance_gate(),
-            commit_gate(),
-            cfg,
-        );
+        let ck = Checkpointer::spawn(bm, None, maintenance_gate(), commit_gate(), cfg);
         assert!(ck.is_none());
     }
 
     #[test]
     fn spawn_and_drop_is_leak_free() {
         let bm = make_bm();
-        let ck = Checkpointer::spawn(
-            bm,
-            None,
-            TEST_ROOT_GUID,
-            maintenance_gate(),
-            commit_gate(),
-            no_merge_cfg(),
-        )
-        .expect("spawn");
+        let ck = Checkpointer::spawn(bm, None, maintenance_gate(), commit_gate(), no_merge_cfg())
+            .expect("spawn");
         // Give threads a tick to actually park.
         thread::sleep(Duration::from_millis(50));
         drop(ck);
@@ -484,7 +464,6 @@ mod tests {
         let ck = Checkpointer::spawn(
             Arc::clone(&bm),
             None,
-            TEST_ROOT_GUID,
             maintenance_gate(),
             commit_gate(),
             no_merge_cfg(),
@@ -513,7 +492,6 @@ mod tests {
         let ck = Checkpointer::spawn(
             Arc::clone(&bm),
             None,
-            TEST_ROOT_GUID,
             maintenance_gate(),
             commit_gate(),
             cfg,
@@ -567,7 +545,6 @@ mod tests {
         let ck = Checkpointer::spawn(
             Arc::clone(&bm),
             None,
-            TEST_ROOT_GUID,
             maintenance_gate(),
             commit_gate(),
             cfg,

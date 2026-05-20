@@ -345,10 +345,10 @@ write win"; the larger claims are still on get/list/list_dir.
 
 `tests/bench_contention_p95.rs` runs four `put` writers + a
 background checkpointer (5 ms cadence) + a compaction thread
-that periodically calls `tree.compact()` — the worst-case
-"engine is doing maintenance while users keep writing"
-shape. Every `put` records its wall-clock latency to a
-`hdrhistogram` for percentile reporting.
+that periodically calls `tree.compact()` from a monotonic put
+counter — the worst-case "engine is doing maintenance while users
+keep writing" shape. Every `put` records its wall-clock latency
+to a `hdrhistogram` for percentile reporting.
 
 ```bash
 cargo test --release --test bench_contention_p95 \
@@ -359,34 +359,37 @@ cargo test --release --test bench_contention_p95 \
 
 | Metric           | Value         |
 | ---------------- | ------------: |
-| ops              |  11 284 737   |
-| throughput       |   506 660 ops/s |
-| **mean**         |      6.92 µs  |
-| **p50**          |      1.17 µs  |
-| **p95**          |      1.96 µs  |
-| **p99**          |      6.75 µs  |
-| p99.9            |     880.64 µs |
-| max              | 328 990.72 µs |
+| ops              |  16 888 096   |
+| throughput       |   840 221 ops/s |
+| **mean**         |      4.61 µs  |
+| **p50**          |      1.29 µs  |
+| **p95**          |      2.08 µs  |
+| **p99**          |      4.58 µs  |
+| p99.9            |     144.00 µs |
+| max              | 154 664.96 µs |
 
 ### Observations
 
-- **507 k ops/s sustained** with 4 writer threads + a
-  background checkpointer + concurrent `compact()`. Each writer
-  averages ~127 k ops/s on its own.
-- **p50 ≈ 1.2 µs** — most puts hit only the common walker mutate
+- **840 k ops/s sustained** with 4 writer threads + a
+  background checkpointer + concurrent `compact()`. A same-session
+  confirmation run reported 717 k ops/s, p95 = 2.33 µs, p99 =
+  5.25 µs, p99.9 = 158.72 µs.
+- **p50 ≈ 1.3 µs** — most puts hit only the common walker mutate
   + dirty publish + WAL append path with no maintenance
   interference.
-- **p95 ≈ 2.0 µs / p99 ≈ 6.8 µs** — the writer-shared
+- **p95 ≈ 2.1 µs / p99 ≈ 4.6 µs** — the writer-shared
   `CommitGate` and journal-worker group commit removed the old
   writer-vs-writer commit mutex from the hot path; sharded
-  mutation bookkeeping removes the next dirty-map contention
-  point. Versus the pre-group-commit run above this is ~11.7×
-  lower p95 and ~16.0× lower p99 while also raising throughput
-  ~1.9×.
-- **p99.9 ≈ 0.88 ms** with one scheduler-scale max outlier. The
-  normal tail is now low single-digit microseconds; the extreme
-  tail is dominated by online maintenance and OS scheduling, not
-  by a persistent write serialization point.
+  mutation bookkeeping and candidate-driven maintenance remove the
+  next dirty-map and maintenance-scan contention points.
+- **p99.9 ≈ 0.14 ms** with one scheduler-scale max outlier. The
+  normal tail is now low single-digit microseconds; the remaining
+  extreme tail is dominated by online maintenance and OS
+  scheduling, not by a persistent write serialization point.
+- Earlier Group C rows used a dirty-count compact trigger. This
+  row uses the current put-counter trigger, so `compact()` actually
+  fires at the intended write cadence instead of depending on a
+  checkpoint-cleared dirty count.
 - This run also exercises the dirty-snapshot / eviction interlock:
   checkpoint-owned `flushing` entries stay protected until
   `write_through` completes. Fresh spillover blobs keep a local
@@ -395,6 +398,6 @@ cargo test --release --test bench_contention_p95 \
   `BlobGuid`. The run finishes without the previous `dirty entry
   lost cache image` invariant failure.
 
-The mean-vs-p50 gap (6.9 µs mean vs 1.2 µs p50) reflects that the
+The mean-vs-p50 gap (4.6 µs mean vs 1.3 µs p50) reflects that the
 slow tail is real but bounded — the distribution is not long-tailed
 enough to perturb the median.

@@ -46,8 +46,8 @@ A third group — **p95/p99 latency under maintenance interference**
 criterion measures means, not percentiles). Run via
 `cargo test --release --test bench_contention_p95 -- --ignored --nocapture`.
 It spins 4 writer threads + a 5 ms-cadence background
-checkpointer + concurrent `Tree::compact()` calls and tracks
-every `put` latency via `hdrhistogram`.
+checkpointer + concurrent `Tree::compact()` calls triggered by a
+put counter, and tracks every `put` latency via `hdrhistogram`.
 
 ## Running
 

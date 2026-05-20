@@ -63,6 +63,9 @@ use crate::store::{BlobFrame, BlobFrameRef, BufferManager, CachedBlob};
 
 use super::txn::{BatchOp, TxnBatch};
 
+const ONLINE_COMPACT_BLOB_BUDGET: usize = 256;
+const ONLINE_MERGE_PARENT_BUDGET: usize = 256;
+
 /// An `holt` tree — your handle to one metadata store.
 ///
 /// Clone the handle to share the same backing store: the
@@ -314,7 +317,6 @@ impl Tree {
         let checkpointer = crate::checkpoint::Checkpointer::spawn(
             Arc::clone(&bm),
             journal.clone(),
-            root_guid,
             Arc::clone(&maintenance_gate),
             Arc::clone(&commit_gate),
             cfg.checkpoint.clone(),
@@ -1268,38 +1270,28 @@ impl Tree {
         })
     }
 
-    /// Compact every blob reachable from the root in place, then
-    /// fold every mergeable cross-blob crossing back into its
-    /// parent.
+    /// Run one online maintenance pass.
     ///
     /// ## Concurrency
     ///
-    /// Safe to run while point reads are active. Phase 1 is only a
-    /// blob-local rewrite: it holds the shared maintenance side,
-    /// skips clean blobs under shared blob latches, and takes a
-    /// blob's exclusive latch only when that blob has reclaimable
-    /// garbage. Foreground operations on other blobs keep running.
-    /// Phase 2 folds `BlobNode` children under short exclusive
-    /// maintenance windows, one parent at a time, so no operation
-    /// can be lock-coupling through the edge being deleted. Range
-    /// iterators remain best-effort snapshots; if the caller needs
-    /// strict full-iterator stability, consume the iterator during
-    /// an external quiescent window.
+    /// Safe to run while point reads and foreground writers are
+    /// active. The pass is candidate-driven: deletes and leaf-slot
+    /// churn enqueue blob-local compaction candidates; spillovers
+    /// enqueue parent-merge candidates. A cold call with no queued
+    /// candidates seeds the queues once by scanning reachable
+    /// blobs. After that, each call processes at most
+    /// `ONLINE_COMPACT_BLOB_BUDGET` compact candidates and
+    /// `ONLINE_MERGE_PARENT_BUDGET` merge candidates, so online
+    /// maintenance is bounded rather than a whole-tree sweep.
     ///
-    /// ## Two phases:
-    ///
-    /// 1. **Per-blob compact**: every reachable blob with
-    ///    tombstones or freed leaf slots is rebuilt in place,
-    ///    dropping tombstones and reclaiming bump-area waste. Clean
-    ///    blobs are skipped to avoid needless 512 KB rewrites on hot
-    ///    paths. `compact_times` bumps only for blobs actually
-    ///    rebuilt; `tombstone_leaf_cnt` resets to zero there.
-    /// 2. **Tree-wide merge**: each reachable blob is walked and
-    ///    every mergeable `BlobNode` child is folded back into the
-    ///    parent, then the child blob is queued for deferred
-    ///    deletion via the BM. A heavy-erase workload that leaves
-    ///    children mostly-empty collapses back toward a single root
-    ///    blob.
+    /// Blob-local compaction holds only the shared maintenance side
+    /// plus the candidate blob's latch; clean stale candidates are
+    /// skipped after a shared-latch header check. Merge still uses the
+    /// exclusive maintenance side, but only around the one parent
+    /// being folded/deleted. Range iterators remain best-effort
+    /// snapshots; if the caller needs strict full-iterator
+    /// stability, consume the iterator during an external quiescent
+    /// window.
     ///
     /// Both phases stage their changes via `mark_dirty` /
     /// `mark_for_delete` on the internal `BufferManager`
@@ -1321,92 +1313,118 @@ impl Tree {
     /// next run re-does the work; the W2D protocol keeps the
     /// backend image consistent throughout.
     ///
-    /// Single-pass merge: nested crossings (a mergeable child
-    /// whose own children are themselves merge candidates) aren't
-    /// unfolded recursively. Re-invoke `compact` for another pass
-    /// if the workload has cascaded crossings.
+    /// This is intentionally incremental. Re-invoke `compact` until
+    /// [`Tree::stats`] shows the tombstone / merge backlog has
+    /// settled if you want to force a tree all the way down after a
+    /// heavy churn phase.
     pub fn compact(&self) -> Result<()> {
+        if self.backend.compaction_candidate_count() == 0
+            && self.backend.merge_candidate_count() == 0
+        {
+            self.seed_maintenance_candidates()?;
+        }
+
+        let compact_guids = self
+            .backend
+            .pop_compaction_candidates(ONLINE_COMPACT_BLOB_BUDGET);
+        for guid in compact_guids {
+            self.compact_candidate_blob(guid)?;
+        }
+
+        let merge_guids = self
+            .backend
+            .pop_merge_candidates(ONLINE_MERGE_PARENT_BUDGET);
+        for guid in merge_guids {
+            self.merge_candidate_parent(guid)?;
+        }
+        Ok(())
+    }
+
+    fn seed_maintenance_candidates(&self) -> Result<()> {
+        let _maintenance = self.maintenance_gate.enter_shared();
+        let guids = engine::collect_blob_guids(&self.backend, self.root_guid)?;
+        for guid in guids {
+            let pin = self.backend.pin(guid)?;
+            let guard = pin.read();
+            let frame = BlobFrameRef::wrap(guard.as_slice());
+            let header = frame.header();
+            if engine::blob_needs_compaction(frame) {
+                self.backend.note_compaction_candidate(guid);
+            }
+            if header.num_ext_blobs != 0 {
+                self.backend.note_merge_candidate(guid);
+            }
+        }
+        Ok(())
+    }
+
+    fn compact_candidate_blob(&self, guid: BlobGuid) -> Result<()> {
         use crate::store::buffer_manager::STRUCTURAL_SEQ;
 
-        // Phase 1 — per-blob compact. Keep this pass's reachable
-        // list for phase 2 as well; children added concurrently
-        // during this call are intentionally left for a future
-        // single-pass compact round.
-        let guids = {
-            let _maintenance = self.maintenance_gate.enter_shared();
-            let guids = engine::collect_blob_guids(&self.backend, self.root_guid)?;
-            for guid in &guids {
-                let pin = self.backend.pin(*guid)?;
-                let needs_compaction = {
-                    let guard = pin.read();
-                    engine::blob_needs_compaction(crate::store::BlobFrameRef::wrap(
-                        guard.as_slice(),
-                    ))
-                };
-                if !needs_compaction {
-                    drop(pin);
-                    continue;
-                }
-
-                let _commit = self
-                    .journal
-                    .as_ref()
-                    .map(|_| self.commit_gate.enter_writer());
-                let compacted = {
-                    let mut guard = pin.write();
-                    let still_needs_compaction = {
-                        let frame = guard.frame();
-                        engine::blob_needs_compaction(frame.as_ref())
-                    };
-                    if still_needs_compaction {
-                        engine::compact_blob(&mut guard)?;
-                    }
-                    still_needs_compaction
-                };
-                if compacted {
-                    // Stage the rebuilt image; let `Tree::checkpoint`
-                    // (or the bg checkpointer) push it through under
-                    // W2D. The pin must stay alive until after
-                    // `mark_dirty` so eviction cannot drop the only
-                    // cache image in the gap.
-                    self.backend.mark_dirty(*guid, STRUCTURAL_SEQ);
-                }
-                drop(pin);
-            }
-            guids
-        };
-
-        // Phase 2 — tree-wide merge pass. Walk this pass's reachable
-        // blobs in root-first order; each `try_merge_children`
-        // collapses any direct `BlobNode` child whose blob is small
-        // enough to inline. Snapshot the list first; merges performed
-        // earlier in the iteration delete the merged child blobs,
-        // so later iterations may encounter guids that no longer
-        // exist — skip those rather than re-pinning a missing blob.
-        for guid in guids {
-            let _maintenance = self.maintenance_gate.enter_exclusive();
-            if !self.backend.has_blob(guid)? {
-                continue;
-            }
-            let _commit = self
-                .journal
-                .as_ref()
-                .map(|_| self.commit_gate.enter_writer());
-            let pin = self.backend.pin(guid)?;
-            let merged = {
-                let mut guard = pin.write();
-                let mut frame = guard.frame();
-                engine::try_merge_children(&self.backend, &mut frame, STRUCTURAL_SEQ)?
-            };
-            if merged.merged > 0 {
-                // Keep the parent pin alive until after dirty
-                // publication; otherwise eviction could remove the
-                // updated cache image before checkpoint snapshots it.
-                self.backend.mark_dirty(guid, STRUCTURAL_SEQ);
-                self.backend.note_merges(u64::from(merged.merged));
-            }
-            drop(pin);
+        let _maintenance = self.maintenance_gate.enter_shared();
+        if !self.backend.has_blob(guid)? {
+            return Ok(());
         }
+        let pin = self.backend.pin(guid)?;
+        let needs_compaction = {
+            let guard = pin.read();
+            engine::blob_needs_compaction(BlobFrameRef::wrap(guard.as_slice()))
+        };
+        if !needs_compaction {
+            return Ok(());
+        }
+
+        let _commit = self
+            .journal
+            .as_ref()
+            .map(|_| self.commit_gate.enter_writer());
+        let compacted = {
+            let mut guard = pin.write();
+            let still_needs_compaction = {
+                let frame = guard.frame();
+                engine::blob_needs_compaction(frame.as_ref())
+            };
+            if still_needs_compaction {
+                engine::compact_blob(&mut guard)?;
+            }
+            still_needs_compaction
+        };
+        if compacted {
+            // Keep the pin alive until after dirty publication so
+            // eviction cannot drop the rebuilt cache image before a
+            // checkpoint snapshots it.
+            self.backend.mark_dirty(guid, STRUCTURAL_SEQ);
+        }
+        drop(pin);
+        Ok(())
+    }
+
+    fn merge_candidate_parent(&self, guid: BlobGuid) -> Result<()> {
+        use crate::store::buffer_manager::STRUCTURAL_SEQ;
+
+        let _maintenance = self.maintenance_gate.enter_exclusive();
+        if !self.backend.has_blob(guid)? {
+            return Ok(());
+        }
+        let _commit = self
+            .journal
+            .as_ref()
+            .map(|_| self.commit_gate.enter_writer());
+        let pin = self.backend.pin(guid)?;
+        let (merged, has_children) = {
+            let mut guard = pin.write();
+            let mut frame = guard.frame();
+            let merged = engine::try_merge_children(&self.backend, &mut frame, STRUCTURAL_SEQ)?;
+            (merged, frame.header().num_ext_blobs != 0)
+        };
+        if merged.merged > 0 {
+            self.backend.mark_dirty(guid, STRUCTURAL_SEQ);
+            self.backend.note_merges(u64::from(merged.merged));
+            if has_children {
+                self.backend.note_merge_candidate(guid);
+            }
+        }
+        drop(pin);
         Ok(())
     }
 

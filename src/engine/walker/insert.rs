@@ -10,6 +10,7 @@ use crate::store::{BlobFrame, BlobFrameRef, BufferManager, CachedBlob};
 
 use super::cast;
 use super::lookup::lookup_at;
+use super::migrate::blob_needs_compaction;
 use super::readers::{longest_common, ntype_of, read_leaf_key_ref, read_prefix};
 use super::spillover::{compact_blob, spillover_blob};
 use super::types::{InsertOutcome, InsertReturn, LookupResult};
@@ -191,11 +192,15 @@ fn lock_coupled_insert_in_blob(
         };
         match r {
             Ok(InsertStep::Done(out)) => {
-                {
+                let needs_compaction = {
                     let mut frame = guard.frame();
                     frame.header_mut().root_slot = out.slot_after;
-                }
+                    blob_needs_compaction(frame.as_ref())
+                };
                 drop(guard);
+                if needs_compaction {
+                    bm.note_compaction_candidate(current_guid);
+                }
                 if !is_top_blob {
                     bm.mark_dirty(current_guid, seq);
                 }
@@ -239,6 +244,7 @@ fn lock_coupled_insert_in_blob(
                     spillover_blob(bm, &mut frame, seq)
                         .map_err(|e| e.with_blob_guid(current_guid))?;
                 }
+                bm.note_merge_candidate(current_guid);
                 bm.note_spillover();
                 compact_blob(&mut guard).map_err(|e| e.with_blob_guid(current_guid))?;
                 current_dirty = true;

@@ -99,11 +99,13 @@ v0.3's concurrency cut is implemented in the codebase:
   without self-referential guard plumbing.
 - **Maintenance is separated.** Foreground writers enter only the
   shared side of a narrow atomic `maintenance_gate` while they may
-  cross `BlobNode` boundaries. `compact()` skips clean blobs after
-  a shared-latch header check, runs needed blob-local rewrite work
-  on the shared side under per-blob latches, and `compact()` plus
-  the background merge pass enter the exclusive side only around
-  the parent edge currently being folded/deleted.
+  cross `BlobNode` boundaries. Deletes and leaf-slot churn enqueue
+  blob-local compaction candidates; spillovers enqueue parent-merge
+  candidates. `compact()` cold-seeds only when no hints exist,
+  drains bounded candidate batches, skips clean stale candidates
+  after a shared-latch header check, and `compact()` plus the
+  background merge pass enter the exclusive side only around the
+  parent edge currently being folded/deleted.
   Point reads also take the shared side, but blob-local access
   remains optimistic; ordinary readers and writers still run
   concurrently with each other.
@@ -196,9 +198,10 @@ threads. v0.3 makes the I/O side worth that structure:
 - Implement `BlobNode` inline-prefix divergence split so a bad
   blob boundary can recover into a high-fanout structure.
 - Make merge/rebalance incremental. `compact()` and background
-  merge are now online with respect to foreground writers through
-  the atomic `maintenance_gate`; the remaining large-tree work is policy
-  quality (when to split/merge/rebalance), not basic safety.
+  merge are now candidate-driven and online with respect to
+  foreground writers through the atomic `maintenance_gate`; the
+  remaining large-tree work is policy quality (when to
+  split/merge/rebalance), not basic safety.
 - Add targeted benchmarks for skewed path prefixes, hot
   directories, delete-heavy churn, and working sets larger than
   the buffer pool.

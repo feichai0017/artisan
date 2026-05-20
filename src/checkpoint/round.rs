@@ -5,9 +5,9 @@
 //! ## Sequence
 //!
 //! 0. **Merge pass** (optional, controlled by
-//!    `CheckpointConfig::auto_merge`) — walks every reachable blob
-//!    and folds any mergeable child back into its parent. Merge
-//!    mutations are staged through the same dirty /
+//!    `CheckpointConfig::auto_merge`) — drains queued parent-merge
+//!    candidates and folds mergeable children back into parents.
+//!    Merge mutations are staged through the same dirty /
 //!    pending-delete sets as foreground writes, then flushed by
 //!    this round after the WAL sync.
 //! 1. **Snapshot dirty + pending deletes** under the exclusive
@@ -58,7 +58,7 @@ pub(super) fn run_round(shared: &Arc<Shared>) -> Result<()> {
 
     shared.rounds_attempted.fetch_add(1, Ordering::Relaxed);
 
-    // 0. Optional tree-wide merge pass.
+    // 0. Optional candidate-driven merge pass.
     let merged = if shared.cfg.auto_merge {
         match run_merge_pass(shared) {
             Ok(n) => n,
@@ -378,16 +378,17 @@ pub(super) fn run_round(shared: &Arc<Shared>) -> Result<()> {
     Ok(())
 }
 
-/// Tree-wide merge pass — fold every mergeable `BlobNode` child
-/// back into its parent. Stages the mutations via the unified
-/// `mark_dirty` + `mark_for_delete` protocol so the round's
+/// Candidate-driven merge pass — fold mergeable `BlobNode`
+/// children back into their parents. Stages the mutations via the
+/// unified `mark_dirty` + `mark_for_delete` protocol so the round's
 /// later phases (WAL flush → Flush tasks → Sync → pending
 /// deletes → re-Sync → truncate) handle persistence under W2D.
 /// Takes the exclusive maintenance gate around one parent at a
 /// time so no foreground writer is lock-coupling through the child
-/// edge being folded and queued for delete. The parent list itself
-/// is collected under the shared side; foreground writes may add
-/// new children concurrently, and those are left for a future pass.
+/// edge being folded and queued for delete. Foreground spillovers
+/// enqueue parent blobs. Candidates that inspect only too-large
+/// children are consumed; future spillovers or manual maintenance
+/// seeding will requeue the parent when there is fresh shape debt.
 ///
 /// Returns the cumulative count of children folded.
 ///
@@ -404,10 +405,7 @@ pub(super) fn run_round(shared: &Arc<Shared>) -> Result<()> {
 fn run_merge_pass(shared: &Arc<Shared>) -> Result<u64> {
     use crate::store::buffer_manager::STRUCTURAL_SEQ;
 
-    let parents = {
-        let _maintenance = shared.maintenance_gate.enter_shared();
-        engine::collect_blob_guids(shared.bm.as_ref(), shared.root_guid)?
-    };
+    let parents = shared.bm.pop_merge_candidates(256);
     let mut merged_total = 0u64;
     for guid in parents {
         let _maintenance = shared.maintenance_gate.enter_exclusive();
@@ -419,10 +417,11 @@ fn run_merge_pass(shared: &Arc<Shared>) -> Result<u64> {
             .as_ref()
             .map(|_| shared.commit_gate.enter_writer());
         let pin = shared.bm.pin(guid)?;
-        let stats = {
+        let (stats, has_children) = {
             let mut guard = pin.write();
             let mut frame = guard.frame();
-            engine::try_merge_children(shared.bm.as_ref(), &mut frame, STRUCTURAL_SEQ)?
+            let stats = engine::try_merge_children(shared.bm.as_ref(), &mut frame, STRUCTURAL_SEQ)?;
+            (stats, frame.header().num_ext_blobs != 0)
         };
         if stats.merged > 0 {
             // Keep the parent pin alive until after dirty
@@ -430,6 +429,9 @@ fn run_merge_pass(shared: &Arc<Shared>) -> Result<u64> {
             // cache image before this round snapshots it.
             shared.bm.mark_dirty(guid, STRUCTURAL_SEQ);
             merged_total += u64::from(stats.merged);
+            if has_children {
+                shared.bm.note_merge_candidate(guid);
+            }
         }
         drop(pin);
     }

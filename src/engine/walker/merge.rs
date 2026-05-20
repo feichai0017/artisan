@@ -1,13 +1,13 @@
-//! Tree-wide merge pass — walks a parent blob's structure looking
-//! for `BlobNode` crossings whose child blob is small enough to
-//! fold back inline, and folds them via [`super::merge_blob`].
+//! Parent-local merge pass — walks one parent blob's structure
+//! looking for `BlobNode` crossings whose child blob is small
+//! enough to fold back inline, and folds them via
+//! [`super::merge_blob`].
 //!
-//! Triggered by [`crate::api::Tree::compact`]: after the per-blob
-//! `compact_blob` reduces each blob to its live core, this walker
-//! scans for mergeable `BlobNode` children and inlines them. A
-//! typical churn workload (lots of erases) leaves child blobs
-//! with little data, which this pass collapses back into a single
-//! parent so the BFS shrinks toward one root blob.
+//! Triggered by candidate-driven maintenance in
+//! [`crate::api::Tree::compact`] and checkpoint auto-merge. A
+//! typical churn workload (lots of erases) leaves child blobs with
+//! little data, and each queued parent can collapse its direct
+//! children without forcing a whole-tree merge scan.
 
 use crate::api::errors::{Error, Result};
 use crate::layout::{BlobNode, NodeType, BLOB_MAX_INLINE};

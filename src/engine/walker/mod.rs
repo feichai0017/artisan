@@ -24,12 +24,12 @@
 //!   (spillover) + [`compact_blob`] (in-place repack). Share the
 //!   internal `clone_subtree` machinery.
 //! - `scan` — tree-wide BFS over reachable blobs ([`collect_blob_guids`]).
-//!   Used by [`crate::Tree::stats`] and [`crate::Tree::compact`] to
-//!   fan out across the whole on-disk tree.
-//! - `merge` — tree-wide single-pass walker ([`try_merge_children`])
+//!   Used by [`crate::Tree::stats`] and by `compact` only for cold
+//!   maintenance seeding when no candidate hints exist.
+//! - `merge` — parent-local single-pass walker ([`try_merge_children`])
 //!   that folds every mergeable `BlobNode` child back into its
-//!   parent via [`merge_blob`]. Wired into [`crate::Tree::compact`]
-//!   after the per-blob compaction pass.
+//!   parent via [`merge_blob`]. Maintenance calls it only for
+//!   queued parent candidates.
 
 use std::mem::size_of;
 
@@ -49,7 +49,7 @@ mod writers;
 
 // ---------- public-to-engine surface ----------
 //
-// Only the multi-blob entry points + tree-wide passes are reachable
+// Only the multi-blob entry points + maintenance passes are reachable
 // from outside the walker. Single-blob primitives (`insert`, `erase`,
 // `lookup`, `lookup_at`) and the Outcome types live behind their
 // submodule paths and are only consumed by sibling submodules and

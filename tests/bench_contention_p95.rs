@@ -14,7 +14,7 @@
 //! cargo test --release --test bench_contention_p95 -- --ignored --nocapture
 //! ```
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -25,7 +25,10 @@ use tempfile::tempdir;
 
 const N_WRITERS: usize = 4;
 const WORKLOAD_SECS: u64 = 20;
-/// Manual compact every N writes (one writer thread issues it).
+/// Manual compact every N writes. The compactor observes this
+/// counter directly instead of polling `Tree::stats()`, so the
+/// benchmark isolates maintenance interference rather than a
+/// measurement-side full-tree stats walk.
 const COMPACT_EVERY: u32 = 20_000;
 const PAYLOAD_LEN: usize = 256;
 
@@ -51,6 +54,7 @@ fn put_latency_under_bg_checkpoint_and_compact_interference() {
     );
 
     let stop = Arc::new(AtomicBool::new(false));
+    let total_puts = Arc::new(AtomicU64::new(0));
     // Per-writer histogram (lock-free; merged at the end).
     let payload = vec![b'q'; PAYLOAD_LEN];
 
@@ -59,6 +63,7 @@ fn put_latency_under_bg_checkpoint_and_compact_interference() {
     for writer_id in 0..N_WRITERS {
         let tree = Arc::clone(&tree);
         let stop = Arc::clone(&stop);
+        let total_puts = Arc::clone(&total_puts);
         let payload = payload.clone();
         handles.push(thread::spawn(move || -> Histogram<u64> {
             // 5-significant-digit precision up to 60 s in
@@ -75,6 +80,7 @@ fn put_latency_under_bg_checkpoint_and_compact_interference() {
                 let key = format!("w{writer_id:02}/k{counter:08}");
                 let start = Instant::now();
                 tree.put(key.as_bytes(), &payload).unwrap();
+                total_puts.fetch_add(1, Ordering::Relaxed);
                 // Saturating into the hist's range (clamped at
                 // 60 s, which would be a pathological stall —
                 // record it explicitly rather than panic).
@@ -92,17 +98,16 @@ fn put_latency_under_bg_checkpoint_and_compact_interference() {
     {
         let tree = Arc::clone(&tree);
         let stop = Arc::clone(&stop);
+        let total_puts = Arc::clone(&total_puts);
         handles.push(thread::spawn(move || -> Histogram<u64> {
             // Empty per-thread hist so the join signature matches.
             let empty = Histogram::<u64>::new_with_bounds(1, 60_000_000_000, 3).unwrap();
-            let mut last_compact_at = 0u32;
+            let mut last_compact_at = 0u64;
             while !stop.load(Ordering::Relaxed) {
-                let total_dirty = tree.stats().map(|s| s.bm_dirty_count).unwrap_or(0);
-                // Loose proxy: when the dirty set has grown
-                // since the last compact, kick another one.
-                if total_dirty as u32 >= last_compact_at + COMPACT_EVERY {
+                let puts = total_puts.load(Ordering::Relaxed);
+                if puts >= last_compact_at + u64::from(COMPACT_EVERY) {
                     let _ = tree.compact();
-                    last_compact_at = total_dirty as u32;
+                    last_compact_at = puts;
                 }
                 thread::sleep(Duration::from_millis(100));
             }
