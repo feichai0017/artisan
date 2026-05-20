@@ -120,8 +120,9 @@ v0.3's concurrency cut is implemented in the codebase:
   `flushing` entries until their snapshotted bytes complete
   `write_through`, so eviction cannot drop the cache image in the
   gap between `snapshot_dirty()` and the planner's byte copy.
-  Fresh spillover blobs also insert the cache image and dirty
-  entry under the same dirty-lock interlock, so background eviction
+  Dirty / flushing / pending-delete bookkeeping is sharded by
+  `BlobGuid`, and fresh spillover blobs keep a local `Arc` pin
+  alive until their dirty entry is visible, so background eviction
   cannot observe a new child blob as clean before checkpoint can
   flush it.
 
@@ -151,8 +152,8 @@ Durable group commit is implemented:
 - This keeps the W2D proof intact while removing writer-vs-writer
   serialization from the persistent write hot path. Writers on
   disjoint child blobs now contend on per-blob latches and the
-  dirty-map shard/mutex they actually touch, not a global commit
-  mutex.
+  mutation-bookkeeping shard they actually touch, not a global
+  commit mutex or global dirty mutex.
 
 ### P2 — NVMe-grade checkpoint I/O
 

@@ -359,38 +359,42 @@ cargo test --release --test bench_contention_p95 \
 
 | Metric           | Value         |
 | ---------------- | ------------: |
-| ops              |  12 823 581   |
-| throughput       |   458 850 ops/s |
-| **mean**         |      6.07 µs  |
-| **p50**          |      1.33 µs  |
-| **p95**          |      8.34 µs  |
-| **p99**          |     19.81 µs  |
-| p99.9            |     171.52 µs |
-| max              | 452 460.54 µs |
+| ops              |  11 284 737   |
+| throughput       |   506 660 ops/s |
+| **mean**         |      6.92 µs  |
+| **p50**          |      1.17 µs  |
+| **p95**          |      1.96 µs  |
+| **p99**          |      6.75 µs  |
+| p99.9            |     880.64 µs |
+| max              | 328 990.72 µs |
 
 ### Observations
 
-- **459 k ops/s sustained** with 4 writer threads + a
+- **507 k ops/s sustained** with 4 writer threads + a
   background checkpointer + concurrent `compact()`. Each writer
-  averages ~115 k ops/s on its own.
-- **p50 ≈ 1.3 µs** — most puts hit only the common walker mutate
+  averages ~127 k ops/s on its own.
+- **p50 ≈ 1.2 µs** — most puts hit only the common walker mutate
   + dirty publish + WAL append path with no maintenance
   interference.
-- **p95 ≈ 8.3 µs / p99 ≈ 19.8 µs** — the writer-shared
+- **p95 ≈ 2.0 µs / p99 ≈ 6.8 µs** — the writer-shared
   `CommitGate` and journal-worker group commit removed the old
-  writer-vs-writer commit mutex from the hot path. Versus the
-  pre-group-commit run above this is ~2.7× lower p95 and ~5.5×
-  lower p99 while also raising throughput ~1.7×.
-- **p99.9 ≈ 0.17 ms** with one scheduler-scale max outlier. The
-  steady tail is now dominated by maintenance and OS scheduling,
-  not by a persistent write serialization point.
+  writer-vs-writer commit mutex from the hot path; sharded
+  mutation bookkeeping removes the next dirty-map contention
+  point. Versus the pre-group-commit run above this is ~11.7×
+  lower p95 and ~16.0× lower p99 while also raising throughput
+  ~1.9×.
+- **p99.9 ≈ 0.88 ms** with one scheduler-scale max outlier. The
+  normal tail is now low single-digit microseconds; the extreme
+  tail is dominated by online maintenance and OS scheduling, not
+  by a persistent write serialization point.
 - This run also exercises the dirty-snapshot / eviction interlock:
   checkpoint-owned `flushing` entries stay protected until
-  `write_through` completes, and fresh spillover blobs publish
-  their cache entry + dirty bit under the same interlock. The run
-  finishes without the previous `dirty entry lost cache image`
-  invariant failure.
+  `write_through` completes. Fresh spillover blobs keep a local
+  `Arc` pin alive until their dirty bit is visible, and
+  dirty/flushing/pending-delete bookkeeping is sharded by
+  `BlobGuid`. The run finishes without the previous `dirty entry
+  lost cache image` invariant failure.
 
-The mean-vs-p50 gap (6.1 µs mean vs 1.3 µs p50) reflects that the
+The mean-vs-p50 gap (6.9 µs mean vs 1.2 µs p50) reflects that the
 slow tail is real but bounded — the distribution is not long-tailed
 enough to perturb the median.

@@ -185,12 +185,17 @@ The remaining v0.3 concurrency cleanup is now in place:
   closing the pressure-window where a background sweep could drop
   the only cached image after `snapshot_dirty()` drained the dirty
   map but before the checkpoint planner copied the bytes.
-- Fresh spillover blobs now publish their cache entry and dirty
-  entry under the same dirty-lock interlock used by eviction.
-  This closes the complementary I1 window where a background
-  eviction sweep could see a just-created child blob as clean,
-  remove its cache image, and leave checkpoint with a dirty entry
-  but no bytes to flush.
+- Dirty / flushing / pending-delete bookkeeping is sharded by
+  `BlobGuid` (64 shards). `mark_dirty` and `mark_for_delete` now
+  take one per-guid shard lock instead of one global dirty mutex,
+  which removes the next persistent-write contention point after
+  `CommitGate`.
+- Fresh spillover blobs keep a local `Arc` pin alive until their
+  dirty entry is published. This closes the complementary I1
+  window where a background eviction sweep could see a just-created
+  child blob as clean, remove its cache image, and leave checkpoint
+  with a dirty entry but no bytes to flush, without introducing a
+  mutation-shard / cache-shard lock-order inversion.
 
 ### Performance / Correctness — journal group commit
 

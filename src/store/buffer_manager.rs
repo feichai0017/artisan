@@ -148,24 +148,50 @@ use super::backend::{AlignedBlobBuf, Backend};
 /// the truncate gate already refuses to fire).
 pub const STRUCTURAL_SEQ: u64 = u64::MAX;
 
+const BOOKKEEPING_SHARDS: usize = 64;
+
 #[derive(Default)]
-struct DirtyState {
+struct MutationState {
     /// New dirty entries not yet claimed by a checkpoint round.
     dirty: HashMap<BlobGuid, u64>,
     /// Dirty entries drained by a checkpoint round whose cached
     /// image still has to survive until `write_through` completes.
     flushing: HashMap<BlobGuid, u64>,
+    /// Blobs unlinked from the tree but not yet deleted from the
+    /// backend manifest because WAL/checkpoint ordering still owns
+    /// them.
+    pending_deletes: HashMap<BlobGuid, u64>,
 }
 
-impl DirtyState {
+impl MutationState {
     fn is_protected(&self, guid: &BlobGuid) -> bool {
         self.dirty.contains_key(guid) || self.flushing.contains_key(guid)
     }
 
-    fn remove_all(&mut self, guid: &BlobGuid) {
+    fn is_protected_or_pending(&self, guid: &BlobGuid) -> bool {
+        self.is_protected(guid) || self.pending_deletes.contains_key(guid)
+    }
+
+    fn remove_dirty(&mut self, guid: &BlobGuid) {
         self.dirty.remove(guid);
         self.flushing.remove(guid);
     }
+}
+
+fn bookkeeping_shard_idx(guid: &BlobGuid) -> usize {
+    debug_assert!(BOOKKEEPING_SHARDS.is_power_of_two());
+
+    let mut lo_bytes = [0u8; 8];
+    let mut hi_bytes = [0u8; 8];
+    lo_bytes.copy_from_slice(&guid[0..8]);
+    hi_bytes.copy_from_slice(&guid[8..16]);
+    let lo = u64::from_le_bytes(lo_bytes);
+    let hi = u64::from_le_bytes(hi_bytes);
+    let mut h = lo ^ hi.rotate_left(27);
+    h ^= h >> 33;
+    h = h.wrapping_mul(0xff51_afd7_ed55_8ccd);
+    h ^= h >> 33;
+    (h as usize) & (BOOKKEEPING_SHARDS - 1)
 }
 
 /// LRU-bounded blob cache; see the module docs.
@@ -179,24 +205,14 @@ pub struct BufferManager {
     /// `last_touched` tick give "approximate LRU" without needing
     /// an O(n) front-of-deque touch on every hit.
     cache: DashMap<BlobGuid, Arc<CachedBlob>>,
-    /// Per-blob lowest unflushed WAL seq. An entry exists ⟺ the
-    /// cached image of that blob is newer than the backend image
-    /// (invariant **I1**; see module docs). Drained atomically by
-    /// [`BufferManager::snapshot_dirty`] so checkpoint rounds and
-    /// concurrent writers don't step on each other.
-    dirty: Mutex<DirtyState>,
-    /// Blobs the walker has unlinked from their parent in cache
-    /// but whose backend slot can't be released yet — invariant
-    /// W2D forbids removing them from the manifest before the WAL
-    /// record covering the unlink op is durable. The checkpoint
-    /// round drains this set **after** Sync (data + manifest
-    /// stable) and **before** WAL truncate, so the truncate gate
-    /// can promise "everything in this WAL is either redundant
-    /// with backend or already pending in dirty/pending-delete".
+    /// Per-blob mutation bookkeeping, sharded by `BlobGuid`.
     ///
-    /// `guid -> seq` mirrors `dirty`'s shape: `seq` is the WAL
-    /// seq of the op that unlinked this blob.
-    pending_deletes: Mutex<HashMap<BlobGuid, u64>>,
+    /// Each shard owns the dirty, flushing, and pending-delete
+    /// entries for the same set of blobs. Keeping those three maps
+    /// under one shard lock gives `mark_dirty` / `mark_for_delete`
+    /// one short critical section with no global dirty mutex on the
+    /// persistent write hot path.
+    mutation: [Mutex<MutationState>; BOOKKEEPING_SHARDS],
     /// Monotonic logical clock used by the eviction thread to
     /// classify cache entries as cold. Every `pin` / `get_cached`
     /// stamps the touched entry's `last_touched` with
@@ -402,8 +418,7 @@ impl BufferManager {
             backend,
             capacity: capacity.max(1),
             cache: DashMap::new(),
-            dirty: Mutex::new(DirtyState::default()),
-            pending_deletes: Mutex::new(HashMap::new()),
+            mutation: std::array::from_fn(|_| Mutex::new(MutationState::default())),
             clock: AtomicU64::new(1),
             cache_hits: AtomicU64::new(0),
             cache_misses: AtomicU64::new(0),
@@ -445,14 +460,8 @@ impl BufferManager {
     /// Returns `true` if an entry was actually evicted.
     pub(crate) fn try_evict_cold(&self, guid: BlobGuid) -> bool {
         {
-            let dirty_guard = self.dirty.lock().unwrap();
-            if dirty_guard.is_protected(&guid) {
-                return false;
-            }
-        }
-        {
-            let pending = self.pending_deletes.lock().unwrap();
-            if pending.contains_key(&guid) {
+            let state = self.mutation_shard(guid).lock().unwrap();
+            if state.is_protected_or_pending(&guid) {
                 return false;
             }
         }
@@ -465,13 +474,8 @@ impl BufferManager {
                 if Arc::strong_count(entry) > 1 {
                     return false;
                 }
-                let d = self.dirty.lock().unwrap();
-                if d.is_protected(&guid) {
-                    return false;
-                }
-                drop(d);
-                let pending = self.pending_deletes.lock().unwrap();
-                !pending.contains_key(&guid)
+                let state = self.mutation_shard(guid).lock().unwrap();
+                !state.is_protected_or_pending(&guid)
             })
             .is_some()
     }
@@ -609,8 +613,16 @@ impl BufferManager {
         Some(arc)
     }
 
+    fn mutation_shard(&self, guid: BlobGuid) -> &Mutex<MutationState> {
+        &self.mutation[bookkeeping_shard_idx(&guid)]
+    }
+
     fn is_pending_delete(&self, guid: BlobGuid) -> bool {
-        self.pending_deletes.lock().unwrap().contains_key(&guid)
+        self.mutation_shard(guid)
+            .lock()
+            .unwrap()
+            .pending_deletes
+            .contains_key(&guid)
     }
 
     fn pending_delete_not_found(guid: BlobGuid) -> Error {
@@ -699,13 +711,15 @@ impl BufferManager {
         // would serialise reads against any concurrent writer.
         // Snapshotting and then re-validating under the per-shard
         // remove_if guard keeps the hot path lock-free.
-        let dirty_snap: std::collections::HashSet<BlobGuid> = {
-            let d = self.dirty.lock().unwrap();
-            d.dirty.keys().chain(d.flushing.keys()).copied().collect()
-        };
-        let pending_snap: std::collections::HashSet<BlobGuid> = {
-            let p = self.pending_deletes.lock().unwrap();
-            p.keys().copied().collect()
+        let protected_snap: std::collections::HashSet<BlobGuid> = {
+            let mut out = std::collections::HashSet::new();
+            for shard in &self.mutation {
+                let state = shard.lock().unwrap();
+                out.extend(state.dirty.keys().copied());
+                out.extend(state.flushing.keys().copied());
+                out.extend(state.pending_deletes.keys().copied());
+            }
+            out
         };
 
         let mut victim: Option<(BlobGuid, u64)> = None;
@@ -714,7 +728,7 @@ impl BufferManager {
                 continue;
             }
             let guid = *kv.key();
-            if dirty_snap.contains(&guid) || pending_snap.contains(&guid) {
+            if protected_snap.contains(&guid) {
                 continue;
             }
             let tick = kv.value().last_touched.load(Ordering::Relaxed);
@@ -737,16 +751,8 @@ impl BufferManager {
                     if Arc::strong_count(e) > 1 {
                         return false;
                     }
-                    let d = self.dirty.lock().unwrap();
-                    if d.is_protected(&guid) {
-                        return false;
-                    }
-                    drop(d);
-                    let p = self.pending_deletes.lock().unwrap();
-                    if p.contains_key(&guid) {
-                        return false;
-                    }
-                    true
+                    let state = self.mutation_shard(guid).lock().unwrap();
+                    !state.is_protected_or_pending(&guid)
                 })
                 .is_some();
         }
@@ -760,7 +766,10 @@ impl BufferManager {
     /// backend.
     fn evict_from_cache(&self, guid: BlobGuid) {
         self.cache.remove(&guid);
-        self.dirty.lock().unwrap().remove_all(&guid);
+        self.mutation_shard(guid)
+            .lock()
+            .unwrap()
+            .remove_dirty(&guid);
     }
 
     /// Pin a blob in cache and return an `Arc<CachedBlob>` over it.
@@ -867,36 +876,45 @@ impl BufferManager {
     /// checkpointer-side drains the map via
     /// [`Self::snapshot_dirty`].
     pub fn mark_dirty(&self, guid: BlobGuid, txn_id: u64) {
-        if self.is_pending_delete(guid) {
+        let mut state = self.mutation_shard(guid).lock().unwrap();
+        if state.pending_deletes.contains_key(&guid) {
             return;
         }
-        let mut d = self.dirty.lock().unwrap();
-        d.dirty
+        state
+            .dirty
             .entry(guid)
             .and_modify(|cur| *cur = (*cur).min(txn_id))
             .or_insert(txn_id);
     }
 
-    /// Atomically take the current dirty map, leaving an empty one
-    /// behind for concurrent writers.
+    /// Drain the current dirty entries from every bookkeeping shard,
+    /// leaving empty per-shard dirty maps behind for concurrent
+    /// writers.
     ///
     /// Returned map maps `guid -> lowest unflushed txn_id`. The
     /// caller (background checkpointer) is responsible for flushing
     /// each blob and either accepting the drain (on success) or
     /// restoring failed entries via [`Self::restore_dirty`].
+    /// Persistent checkpoint rounds call this while holding the
+    /// exclusive side of `CommitGate`, so the multi-shard drain is
+    /// tree-wide stable for WAL trimming.
     #[must_use]
     pub fn snapshot_dirty(&self) -> HashMap<BlobGuid, u64> {
-        let pending = self.pending_deletes.lock().unwrap();
-        let mut d = self.dirty.lock().unwrap();
-        let mut snap = std::mem::take(&mut d.dirty);
-        snap.retain(|guid, _| !pending.contains_key(guid));
-        for (guid, txn_id) in &snap {
-            d.flushing
-                .entry(*guid)
-                .and_modify(|cur| *cur = (*cur).min(*txn_id))
-                .or_insert(*txn_id);
+        let mut out = HashMap::new();
+        for shard in &self.mutation {
+            let mut state = shard.lock().unwrap();
+            let mut snap = std::mem::take(&mut state.dirty);
+            snap.retain(|guid, _| !state.pending_deletes.contains_key(guid));
+            for (guid, txn_id) in snap {
+                state
+                    .flushing
+                    .entry(guid)
+                    .and_modify(|cur| *cur = (*cur).min(txn_id))
+                    .or_insert(txn_id);
+                out.insert(guid, txn_id);
+            }
         }
-        snap
+        out
     }
 
     /// Merge `entries` back into the dirty map, preserving the
@@ -911,17 +929,17 @@ impl BufferManager {
         if entries.is_empty() {
             return;
         }
-        let pending = self.pending_deletes.lock().unwrap();
-        let mut d = self.dirty.lock().unwrap();
         for (guid, t) in entries {
-            if pending.contains_key(&guid) {
-                d.flushing.remove(&guid);
+            let mut state = self.mutation_shard(guid).lock().unwrap();
+            if state.pending_deletes.contains_key(&guid) {
+                state.flushing.remove(&guid);
                 continue;
             }
-            if matches!(d.flushing.get(&guid), Some(cur) if *cur == t) {
-                d.flushing.remove(&guid);
+            if matches!(state.flushing.get(&guid), Some(cur) if *cur == t) {
+                state.flushing.remove(&guid);
             }
-            d.dirty
+            state
+                .dirty
                 .entry(guid)
                 .and_modify(|cur| *cur = (*cur).min(t))
                 .or_insert(t);
@@ -932,7 +950,10 @@ impl BufferManager {
     /// metrics + checkpoint-policy thresholds.
     #[must_use]
     pub fn dirty_count(&self) -> usize {
-        self.dirty.lock().unwrap().dirty.len()
+        self.mutation
+            .iter()
+            .map(|shard| shard.lock().unwrap().dirty.len())
+            .sum()
     }
 
     // ---------- deferred delete (W2D for erase) ----------
@@ -959,23 +980,30 @@ impl BufferManager {
     /// be truncated.
     pub fn mark_for_delete(&self, guid: BlobGuid, txn_id: u64) {
         {
-            let mut p = self.pending_deletes.lock().unwrap();
-            p.entry(guid)
+            let mut state = self.mutation_shard(guid).lock().unwrap();
+            state
+                .pending_deletes
+                .entry(guid)
                 .and_modify(|cur| *cur = (*cur).min(txn_id))
                 .or_insert(txn_id);
+            state.remove_dirty(&guid);
         }
         self.cache.remove(&guid);
-        self.dirty.lock().unwrap().remove_all(&guid);
     }
 
-    /// Atomically take the current pending-delete map, leaving an
-    /// empty one behind. Caller (checkpoint round / manual
-    /// `Tree::checkpoint`) is responsible for executing each
-    /// `backend.delete_blob` or restoring on failure.
+    /// Drain the current pending-delete entries from every
+    /// bookkeeping shard, leaving empty per-shard maps behind.
+    /// Caller (checkpoint round / manual `Tree::checkpoint`) is
+    /// responsible for executing each `backend.delete_blob` or
+    /// restoring on failure.
     #[must_use]
     pub fn snapshot_pending_deletes(&self) -> HashMap<BlobGuid, u64> {
-        let mut p = self.pending_deletes.lock().unwrap();
-        std::mem::take(&mut *p)
+        let mut out = HashMap::new();
+        for shard in &self.mutation {
+            let mut state = shard.lock().unwrap();
+            out.extend(std::mem::take(&mut state.pending_deletes));
+        }
+        out
     }
 
     /// Merge `entries` back into the pending-delete map, keeping
@@ -984,9 +1012,11 @@ impl BufferManager {
         if entries.is_empty() {
             return;
         }
-        let mut p = self.pending_deletes.lock().unwrap();
         for (g, t) in entries {
-            p.entry(g)
+            let mut state = self.mutation_shard(g).lock().unwrap();
+            state
+                .pending_deletes
+                .entry(g)
                 .and_modify(|cur| *cur = (*cur).min(t))
                 .or_insert(t);
         }
@@ -997,7 +1027,10 @@ impl BufferManager {
     /// "WAL records are all redundant" invariant.
     #[must_use]
     pub fn pending_delete_count(&self) -> usize {
-        self.pending_deletes.lock().unwrap().len()
+        self.mutation
+            .iter()
+            .map(|shard| shard.lock().unwrap().pending_deletes.len())
+            .sum()
     }
 
     /// Execute a queued deletion against the inner backend.
@@ -1050,9 +1083,9 @@ impl BufferManager {
         expected_seq: u64,
     ) -> Result<()> {
         self.backend.write_blob(guid, bytes)?;
-        let mut d = self.dirty.lock().unwrap();
+        let mut state = self.mutation_shard(guid).lock().unwrap();
         if expected_seq != STRUCTURAL_SEQ {
-            if let std::collections::hash_map::Entry::Occupied(e) = d.dirty.entry(guid) {
+            if let std::collections::hash_map::Entry::Occupied(e) = state.dirty.entry(guid) {
                 // Only retire the entry when no racing writer has
                 // bumped it. `mark_dirty` keeps the **minimum**
                 // unflushed seq, so a survivor here has a seq newer
@@ -1062,8 +1095,8 @@ impl BufferManager {
                 }
             }
         }
-        if matches!(d.flushing.get(&guid), Some(seq) if *seq == expected_seq) {
-            d.flushing.remove(&guid);
+        if matches!(state.flushing.get(&guid), Some(seq) if *seq == expected_seq) {
+            state.flushing.remove(&guid);
         }
         Ok(())
     }
@@ -1100,22 +1133,22 @@ impl BufferManager {
         let tick = self.clock.fetch_add(1, Ordering::Relaxed);
         let entry = Arc::new(CachedBlob::new(bytes));
         entry.last_touched.store(tick, Ordering::Relaxed);
-        let mut d = self.dirty.lock().unwrap();
         // Defensive overwrite: a fresh GUID shouldn't collide, but
         // if it does we want the newest bytes to win (the dirty
         // entry below will also keep the lowest seq across both).
         //
-        // Keep cache insertion and dirty publication under the
-        // same dirty lock. The eviction thread consults this lock
-        // before removing cold blobs; without this interlock it can
-        // see the fresh cache entry as clean and drop it in the
-        // small window before the dirty entry is inserted, leaving
-        // checkpoint with "dirty but no cache image" (I1).
-        self.cache.insert(guid, entry);
-        d.dirty
+        // Keep a local Arc clone until after dirty publication.
+        // Eviction's remove_if requires `strong_count == 1`, so a
+        // background sweep cannot drop this fresh cache entry in
+        // the small window before the dirty bit is visible.
+        self.cache.insert(guid, Arc::clone(&entry));
+        let mut state = self.mutation_shard(guid).lock().unwrap();
+        state
+            .dirty
             .entry(guid)
             .and_modify(|cur| *cur = (*cur).min(seq))
             .or_insert(seq);
+        drop(entry);
     }
 }
 
@@ -1145,7 +1178,10 @@ impl Backend for BufferManager {
         // Backend now holds these exact bytes; any pending dirty
         // entry for this blob is satisfied. Subsequent writes via
         // the pin/write-guard path will re-mark it.
-        self.dirty.lock().unwrap().remove_all(&guid);
+        self.mutation_shard(guid)
+            .lock()
+            .unwrap()
+            .remove_dirty(&guid);
         Ok(())
     }
 
@@ -1455,6 +1491,38 @@ mod tests {
         assert_eq!(bm.dirty_count(), 1);
         let next = bm.snapshot_dirty();
         assert_eq!(next[&[0x03; 16]], 99);
+    }
+
+    #[test]
+    fn snapshot_dirty_drains_every_bookkeeping_shard() {
+        let bm = BufferManager::new(Arc::new(MemoryBackend::new()), 4);
+        let mut guids: [Option<BlobGuid>; BOOKKEEPING_SHARDS] = [None; BOOKKEEPING_SHARDS];
+
+        for i in 0..20_000u64 {
+            let mut guid = [0u8; 16];
+            guid[0..8].copy_from_slice(&i.to_le_bytes());
+            guid[8..16].copy_from_slice(&i.wrapping_mul(0x9E37_79B9_7F4A_7C15).to_le_bytes());
+            let shard = bookkeeping_shard_idx(&guid);
+            guids[shard].get_or_insert(guid);
+            if guids.iter().all(Option::is_some) {
+                break;
+            }
+        }
+
+        assert!(
+            guids.iter().all(Option::is_some),
+            "test generator should hit every bookkeeping shard"
+        );
+        for (shard, guid) in guids.iter().enumerate() {
+            bm.mark_dirty(guid.expect("filled"), shard as u64 + 1);
+        }
+
+        let snap = bm.snapshot_dirty();
+        assert_eq!(snap.len(), BOOKKEEPING_SHARDS);
+        assert_eq!(bm.dirty_count(), 0);
+        for (shard, guid) in guids.iter().enumerate() {
+            assert_eq!(snap[&guid.expect("filled")], shard as u64 + 1);
+        }
     }
 
     #[test]
