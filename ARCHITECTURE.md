@@ -95,12 +95,15 @@ updates where size doesn't change.
 Three primitives keep multi-blob trees healthy.
 
 **`splitBlob` (spillover)** runs in-band when `insert_at` returns
-`AllocError::OutOfSpace`. It picks the largest non-`Blob` subtree
-under the current blob's first branching node, deep-clones it
-into a fresh blob via `make_blob_from_node`, stages the new blob
-in the buffer manager's dirty set, frees the source slots, and
-installs a `BlobNode` crossing in the parent. The walker then
-retries the insert; the descent now follows the new BlobNode.
+`AllocError::OutOfSpace`. The v0.3 picker is occupancy-aware: it
+skips existing `BlobNode` crossings, descends into overfull
+path-shaped branches, and chooses a subtree near the target child
+fill band instead of blindly peeling off the largest direct child.
+The selected subtree is deep-cloned into a fresh blob via
+`make_blob_from_node`, staged in the buffer manager's dirty set,
+removed from the source blob, and replaced by a `BlobNode`
+crossing. The walker then retries the insert; the descent now
+follows the new child blob's `header.root_slot`.
 
 To keep spillover from itself OOM'ing, `alloc_node` /
 `alloc_extent` (non-`Blob`) refuse to consume the last 128 bytes
@@ -133,12 +136,15 @@ subtree gets inlined back into its parent at the `BlobNode` slot
 then the child blob is deleted. Guarded by `is_mergeable`:
 combined space + slots fit, no nested crossings, no tombstones.
 
-`Tree::compact` enters the tree-wide `maintenance_gate` in
-exclusive mode, walks every reachable blob, runs `compact_blob`
-per blob, then folds every direct-mergeable `BlobNode` child via
-a single-pass merge sweep. Parents do not store child entry
-slots; after a child compacts, its own `header.root_slot` remains
-the only cross-blob entry token.
+`Tree::compact` is online and candidate-driven. Foreground churn
+queues blob-local compaction candidates and parent-merge
+candidates; a cold manual call seeds those queues only when no
+hints exist. Blob-local compaction runs on the shared side of the
+tree-wide `maintenance_gate` under that blob's latch. Parent
+merge/delete takes the exclusive side only around the one edge
+being folded. Parents do not store child entry slots; after a
+child compacts, its own `header.root_slot` remains the only
+cross-blob entry token.
 
 ## 5. Concurrency
 
@@ -162,35 +168,27 @@ release. Optimistic readers snapshot version → walk → revalidate;
 on a torn read the lookup restarts from the root (the parent's
 BlobNode may have moved too, so re-entry has to be the tree root).
 
-### Writer synchronisation — `wal.lock` is the per-op barrier
+### Writer synchronisation — per-blob latches + publish gates
 
-`Tree::put` / `Tree::delete` for persistent trees take
-`wal.lock()` (the `Mutex<WalWriter>`) **once** at the top and
-hold it across:
+`Tree::put` / `Tree::delete` / `Tree::txn` enter the shared side
+of `maintenance_gate` while they may cross `BlobNode` boundaries.
+That prevents a maintenance merge from deleting a child after a
+foreground walker has observed the parent edge but before it pins
+the child. Blob-local conflicts are handled by the per-blob
+`HybridLatch`: disjoint child blobs can mutate concurrently.
 
-1. Walker descent (including all cross-blob hops, spillover, and
-   compact retries — these take the per-blob `HybridLatch`
-   exclusive as needed).
-2. `bm.mark_dirty(root_guid, seq)` (plus any
-   `mark_dirty(child_guid, seq)` / `mark_for_delete(...)` the
-   walker issued internally).
-3. `wal.append_*` for the op's record.
-4. Optional `wal.flush()` if `wal_sync_on_commit` is set.
+Persistent writers also enter the writer side of `CommitGate`
+while they mutate cached blobs, publish dirty/pending-delete
+state, and submit an already-encoded WAL record to the journal
+worker. The checkpoint path takes the checkpoint side of the same
+gate while draining dirty state, flushing the journal, and cloning
+bytes. This is the W2D boundary: any backend image written by a
+checkpoint has a WAL record admitted and flushed before the bytes
+are copied for write-through.
 
-The wal-lock-around-the-whole-op shape is **load-bearing**: any
-dirty / pending-delete entry visible to a checkpoint round has
-its corresponding WAL record already buffered, because both
-`Tree::checkpoint` and the bg round snapshot under the same
-`wal.lock`. This is the W2D-strict invariant: every backend
-mutation is preceded by a durable WAL record describing it.
-
-Concurrent persistent writers still serialise on `wal.lock`.
-That's the current barrier, not the end state. Cross-blob walker
-guards are already lock-coupled: a writer reads the parent
-`BlobNode`, pins and latches the child, then releases the parent
-before mutating below that boundary. The next remaining write
-path choke point is the journal side: a worker / group-commit
-pipeline should replace the full-op WAL mutex.
+The journal worker owns the `WalWriter`. Durable callers
+(`wal_sync_on_commit=true`) wait outside `CommitGate`; requests
+arriving in the short group window share one `sync_data`.
 
 `Tree::rename` takes a separate `Mutex<()>` `rename_lock` around
 its multi-step `lookup → erase → insert` so other renames see it
@@ -200,8 +198,9 @@ atomically. `put` / `delete` / `get` never take `rename_lock`.
 
 ### WAL — physiological log of TxnOps
 
-Mutations emit a `TxnOp` to an append-only `journal.wal` file.
-Eleven variants today: `Insert`, `Erase`, `Split`, `Merge`,
+Mutations emit encoded `TxnOp` records to an append-only
+`journal.wal` file via the journal worker. Eleven variants today:
+`Insert`, `Erase`, `Split`, `Merge`,
 `Compact`, `RenameObject`, `Rename`, `NewTree`, `RmTree`,
 `MemMarker`, `Batch`. Each record is
 
@@ -211,8 +210,8 @@ MAGIC | LEN | SEQ | TY | BODY | CRC32
 
 with hardware-accelerated CRC32 (`crc32fast`, dispatching to
 PCLMULQDQ on x86_64 + ARM-CRC32 on AArch64). The writer's pending
-buffer auto-drains to the OS page cache at 64 KB; explicit
-`wal.flush()` is the `sync_data` durability boundary.
+buffer auto-drains to the OS page cache at 64 KB. `Journal::flush`
+and durable group-commit batches are the `sync_data` boundaries.
 
 Replay walks the journal forward, validating CRC + magic +
 variant tag on each record. Torn tails (mid-write power loss)
@@ -261,14 +260,16 @@ Both `Tree::checkpoint` (synchronous, caller-driven) and the
 background `Checkpointer` round follow the same seven-phase
 protocol, strictly ordered around the W2D invariant:
 
-1. **Snapshot + WAL flush** under `wal.lock`. Drain live dirty
-   entries into the checkpoint snapshot, move them into the
-   in-flight `flushing` protection set, drain pending deletes,
-   then `wal.flush()`. Flush failure restores both snapshots.
-2. **Per-blob write-through** with CAS-on-seq. Successful writes
-   release the matching `flushing` protection; racing writers'
-   fresh dirty entries survive for the next round. Failures are
-   restored to live dirty.
+1. **Snapshot + journal flush** under `CommitGate` checkpoint
+   mode. Drain live dirty entries into the checkpoint snapshot,
+   move them into the in-flight `flushing` protection set, drain
+   pending deletes, force the journal durable, and clone the
+   snapshotted blob bytes before releasing the gate. Flush failure
+   restores both snapshots.
+2. **Batched per-blob write-through** with CAS-on-seq.
+   Successful writes release the matching `flushing` protection;
+   racing writers' fresh dirty entries survive for the next round.
+   Failures are restored to live dirty.
 3. **Pre-delete sync** — `backend.flush` (data file fdatasync +
    manifest persist) so the writes from phase 2 are stable.
    Failure restores `pending`.
@@ -287,9 +288,10 @@ protocol, strictly ordered around the W2D invariant:
    restored failure keeps the WAL alive until a future round.
 
 The background checkpointer is 3 threads: a planner running the
-seven phases, a dedicated I/O worker processing `IoTask::Flush`
-+ `IoTask::Sync` from a bounded `crossbeam-channel` queue, and a
-cold-blob eviction sweep on the same `clock_tick` mechanism.
+seven phases, a dedicated I/O worker processing
+`IoTask::FlushBatchAndSync` + `IoTask::Sync` from a bounded
+`crossbeam-channel` queue, and a cold-blob eviction sweep on the
+same `clock_tick` mechanism.
 `Drop` joins the planner and runs one final synchronous round on
 the calling thread so dirty state between the last bg round and
 shutdown doesn't get lost.
@@ -327,11 +329,16 @@ pause writes externally.
 
 ```rust
 pub trait Backend: Send + Sync {
+    fn alloc_blob_buf_zeroed(&self) -> AlignedBlobBuf;
+    fn alloc_blob_buf_uninit(&self) -> AlignedBlobBuf;
     fn read_blob(&self, guid: BlobGuid, dst: &mut AlignedBlobBuf) -> Result<()>;
     fn write_blob(&self, guid: BlobGuid, src: &AlignedBlobBuf) -> Result<()>;
+    fn write_blobs(&self, writes: &[(BlobGuid, &AlignedBlobBuf)]) -> Result<()>;
+    fn write_blobs_with_data_sync(&self, writes: &[(BlobGuid, &AlignedBlobBuf)]) -> Result<()>;
     fn delete_blob(&self, guid: BlobGuid) -> Result<()>;
     fn list_blobs(&self) -> Result<Vec<BlobGuid>>;
     fn flush(&self) -> Result<()>;
+    fn needs_flush(&self) -> bool;
     fn has_blob(&self, guid: BlobGuid) -> Result<bool>;
 }
 ```
@@ -347,13 +354,14 @@ Implementations:
   AlignedBlobBuf>>`. For tests, micro-benches, and ephemeral
   workloads.
 - **`PersistentBackend`** — single packed `blobs.dat` (blob N at
-  byte offset `N × PAGE_SIZE`) + atomic-rename `manifest.bin`.
-  Opens with `O_DIRECT` on Linux, `F_NOCACHE` (`fcntl`) on macOS.
+  byte offset `N × PAGE_SIZE`) plus `manifest.bin` snapshot and
+  append-only `manifest.log` deltas. Opens with `O_DIRECT` on
+  Linux, `F_NOCACHE` (`fcntl`) on macOS.
 - **`io_uring` fast path** (`cfg(target_os = "linux") + feature
-  = "io-uring"`) — `PersistentBackend` routes reads / writes
-  through a per-backend `IoUring` (depth 8) instead of `pread` /
-  `pwrite`. Non-Linux builds with the feature flag still get the
-  syscall path.
+  = "io-uring"`) — `PersistentBackend` routes reads, batched
+  writes, and data-file fsync through a per-backend ring with a
+  fixed file and a bounded registered-buffer pool. Non-Linux builds
+  with the feature flag still get the syscall path.
 
 `Backend` is part of the public API surface so users can plug in
 custom storage; everything else (`BufferManager`, `BlobFrame`,
@@ -365,7 +373,11 @@ the walker guards) is `pub(crate)`.
 
 - Operations on different blobs run truly in parallel.
 - Operations on the same blob serialise at that blob's
-  `HybridLatch` (and at `wal.lock` for the WAL-append window).
+  `HybridLatch`.
+- Persistent writers share the `CommitGate` publish window only
+  while dirty state and journal submission are made visible to
+  checkpoint. Durable fsync waiting is handled by the journal
+  worker outside that gate.
 - Reads take optimistic latches first; only escalate to shared /
   exclusive when needed.
 
@@ -380,7 +392,7 @@ only when `CheckpointConfig::enabled = true`.
 |---|---|
 | Crash mid-write | WAL replay restores the tree to the last durable record. Uncommitted partial writes drop. |
 | WAL torn tail | Replay yields every complete record before the chop, reports the byte offset where it stopped. Real mid-file corruption surfaces as `Error::ReplaySanityFailed`. |
-| Partial `backend.flush` | Manifest rewrite is atomic-rename — old manifest stays intact if the rename doesn't complete. Data file writes are O_DIRECT aligned (atomic at 4 KB on NVMe). |
+| Partial `backend.flush` | Manifest deltas are appended and fsync'd before becoming the recovery contract; full manifest snapshots use tmp+rename. Data file writes are O_DIRECT aligned (atomic at 4 KB on NVMe). |
 | Out of disk space | Backend write errors propagate as `Error::BackendIo`; the dirty entry stays in BM for retry, no state corruption. |
 | OOM in buffer pool | Clock-tick eviction reclaims cold blobs; pinned blobs are skipped until released. |
 | Checkpoint mid-failure | Each phase restores any drained state on error return so the next round retries cleanly (see §6 phase 1-7). |

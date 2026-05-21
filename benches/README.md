@@ -47,19 +47,6 @@ keys. The 500 k tier (~48 MB payload) already exceeds the
 default 32 MB buffer pool; the 2 M tier is the large-tree
 pressure case used to judge path-put scalability.
 
-The second public executable benchmark is **persistent cold I/O**
-(`cargo bench --bench cold_io`). It closes each engine after
-preload, forces its checkpoint/flush boundary, drops file cache on
-Linux via `posix_fadvise(POSIX_FADV_DONTNEED)`, reopens, and then
-times random `cold_get` and same-key `cold_put`. Use this for
-`io_uring` / O_DIRECT / page-cache fairness questions; do not use
-the hot `*_persist_*` Criterion groups to make cold-I/O claims.
-
-Internal one-off tuning probes live under `tools/bench/probes/`.
-They are not Cargo targets and are not part of the public
-benchmark surface. Keep release claims in this directory focused
-on Holt vs RocksDB vs SQLite workload comparisons.
-
 ## Running
 
 ```sh
@@ -82,18 +69,9 @@ cargo bench --bench main -- _list
 cargo bench --bench main -- _create_delete
 cargo bench --bench main -- _rename
 cargo bench --bench main -- _metadata_mix
-
-# Persistent cold-I/O comparator:
-cargo bench --features io-uring --bench cold_io
-
-# Short persistent cold-I/O smoke:
-HOLT_COLD_IO_KEYS=20000 \
-HOLT_COLD_IO_OPS=2000 \
-cargo bench --features io-uring --bench cold_io
 ```
 
-HTML criterion reports land in `target/criterion/`. The
-`cold_io` benchmark prints its comparison table to stdout.
+HTML criterion reports land in `target/criterion/`.
 
 ## Methodology — apples-to-apples
 
@@ -135,26 +113,6 @@ Shared settings: 20 000 unique keys preloaded; bench iterates a
 seeded permutation of that set; `cargo bench` builds with
 `lto="thin"`, `codegen-units=1`, `opt-level=3`; single-threaded.
 
-### Persistent cold-I/O mode (`cargo bench --bench cold_io`)
-
-All three engines are preloaded, forced through their flush/checkpoint
-boundary, closed, cache-dropped, and reopened before timing. On
-Linux the cache drop is best-effort `sync_all` +
-`posix_fadvise(POSIX_FADV_DONTNEED)` on every file under the temp
-directory; on other platforms the probe reports `sync_all only`.
-
-This mode answers a different question from hot persistent:
-
-- `cold_get` includes the cost of faulting storage pages back into
-  each engine after reopen.
-- `cold_put` includes any read-before-write path needed to locate
-  and update an existing key from a cold reopened state.
-- It is the right place to evaluate `io_uring`, O_DIRECT, page-cache
-  effects, and buffer-pool sizing.
-
-Do not compare hot persistent numbers against cold-I/O numbers in
-one table; they exercise different parts of the storage stack.
-
 ### Metadata-native groups
 
 `*_create_delete`, `*_rename`, and `*_metadata_mix` currently run
@@ -185,47 +143,48 @@ Pick the engine that matches your **key shape**. holt is for
 hierarchical, prefix-rich keys; if your keys are random bytes
 (hashes, UUIDs without a path prefix), reach for RocksDB / SQLite.
 
-### Sample numbers — Apple M-series, `cargo bench --quick`
+### Sample numbers — Linux v0.3 release run
 
-These are rough `--quick` numbers for orientation; **full-suite
-comparison results — including the scale curve — live in
-[`RESULTS.md`](RESULTS.md)**, which is what to quote. Either way,
-re-run on your hardware before quoting; the **relative ordering**
-is what's load-bearing.
+These are from the v0.3 Linux release run (`c2-standard-8`,
+Rust 1.95.0, `--features io-uring`). **Full-suite comparison
+results, including the 2 M scale curve, live in
+[`RESULTS.md`](RESULTS.md)**. Re-run on your hardware before
+quoting absolute numbers; the relative ordering is the
+load-bearing observation.
 
 **Point lookup (memory mode), N=20 000:**
 
 | Scenario | holt | RocksDB | SQLite | holt vs best other |
 |---|---:|---:|---:|---:|
-| `kv_get` (random key) | ~170 ns | ~680 ns | ~570 ns | **~3.4× faster** |
-| `objstore_get` (path) | ~250 ns | ~700 ns | ~620 ns | **~2.5× faster** |
-| `fs_get` (path) | ~240 ns | ~700 ns | ~630 ns | **~2.6× faster** |
+| `kv_get` (random key) | 272 ns | 749 ns | 920 ns | **2.8× faster** |
+| `objstore_get` (path) | 310 ns | 691 ns | 892 ns | **2.2× faster** |
+| `fs_get` (path) | 374 ns | 700 ns | 885 ns | **1.9× faster** |
 
 **Range scan (memory mode), `take(100)` under an anchored prefix:**
 
 | Scenario | holt | RocksDB | SQLite | holt vs best other |
 |---|---|---|---|---|
-| `objstore_list` (`bucket-05/`, ~625 leaves) | ~10.7 µs | ~17.7 µs | ~13.2 µs | **~1.23× faster** |
-| `fs_list` (`/usr/local/share/category-5/`, ~1250 leaves) | ~10.7 µs | ~18.9 µs | ~13.4 µs | **~1.25× faster** |
+| `objstore_list` (`bucket-05/`, ~625 leaves) | 21.0 µs | 23.8 µs | 32.9 µs | **1.1× faster** |
+| `fs_list` (`/usr/local/share/category-5/`, ~1250 leaves) | 21.8 µs | 24.0 µs | 32.5 µs | **1.1× faster** |
 
 **S3-style delim rollup (memory mode), `take(8)` distinct
 `CommonPrefix` entries:**
 
 | Scenario | holt | RocksDB | SQLite | holt vs best other |
 |---|---|---|---|---|
-| `objstore_list_dir` (8 of 32 buckets) | **~2.5 µs** | ~623 µs | ~440 µs | **~177× faster** |
-| `fs_list_dir` (8 of 16 dirs) | **~2.85 µs** | ~1.31 ms | ~928 µs | **~326× faster** |
+| `objstore_list_dir` (8 of 32 buckets) | **4.2 µs** | 638 µs | 584 µs | **139× faster** |
+| `fs_list_dir` (8 of 16 dirs) | **4.9 µs** | 1.316 ms | 1.197 ms | **244× faster** |
 
 **Metadata-native operation mix (memory mode, quick smoke):**
 
 | Scenario | holt | RocksDB | SQLite | holt vs best other |
 |---|---:|---:|---:|---:|
-| `objstore_create_delete` | ~211 ns | ~1.06 µs | ~2.84 µs | **~5.0× faster** |
-| `objstore_rename` | ~1.12 µs | ~4.45 µs | ~11.41 µs | **~4.0× faster** |
-| `objstore_metadata_mix` | ~1.44 µs | ~70.39 µs | ~49.05 µs | **~34× faster** |
-| `fs_create_delete` | ~406 ns | ~1.15 µs | ~2.86 µs | **~2.8× faster** |
-| `fs_rename` | ~1.54 µs | ~4.58 µs | ~11.34 µs | **~3.0× faster** |
-| `fs_metadata_mix` | ~1.48 µs | ~136.84 µs | ~99.17 µs | **~67× faster** |
+| `objstore_create_delete` | 473 ns | 1.25 µs | 5.48 µs | **2.6× faster** |
+| `objstore_rename` | 1.96 µs | 4.67 µs | 24.87 µs | **2.4× faster** |
+| `objstore_metadata_mix` | 2.25 µs | 98.06 µs | 66.39 µs | **29× faster** |
+| `fs_create_delete` | 780 ns | 1.26 µs | 5.50 µs | **1.6× faster** |
+| `fs_rename` | 2.53 µs | 4.82 µs | 24.90 µs | **1.9× faster** |
+| `fs_metadata_mix` | 2.46 µs | 162.94 µs | 131.40 µs | **53× faster** |
 
 **Reading the LIST numbers:** plain prefix scans (`*_list`) are
 the bread-and-butter metadata workload — `readdir`, `ListObjects`

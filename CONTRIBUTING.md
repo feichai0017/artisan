@@ -82,10 +82,10 @@ methodology and the apples-to-apples ground rules vs RocksDB.
 - **Property tests** (`tests/properties.rs`) cross-check the tree
   against a `HashMap` oracle. Adding a new op variant? Extend the
   generator + oracle in lockstep.
-- **WAL integration tests** (`tests/wal_round_trip.rs`,
-  `tests/wal_tree_integration.rs`) cover the crash-and-replay
-  invariants. The `durable_cfg` helper enables `wal_sync_on_commit`
-  for tests that simulate a crash without a checkpoint.
+- **WAL integration tests** (`tests/wal_tree_integration.rs` and
+  `src/journal/tests.rs`) cover the crash-and-replay invariants.
+  The `durable_cfg` helper enables `wal_sync_on_commit` for tests
+  that simulate a crash without a checkpoint.
 
 ### Commits
 

@@ -13,11 +13,9 @@ documentation = "https://docs.rs/holt"
 keywords = ["art", "radix-tree", "metadata", "storage", "embedded"]
 categories = ["database-implementations", "data-structures", "filesystem"]
 
-# v0.1 deps. PersistentBackend is available on every Unix; io_uring
-# is the Linux fast path (Stage 7).
 [dependencies]
 # Bounded MPSC + `select!` between a timer and a stop-channel —
-# used by the v0.2 background checkpointer threads (planner / I/O /
+# used by the background checkpointer threads (planner / I/O /
 # eviction). Std's `mpsc` lacks bounded sends and `select!`.
 crossbeam-channel = "0.5"
 # Sharded concurrent HashMap — backs the BufferManager's blob
@@ -106,8 +104,3 @@ path = "examples/s3_metadata.rs"
 name = "main"
 harness = false
 path = "benches/main.rs"
-
-[[bench]]
-name = "cold_io"
-harness = false
-path = "benches/cold_io.rs"

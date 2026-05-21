@@ -41,10 +41,7 @@
 //!
 //! The `*_persist_*` groups are intentionally hot-service
 //! measurements. They do **not** claim to measure cold data-file
-//! I/O after reopen. For that, use
-//! `benches/cold_io.rs`, which closes every engine,
-//! drops file cache on Linux via `posix_fadvise(DONTNEED)`, then
-//! times cold-ish `get` / same-key `put`.
+//! I/O after reopen.
 //!
 //! ## Running
 //!
@@ -418,8 +415,8 @@ fn bench_scenario(c: &mut Criterion, name: &str, pairs: &[(Vec<u8>, Vec<u8>)]) {
 
 // Hot persistent variant: all three engines are disk-backed with
 // WAL on and per-op fsync off. This isolates foreground WAL/cache
-// cost under a warm service state. Cold data-file I/O after reopen
-// is measured by `benches/cold_io.rs` instead.
+// cost under a warm service state, not cold data-file I/O after
+// reopen.
 fn bench_scenario_persistent(c: &mut Criterion, name: &str, pairs: &[(Vec<u8>, Vec<u8>)]) {
     let key_count = pairs.len();
 

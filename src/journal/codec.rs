@@ -58,7 +58,7 @@ pub const FILE_MAGIC: u32 = 0x414C_4157;
 /// bump this and grow the header (in the reserved tail) rather
 /// than moving existing fields.
 ///
-/// v0.3.1 bumps `2 → 3`: dropped the dead `prev_value` field
+/// v0.3.0 ships format `3`: dropped the dead `prev_value` field
 /// from `TxnOp::Insert` and the dead `value` field from
 /// `TxnOp::Erase`. Both were "for replay reversibility" but
 /// replay never undoes — it's an idempotent forward redo that
@@ -68,15 +68,14 @@ pub const FILE_MAGIC: u32 = 0x414C_4157;
 /// variants already wrote `None`); the trailing
 /// `optional_bytes` slot is gone from both record bodies.
 ///
-/// A v0.3.0 binary reading a v0.3.1 WAL would mis-parse the
-/// absent slot as a length prefix; the file-header check rejects
-/// the upgrade with "format version unsupported" rather than
-/// silently corrupting state on replay. Upgrade path: checkpoint
-/// the v0.3.0 tree (truncates the WAL) before swapping in the
-/// v0.3.1 binary. The v0.2 → v0.3.0 step bumped 1 → 2 by
-/// converting `Erase.value` from required to optional; the same
-/// "checkpoint before upgrade" rule applies to anyone leapfrogging
-/// from v0.2 directly to v0.3.1.
+/// Older internal v0.3 draft binaries that still wrote format `2`
+/// would mis-parse the absent slot as a length prefix; the
+/// file-header check rejects that upgrade with "format version
+/// unsupported" rather than silently corrupting state on replay.
+/// Upgrade path for any local draft data: checkpoint the old tree
+/// first so the WAL is truncated before opening it with v0.3.0.
+/// The v0.2 → v0.3.0 public upgrade follows the same
+/// "checkpoint before upgrade" rule.
 pub const FORMAT_VERSION: u32 = 3;
 
 /// File-header byte size. The record stream starts at this offset.

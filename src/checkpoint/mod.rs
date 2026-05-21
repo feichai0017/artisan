@@ -105,8 +105,8 @@ pub struct CheckpointConfig {
     /// Maximum interval between planner rounds. Smaller values
     /// = lower checkpoint latency, more wake-ups per second.
     ///
-    /// **Default 100 ms** — tuned via the `bench_checkpoint_sweep`
-    /// integration bench. The sweep showed:
+    /// **Default 100 ms** — tuned from local checkpoint cadence
+    /// sweeps. The sweep showed:
     ///
     /// | interval | peak WAL (paced, vs disabled) | writer overhead |
     /// |---:|---:|---:|

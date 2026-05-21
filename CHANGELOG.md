@@ -7,13 +7,17 @@ versioning follows [Semantic Versioning](https://semver.org/).
 For design background see [ARCHITECTURE.md](ARCHITECTURE.md);
 fine-grained per-commit history is in `git log`.
 
-## [Unreleased] — v0.3 (in progress)
+## [Unreleased]
 
-The v0.3 milestone is still unreleased. Everything in this
-section is queued for the first v0.3 tag: the API split, walker
-hot-path optimizations, WAL format cleanup, batch-WAL encoding,
-recursive cross-blob latch coupling, journal group commit, and
-candidate-driven online maintenance.
+No unreleased changes yet.
+
+## [0.3.0] — 2026-05-21
+
+The v0.3 milestone ships the API split, walker hot-path
+optimizations, WAL format cleanup, batch-WAL encoding, recursive
+cross-blob latch coupling, journal group commit, candidate-driven
+online maintenance, Linux fixed-buffer `io_uring` checkpoint I/O,
+and release benchmark coverage focused on metadata workloads.
 
 The three breaking-but-surgical wins below land first; the
 extreme metadata-engine performance track builds on them.
@@ -50,8 +54,8 @@ Concretely:
 
 ### Breaking — public lookup surface stays owned
 
-The draft `Tree::get_with` closure API is removed before v0.3
-ships. The engine still uses an internal zero-copy lookup walker
+The draft `Tree::get_with` closure API was removed before v0.3.
+The engine still uses an internal zero-copy lookup walker
 for existence probes and rename preflight, but the public API stays
 small:
 
@@ -297,15 +301,17 @@ the blind path:
   skip the `Vec` clone + bytes copy that the v0.2.x always-encoded
   path paid.
 
-Current scale-put re-run after the cross-blob latch-coupling and
-`BlobNode` format break (M3 Pro, non-quick Criterion):
-- **kv put @ 2 M**: 1 276 ns (vs RocksDB 1 577 ns, SQLite 1 616 ns).
-- **objstore put @ 2 M**: 1 463 ns (vs RocksDB 1 532 ns, SQLite 1 547 ns).
-- **fs put @ 2 M**: 1 436 ns (vs RocksDB 1 446 ns, SQLite 1 517 ns).
+Linux v0.3 release run after the cross-blob latch-coupling and
+`BlobNode` format break:
+- **kv put @ 2 M**: 1 866 ns (vs RocksDB 2 001 ns, SQLite 2 336 ns).
+- **objstore put @ 2 M**: 1 707 ns (vs RocksDB 1 994 ns, SQLite 2 222 ns).
+- **fs put @ 2 M**: 1 796 ns (vs RocksDB 1 969 ns, SQLite 2 199 ns).
 
-At 2 M vs RocksDB: kv is **1.24×** ahead, objstore is **1.05×**
-ahead, and fs is **1.01×** ahead / effectively tied. Full table in
-[benches/RESULTS.md](benches/RESULTS.md).
+At 2 M vs RocksDB: kv is **1.07×** ahead, objstore is **1.17×**
+ahead, and fs is **1.10×** ahead. Full table in
+[benches/RESULTS.md](benches/RESULTS.md). Point writes are now
+competitive at large scale; the release headline remains
+metadata-native mixes and delimiter directory rollup.
 
 ### Changed — internal types
 
@@ -496,18 +502,16 @@ ahead, and fs is **1.01×** ahead / effectively tied. Full table in
   dataset sizes (`{ 20 k, 100 k, 500 k, 2 M }`). The 500 k tier
   already exceeds the default 32 MB buffer pool; the 2 M tier
   (~192 MB payload) forces full eviction churn. **Get** scales
-  beautifully on all three workloads (holt wins every cell with
-  the lead vs RocksDB widening to 5.4× / 2.8× / 2.2× at 2 M).
+  well on all three workloads (holt wins every cell with the lead
+  vs RocksDB widening to 6.4× / 3.3× / 3.0× at 2 M).
   **Put** now wins every point in the current scale-put run;
-  the hard cell is 2 M fs put, where holt is only **1.01×**
+  the hard cell is 2 M kv put, where holt is only **1.07×**
   ahead of RocksDB and should be treated as parity rather than a
   decisive write win.
-- **Group C — p95/p99 under maintenance interference**
-  (`tests/bench_contention_p95.rs`, `#[ignore]`). 4 writer
-  threads + 5 ms-cadence background checkpointer + concurrent
-  `Tree::compact()` triggered from a put counter; tracks every
-  `put` latency via `hdrhistogram`. Latest local run: 840k ops/s
-  sustained, p50 = 1.29 µs, p99 = 4.58 µs, p99.9 = 144 µs.
+- **Metadata-native release claim.** `objstore_metadata_mix` is
+  43× faster than RocksDB and 29× faster than SQLite;
+  `fs_metadata_mix` is 66× / 53× faster. `objstore_list_dir` is
+  151× / 139× faster and `fs_list_dir` is 268× / 244× faster.
 - **PGO build profile docs** in [`PGO.md`](PGO.md).
 
 Full numbers in [`benches/RESULTS.md`](benches/RESULTS.md).

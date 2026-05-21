@@ -8,7 +8,7 @@
 
 > A carefully crafted **adaptive radix tree** for path-shaped metadata.
 
-> ⚠️ **Pre-1.0 (v0.3 in progress).** The public API is now narrow and
+> ⚠️ **Pre-1.0 (v0.3 released).** The public API is now narrow and
 > SemVer-stable inside a minor release, but minor releases may
 > still break source compatibility before 1.0. Pin the exact
 > published version in your `Cargo.toml` (`holt = "=0.3.0"`) until 1.0
@@ -30,11 +30,13 @@ It targets workloads where:
 
 It is **not** a general-purpose KV store; if you need full-text
 or vector similarity, reach for the right tool. For this shape,
-holt beats LMDB / RocksDB / SQLite cleanly on point lookup and
-prefix scan at every dataset size we test through 2 M keys, and
-on point writes at every size + workload in the current scale-put
-run. The narrowest cell is 2 M `fs_put` vs RocksDB, where holt is
-effectively at parity rather than decisively ahead — see
+holt's strongest wins are metadata-native operations: delimiter
+directory rollup and mixed metadata workloads. In the v0.3 Linux
+release run, `objstore_list_dir` is **151×** faster than RocksDB
+and `fs_list_dir` is **268×** faster; `objstore_metadata_mix` is
+**43×** faster than RocksDB and `fs_metadata_mix` is **66×**
+faster. Point reads stay ahead through 2 M keys; point writes are
+competitive but intentionally not the headline claim — see
 [`benches/RESULTS.md`](benches/RESULTS.md).
 
 ## Why "holt"?
@@ -63,23 +65,16 @@ without coordinating.
 
 ## Project status
 
-**Pre-1.0, actively maintained.** The algorithm core (insert /
-lookup / erase / rename / range / txn / compact + multi-blob
-crossings), online maintenance gate for compact/merge versus
-foreground reads/writes, persistent backend with `O_DIRECT` + optional
-`io_uring` fast path, physiological WAL with batched transactions,
-sharded buffer manager + 3-thread background checkpointer
-enforcing WAL-before-data, SIMD CRC32 + node scans, and the
-stateful `Tree::range` iterator (prefix anchoring, `start_after`,
-S3 delimiter) are all landed.
-240+ tests (unit + property-based + crash-and-replay +
-failpoint-injected) pass on Ubuntu + macOS CI.
+**Pre-1.0, actively maintained.** The v0.3 metadata-engine core is
+landed: insert / lookup / erase / rename / range / txn / compact,
+multi-blob crossings, online maintenance gates, persistent backend
+with `O_DIRECT` and optional Linux `io_uring`, physiological WAL
+with group commit, sharded buffer manager, 3-thread background
+checkpointer, SIMD CRC32 + node scans, and stateful `Tree::range`
+with prefix, `start_after`, and S3 delimiter rollup.
 
-See [`CHANGELOG.md`](CHANGELOG.md) for the per-feature
-breakdown and [`ROADMAP.md`](ROADMAP.md) for what's queued
-(journal-worker group commit, batched `io_uring` / NVMe
-checkpoint I/O, SIMD / memory hot-path work, and large-tree shape
-control).
+See [`CHANGELOG.md`](CHANGELOG.md) for the v0.3 release notes and
+[`ROADMAP.md`](ROADMAP.md) for post-0.3 direction.
 
 `cargo bench --bench main` runs a side-by-side comparison with
 RocksDB and SQLite across three metadata workload shapes — see
@@ -92,8 +87,16 @@ Add holt to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-holt = "0.3"
+holt = "=0.3.0"
 ```
+
+The supported 0.3 user surface is deliberately small:
+`TreeBuilder`, `Tree`, `TreeConfig`, `Storage`, `RangeBuilder`,
+`RangeEntry`, `RangeIter`, `TxnBatch`, `CheckpointConfig`,
+`TreeStats` / related stats structs, `Error` / `Result`, and the
+custom-backend surface (`Backend`, `MemoryBackend`,
+`PersistentBackend`, `AlignedBlobBuf`, `BlobGuid`). Internal
+layout, WAL, walker, and buffer-manager modules are not public API.
 
 ### Open a tree
 

@@ -1,9 +1,6 @@
 //! End-to-end unit tests for the WAL writer + replay scanner —
 //! write some records, flush, scan, verify what comes back
 //! matches what went in.
-//!
-//! Previously lived as `tests/wal_round_trip.rs`. Moved inward
-//! when the `journal` module became `pub(crate)`.
 
 use std::fs;
 use std::io::{Seek, SeekFrom, Write};

@@ -8,9 +8,11 @@ actual hot path.
 
 For holt this matters most on the **read fast path** — the
 `Tree::get` walker is a tight chain of `ntype_of` →
-`body_of_slot` → SIMD scan → recurse. Branch prediction +
-inlining decisions are 10–15 % of total cycles on the bench
-microcases; PGO recovers most of that.
+`body_of_slot` → SIMD scan → recurse. Branch prediction and
+inlining decisions are often a visible slice of total cycles on
+microbenchmarks. Treat PGO as a deployment-local tuning tool; the
+v0.3 release numbers in `benches/RESULTS.md` are plain release
+builds, not PGO-trained binaries.
 
 ## Setup
 
@@ -65,15 +67,13 @@ cargo pgo optimize bench -- --bench main
 
 ## Expected gains
 
-PGO measurements for holt's hot paths haven't been published
-yet — the table below shows what the literature reports for
-similar workloads on rustc + LLVM PGO and what holt is
-**likely** to see, so you have a yardstick when you measure
-your own deployment:
+PGO gains are workload- and compiler-version-dependent. The table
+below is a yardstick for downstream measurement, not a published
+holt claim:
 
 | Workload pattern             | Typical PGO Δ | Why                                              |
 | ---------------------------- | ------------- | ------------------------------------------------ |
-| Walker `Tree::get` hot path  | -10 to -15 %  | Tight `ntype_of → body_of_slot → SIMD scan → recurse`; branch + inline decisions dominate |
+| Walker `Tree::get` hot path  | -5 to -15 %   | Tight `ntype_of → body_of_slot → SIMD scan → recurse`; branch + inline decisions can dominate once data is hot |
 | Range / list-style scans     | -5 to -12 %   | More uniform control flow, SIMD step inner loop already saturates |
 | Write paths (`put` / spillover) | -5 to -8 %   | Spillover allocates + memcpys 512 KB blobs; LLVM PGO can't reorder a `memcpy` |
 | WAL-fsync-bound workloads    | ≈0            | End-to-end latency is `sync_data`; CPU savings are rounding error |
@@ -82,10 +82,10 @@ If you publish numbers from your own runs, replace this table
 with concrete measurements and the criterion baseline you
 compared against (`cargo bench --bench main -- --baseline release`).
 
-The bench harness lives at `benches/main.rs` and covers KV /
-object-store / FS-metadata workloads × get / put / mixed /
-list / list-delim × memory / persistent (24 sub-benches). See
-`benches/README.md` for how to read the criterion output.
+The public bench harness lives at `benches/main.rs` and covers KV,
+object-store metadata, and filesystem metadata workloads against
+RocksDB and SQLite. See `benches/README.md` for the exact scenario
+matrix and `benches/RESULTS.md` for the v0.3 Linux release run.
 
 ## When PGO doesn't help
 

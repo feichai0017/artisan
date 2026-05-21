@@ -5,10 +5,10 @@
 holt is a single-node, Unix-only ART-over-blobs metadata engine.
 The algorithm core, persistent backend, WAL + replay, sharded
 buffer manager, 3-thread background checkpointer, and the curated
-public API are all in place. 260+ tests (unit + property + crash +
-failpoint + multi-reader stress); zero clippy / rustdoc warnings
-under `-D warnings`; ubuntu + macOS CI; `cargo deny` supply-chain
-job.
+public API are all in place. The release test surface is unit,
+property, crash/replay, failpoint, and integration coverage; the
+public benchmark surface is the RocksDB/SQLite metadata comparator
+in `benches/main.rs`.
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the design and
 [CHANGELOG.md](CHANGELOG.md) for what changed when. The fine-
@@ -64,9 +64,9 @@ SemVer; v0.2 tightened those to `pub(crate)` so the engine is
 free to evolve internally without minor-version breaks. See
 [CHANGELOG.md](CHANGELOG.md) for the supported user surface.
 
-## v0.3 — Extreme metadata-engine performance
+## v0.3 — Extreme metadata-engine performance (shipped, 2026-05-21)
 
-v0.3 is now scoped as the performance ceiling milestone for an
+v0.3 shipped as the performance ceiling milestone for an
 embedded metadata engine. Feature work waits. The goal is to push
 the Fractal-ART-inspired kernel as far as practical on modern
 Linux/macOS: cache-resident reads, path-shaped writes, prefix/list
@@ -159,7 +159,7 @@ Durable group commit is implemented:
   mutation-bookkeeping shard they actually touch, not a global
   commit mutex or global dirty mutex.
 
-### P2 — NVMe-grade checkpoint I/O
+### P2 — NVMe-grade checkpoint I/O (done)
 
 The background checkpointer already has planner / I/O / eviction
 threads. v0.3 makes the I/O side worth that structure:
@@ -188,9 +188,6 @@ threads. v0.3 makes the I/O side worth that structure:
   checkpoints and background idle rounds skip the data-file Sync
   only when the backend has no outstanding data or manifest work,
   so a previous failed Sync still forces the next retry.
-- `tests/bench_manifest_checkpoint.rs` isolates this path with
-  path-shaped insert/delete/compact/checkpoint rounds and reports
-  checkpoint latency percentiles plus manifest/WAL/data sizes.
 - The WAL worker tracks whether the current log has uncheckpointed
   records, including records found when reopening a nonempty WAL.
   Clean checkpoints now skip empty WAL flush/truncate work instead
@@ -204,12 +201,10 @@ threads. v0.3 makes the I/O side worth that structure:
   without paying an unrelated backend Sync. WAL truncate itself is
   an in-place `ftruncate` + `sync_data`, avoiding the older
   temp-file write, rename, and fd reopen after every checkpoint.
-- `tests/bench_wal_checkpoint.rs` now isolates those fast paths:
-  clean checkpoints, durable group-commit reuse, default
-  checkpoint WAL barriers, and background idle rounds. It reports
-  latency percentiles together with journal `syncs` and
-  checkpointer `truncates`, so future checkpoint/I/O work can
-  distinguish data-file cost from accidental WAL re-sync work.
+  Release benchmark coverage stays focused on the public
+  RocksDB/SQLite metadata comparison. Checkpoint-specific probes
+  should be reintroduced only when they are promoted to either a
+  public comparator or a correctness integration test.
 
 ### P3 — CPU hot-path work
 
@@ -246,11 +241,10 @@ still material.
   foreground writers through the atomic `maintenance_gate`; the
   remaining large-tree work is policy quality (when to
   split/merge/rebalance), not basic safety.
-- Targeted large-tree shape probe is in
-  `tests/bench_large_tree_shape.rs`: skewed prefixes, hot
-  directories, delete-heavy churn, and a tiny-buffer-pool
-  persistent read probe report blob count, space/gap/tombstones,
-  spillovers, merges, and blob-hop counters.
+- Large-tree release coverage is the public `{20 k, 100 k,
+  500 k, 2 M}` scale curve in `benches/main.rs`. Additional
+  shape probes should be profile-driven and promoted only if they
+  become part of the release comparison surface.
 
 ### Deferred until after the performance core
 
@@ -266,7 +260,7 @@ engine's ceiling and should not compete with the v0.3 hot path:
 
 ## v1.0 — Production-ready
 
-- v0.3 feature set covered.
+- v0.3 public surface and persistence format stabilized.
 - Multi-platform stability across Linux + macOS (optional BSDs
   if anyone needs them).
 - Real production deployments + case studies.
@@ -291,8 +285,8 @@ embed-in-your-process, Unix-only. Out of scope:
   variants holt journals share wire shape with the upstream so a
   future RPC layer could re-use the format, but holt itself ships
   no multi-root registry, no bucket namespace, no RPC dispatcher.
-- **Replication / consensus** — build it above this. We expose
-  hooks (change feed in v0.3) but don't implement Raft.
+- **Replication / consensus** — build it above this. Future hooks
+  can support it, but holt itself does not implement Raft.
 - **Network server** — this is a library. Wrap it in your gRPC /
   HTTP / whatever.
 - **SQL** — not the right abstraction for this data shape.

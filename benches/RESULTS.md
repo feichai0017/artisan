@@ -1,398 +1,185 @@
-# holt — benchmark results
+# holt v0.3.0 benchmark results
 
-End-to-end criterion micro-benches comparing holt against
-**RocksDB** (`rocksdb` crate, default-features-off + bundled
-`librocksdb-sys`) and **SQLite** (`rusqlite` with the
-`bundled` libsqlite3, so contributors don't need a system
-SQLite installation). Three workload shapes (KV, S3
-object-store metadata, POSIX filesystem metadata) ×
-{ memory, hot persistent } × { get, put, mixed, list,
-list-delim }.
+End-to-end Criterion microbenchmarks comparing **holt** against
+**RocksDB** (`rocksdb` crate, bundled `librocksdb-sys`) and
+**SQLite** (`rusqlite`, bundled libsqlite3). The public benchmark
+surface is intentionally small: one harness, three workload
+shapes, and operation mixes that reflect metadata engines rather
+than generic key/value stores.
 
 ## Reproducing
 
 ```bash
-# Full suite (~5 min on M3 Pro).
-cargo bench --bench main -- --output-format bencher
-
-# One group only — e.g. just KV.
-cargo bench --bench main -- kv_ --output-format bencher
-
-# Put-only scale curve refreshed for the current v0.3 branch.
-cargo bench --bench main -- _scale_put --noplot --output-format bencher
+cargo bench --features io-uring --bench main -- --output-format bencher
 ```
 
-Each criterion sample is one op. Numbers are Criterion bencher
-`ns/iter` point estimates in nanoseconds, with noise bands printed
-by the command; lower is better. Holt's per-op numbers are
-randomised over a 20 000-key dataset (see `gen_*_dataset`);
-RocksDB / SQLite are driven by the same dataset for fair
-comparison.
-
-## Test environment
-
-- **Hardware**: Apple M3 Pro (12 cores), 36 GB RAM
-- **OS**: macOS 26.3 (Darwin 25.0.0)
-- **Rust**: 1.94.0 stable, release profile (`lto=thin`,
-  `codegen-units=1`, `opt-level=3`)
-- **holt**: current v0.3 working tree for the refreshed scale-put
-  tables (atomic maintenance gate, root-dirty precision, and
-  root shared-routing for cross-blob puts). Older get/list tables
-  are from the same M3 Pro benchmark track and should be
-  refreshed before a release tag.
-- **RocksDB**: 0.24 (`librocksdb-sys` 0.18, bundled)
-- **SQLite**: rusqlite 0.39 (bundled libsqlite3)
-- **Knob alignment**: the Criterion `*_persist_*` groups are
-  hot persistent / WAL-on measurements: comparable "per-op
-  durable to OS page cache, not fsync'd" semantics, with each
-  engine's in-process cache allowed to stay warm. They are not
-  cold data-file I/O measurements. Use `benches/cold_io.rs` for
-  reopen + file-cache-drop
-  persistent I/O probes.
-
-## Headline numbers
-
-24 baseline benches across KV / objstore / fs shapes, memory +
-hot-persistent variants at 20 k keys: **holt wins all 24** vs
-RocksDB and SQLite. Margin range: 1.3× (in-memory fs_put vs
-SQLite — both short codepaths) to **467×** (`fs_list_dir`
-S3-style rollup vs RocksDB — fast-forward over `BlobNode`
-crossings beats seek-iterator-per-leaf hands down).
-
-The scale curve in Group B (below) extends this across
-`{ 20 k, 100 k, 500 k, 2 M }` keys × three workload shapes
-(scale-put tables refreshed on the current v0.3 branch; get
-tables are from the earlier v0.3 M3 Pro run):
-
-- **Get scales beautifully**: holt wins every get cell at every
-  tier. The lead vs RocksDB widens to **5.4× / 2.8× / 2.2×** at
-  2 M (kv / objstore / fs) as the LSM's read-amplification
-  finally bites.
-- **Put wins every point estimate in the current scale-put run**:
-  holt wins puts at every tier through 2 M. At 2 M: **1.38×**
-  ahead of RocksDB on kv, **1.13×** ahead on objstore, and
-  **1.05×** on fs; vs SQLite the same cells are **1.32× /
-  1.22× / 1.09×**. Treat fs-vs-RocksDB as the tight remaining
-  write cell, not as a large win.
-- **Metadata-native operations show the domain advantage more
-  clearly than point put**: in quick smoke runs, create+delete is
-  2.8-5.0× ahead of the best baseline, rename round-trip is
-  3.0-4.0× ahead, and the weighted objstore/fs metadata mixes are
-  34-67× ahead because they include directory/list rollups.
-
-## KV workload (short random keys + short values)
-
-| Bench               | Holt (ns) | RocksDB (ns) | SQLite (ns) | vs RocksDB | vs SQLite |
-| ------------------- | --------: | -----------: | ----------: | ---------: | --------: |
-| **memory** get      |  **169**  |          684 |         567 |       4.0× |      3.4× |
-| **memory** put      |  **344**  |        1 201 |         629 |       3.5× |      1.8× |
-| **memory** mixed    |  **351**  |        2 138 |         663 |       6.1× |      1.9× |
-| **hot persist** get |  **187**  |          637 |       1 508 |       3.4× |      8.1× |
-| **hot persist** put |  **473**  |        3 470 |       2 310 |       7.3× |      4.9× |
-| **hot persist** mixed | **328** |        3 294 |       1 951 |      10.0× |      5.9× |
-
-## Object-store workload (S3-shaped path keys + metadata values)
-
-| Bench                       | Holt (ns) | RocksDB (ns) | SQLite (ns) | vs RocksDB | vs SQLite |
-| --------------------------- | --------: | -----------: | ----------: | ---------: | --------: |
-| **memory** get              |  **250**  |          702 |         622 |       2.8× |      2.5× |
-| **memory** put              |  **481**  |        1 441 |         664 |       3.0× |      1.4× |
-| **memory** mixed            |  **377**  |        2 152 |         663 |       5.7× |      1.8× |
-| **memory** list             |  **10 808** |     16 815 |      16 637 |       1.6× |      1.5× |
-| **hot persist** get         |  **247**  |          740 |       1 508 |       3.0× |      6.1× |
-| **hot persist** put         |  **567**  |        3 499 |       2 319 |       6.2× |      4.1× |
-| **hot persist** mixed       |  **420**  |        3 264 |       1 954 |       7.8× |      4.7× |
-| **hot persist** list        |  **10 651** |     16 937 |      17 801 |       1.6× |      1.7× |
-| **list_dir** (S3 rollup)    |  **2 463** |    624 672 |     436 204 |     **254×** |  **177×** |
-
-## Filesystem-metadata workload (inode + dirent path keys)
-
-| Bench                | Holt (ns) | RocksDB (ns) |  SQLite (ns) | vs RocksDB | vs SQLite |
-| -------------------- | --------: | -----------: | -----------: | ---------: | --------: |
-| **memory** get       |  **239**  |          700 |          630 |       2.9× |      2.6× |
-| **memory** put       |  **488**  |        1 452 |          660 |       3.0× |      1.4× |
-| **memory** mixed     |  **372**  |        2 469 |          668 |       6.6× |      1.8× |
-| **memory** list      |  **10 854** |    17 887 |       16 775 |       1.6× |      1.5× |
-| **hot persist** get  |  **251**  |          701 |        1 516 |       2.8× |      6.0× |
-| **hot persist** put  |  **555**  |        3 456 |        2 292 |       6.2× |      4.1× |
-| **hot persist** mixed | **411**  |        3 165 |        1 961 |       7.7× |      4.8× |
-| **hot persist** list |  **11 111** |    17 842 |       17 727 |       1.6× |      1.6× |
-| **list_dir**         |  **2 812** |  1 317 457 |      917 245 |     **468×** |  **326×** |
-
-## Note on `wal_sync_on_commit=true`
-
-A previous draft tried to bench all three engines at the
-"flip the strongest fsync knob" tier. The result wasn't a
-fair comparison: each engine's "sync=true" knob actually
-maps to a different syscall on macOS (`F_FULLFSYNC` vs
-`F_BARRIERFSYNC` vs just `write()`+lazy-fsync), so we ended
-up measuring drive-cache flush latency for some engines and
-kernel-page-cache flushes for others. The numbers said more
-about the platform than the engines, so that bench group was
-removed. The numbers above (`*_persist_put`) are the honest
-hot-WAL "per-op durable to OS page cache, not fsync'd" tier,
-which all three engines actually do reach with comparable
-semantics. They should not be quoted as cold data-file I/O
-numbers; use `cargo bench --bench cold_io` for that surface.
-
-## Workload notes
-
-- **`*_get` / `*_put`**: 20 000-key dataset, randomly sampled
-  with `StdRng(seed=SEED)`. Pre-load happens once outside the
-  measured region.
-- **`*_mixed`**: 50 % gets, 50 % puts, same dataset.
-- **`*_list`** (plain): prefix narrows to ~625 keys
-  (`objstore`) / ~1 250 keys (`fs`); each criterion sample
-  iterates up to 100 results.
-- **`*_list_dir`** (S3-style rollup): prefix + delimiter `/`;
-  emits 32 (`objstore`) / 16 (`fs`) `CommonPrefix` entries per
-  pass, then stops. Holt's iterator's fast-forward — ascend
-  past each rollup's subtree — turns the walk from
-  `O(leaves_under_prefix)` into `O(distinct_rollups)`. RocksDB
-  + SQLite both scan every leaf and dedupe in the host loop,
-  which is what the 100–500× gap measures.
-- **`*_create_delete`**: bounded scratch create followed by delete
-  so the benchmark state does not grow across iterations.
-- **`*_rename`**: atomic rename round-trip. Holt uses
-  `Tree::rename`; RocksDB uses `WriteBatch`; SQLite uses an
-  explicit transaction.
-- **`*_metadata_mix`**: 45 % stat/get, 20 % metadata update,
-  10 % plain list, 10 % delimiter list-dir, 10 % create+delete,
-  5 % rename round-trip.
-
-## Metadata-native operation smoke
-
-These are quick `--quick --noplot --output-format bencher`
-samples from the current benchmark harness. They are not a
-release-quality replacement for a full Criterion run, but they
-verify that the benchmark now covers common objstore/fs metadata
-operations beyond fixed-size point overwrite.
-
-| Bench | Holt (ns) | RocksDB (ns) | SQLite (ns) | vs best other |
-| ----- | --------: | -----------: | ----------: | ------------: |
-| `objstore_create_delete` | **211** | 1 064 | 2 835 | **5.0×** |
-| `objstore_rename` | **1 121** | 4 449 | 11 413 | **4.0×** |
-| `objstore_metadata_mix` | **1 444** | 70 385 | 49 048 | **34.0×** |
-| `fs_create_delete` | **406** | 1 152 | 2 860 | **2.8×** |
-| `fs_rename` | **1 541** | 4 584 | 11 340 | **3.0×** |
-| `fs_metadata_mix` | **1 482** | 136 837 | 99 165 | **66.9×** |
-
-Interpretation: same-key point put is the narrowest write-path
-test and therefore the least favorable way to express holt's
-metadata-specific advantage. Metadata workloads that include
-directory/list rollup, create/unlink, and rename expose the path
-semantics that generic KV baselines must reconstruct above the
-engine.
-
-## Group B — Scale curve (20 k → 100 k → 500 k → 2 M keys)
-
-Parameterized point lookup + upsert across **three workload
-shapes × four dataset sizes**, so the comparison is not biased
-by "everything fits in L2 cache" at 20 k. The 500 k tier (~48 MB)
-already exceeds holt's default 32 MB (64-blob) buffer pool; the
-**2 M tier (~192 MB) is 6× the pool**, so every miss pays the
-full `read_blob` + cross-blob descent cost. This is the
-working-set-cannot-be-held shape where engine behaviour diverges.
+Use filters for shorter runs:
 
 ```bash
+cargo bench --bench main -- _metadata_mix --output-format bencher
+cargo bench --bench main -- _list_dir --output-format bencher
 cargo bench --bench main -- _scale_ --output-format bencher
 ```
 
-### `kv` (random 32-byte keys — ART anti-pattern, no prefix sharing)
+Each sample is one logical operation. Lower is better. All three
+engines receive the same generated dataset and the same seeded
+operation stream.
 
-`kv_scale_get`:
+## Test environment
 
-| n        | Holt (ns) | RocksDB (ns) | SQLite (ns) | vs RocksDB | vs SQLite |
-| -------- | --------: | -----------: | ----------: | ---------: | --------: |
-|  **20 k** |   **188** |          684 |         567 |       3.6× |      3.0× |
-| **100 k** |   **292** |          866 |         768 |       3.0× |      2.6× |
-| **500 k** |   **591** |        1 503 |       1 157 |       2.5× |      2.0× |
-|  **2 M**  | **1 015** |    **5 509** |       1 418 |   **5.4×** |      1.4× |
+- **Hardware**: GCP `c2-standard-8`
+- **OS**: Linux on local SSD
+- **Rust**: 1.95.0
+- **holt**: v0.3.0, `--features io-uring`
+- **RocksDB**: 0.24 (`librocksdb-sys` 0.18, bundled)
+- **SQLite**: rusqlite 0.39 (bundled libsqlite3)
+- **Durability alignment**: `*_persist_*` groups are hot
+  persistent / WAL-on measurements. They model "durable to OS page
+  cache, not per-op fsync" semantics, with each engine's cache
+  allowed to stay warm. They are not cold-reopen I/O numbers.
 
-`kv_scale_put` (v0.3 current — blind `put` + cross-blob latch coupling):
+## Workloads
 
-| n        | Holt (ns) | RocksDB (ns) | SQLite (ns) | vs RocksDB | vs SQLite |
-| -------- | --------: | -----------: | ----------: | ---------: | --------: |
-|  **20 k** |   **294** |        1 608 |         644 |       5.5× |      2.2× |
-| **100 k** |   **531** |        1 545 |       1 008 |       2.9× |      1.9× |
-| **500 k** |   **818** |        1 716 |       1 346 |       2.1× |      1.6× |
-|  **2 M**  | **1 313** |        1 806 |       1 729 |   **1.38×** |     1.32× |
+| Workload | Key shape | Value shape | Why it exists |
+|---|---|---|---|
+| `kv` | random 32-byte keys | random 64-byte values | Anti-pattern baseline for ART: little prefix sharing. |
+| `objstore` | `bucket-NN/path/sub/file-NNNN.bin` | fixed JSON-ish metadata | S3-style object metadata. |
+| `fs` | `/usr/local/share/category-N/file-NNNN` | packed inode-ish bytes | Filesystem metadata. |
 
-### `objstore` (S3-shaped path keys with ~30-byte shared prefix per bucket)
+`objstore` and `fs` also run metadata-native operations:
+`list`, `list_dir` delimiter rollup, create/delete, rename, and a
+weighted metadata mix.
 
-`objstore_scale_get`:
+## Headline
 
-| n        | Holt (ns) | RocksDB (ns) | SQLite (ns) | vs RocksDB | vs SQLite |
-| -------- | --------: | -----------: | ----------: | ---------: | --------: |
-|  **20 k** |   **232** |          634 |         542 |       2.7× |      2.3× |
-| **100 k** |   **387** |          889 |         771 |       2.3× |      2.0× |
-| **500 k** |   **824** |        1 227 |       1 121 |       1.5× |      1.4× |
-|  **2 M**  | **1 088** |    **3 066** |       1 358 |   **2.8×** |      1.2× |
+Holt is strongest where the workload is actually metadata-shaped:
 
-`objstore_scale_put` (v0.3 current):
+- `objstore_metadata_mix`: **2.251 us** vs RocksDB **98.064 us**
+  and SQLite **66.394 us**.
+- `fs_metadata_mix`: **2.462 us** vs RocksDB **162.939 us** and
+  SQLite **131.395 us**.
+- `objstore_list_dir`: **4.204 us** vs RocksDB **638.397 us** and
+  SQLite **584.494 us**.
+- `fs_list_dir`: **4.898 us** vs RocksDB **1.316 ms** and SQLite
+  **1.197 ms**.
 
-| n        | Holt (ns) | RocksDB (ns) | SQLite (ns) | vs RocksDB | vs SQLite |
-| -------- | --------: | -----------: | ----------: | ---------: | --------: |
-|  **20 k** |   **338** |        1 507 |         636 |       4.5× |      1.9× |
-| **100 k** |   **659** |        1 724 |       1 014 |       2.6× |      1.5× |
-| **500 k** | **1 161** |        1 671 |       1 390 |       1.4× |      1.2× |
-|  **2 M**  | **1 511** |        1 713 |       1 842 |   **1.13×** |     1.22× |
+The tight cells are large-scale point writes. At 2 M keys, Holt
+still wins every point-put cell in this Linux run, but only by
+**1.07-1.17x** against RocksDB. Treat point put as competitive,
+not as the main marketing claim.
 
-### `fs` (POSIX paths, very long common prefix per directory)
+## Baseline point operations, 20 k keys
 
-`fs_scale_get`:
+### KV
 
-| n        | Holt (ns) | RocksDB (ns) | SQLite (ns) | vs RocksDB | vs SQLite |
-| -------- | --------: | -----------: | ----------: | ---------: | --------: |
-|  **20 k** |   **218** |          670 |         584 |       3.1× |      2.7× |
-| **100 k** |   **378** |          872 |         772 |       2.3× |      2.0× |
-| **500 k** |   **803** |        1 257 |       1 144 |       1.6× |      1.4× |
-|  **2 M**  | **1 105** |    **2 382** |       1 353 |   **2.2×** |      1.2× |
+| Bench | Holt (ns) | RocksDB (ns) | SQLite (ns) | vs RocksDB | vs SQLite |
+|---|---:|---:|---:|---:|---:|
+| memory get | **272** | 749 | 920 | 2.8x | 3.4x |
+| memory put | **421** | 1,796 | 996 | 4.3x | 2.4x |
+| memory mixed | **348** | 3,045 | 979 | 8.8x | 2.8x |
+| hot persist get | **274** | 743 | 2,317 | 2.7x | 8.5x |
+| hot persist put | **922** | 3,446 | 3,535 | 3.7x | 3.8x |
+| hot persist mixed | **542** | 3,978 | 2,933 | 7.3x | 5.4x |
 
-`fs_scale_put` (v0.3 current):
+### Object-store metadata
 
-| n        | Holt (ns) | RocksDB (ns) | SQLite (ns) | vs RocksDB | vs SQLite |
-| -------- | --------: | -----------: | ----------: | ---------: | --------: |
-|  **20 k** |   **326** |        1 542 |         700 |       4.7× |      2.1× |
-| **100 k** |   **695** |        1 608 |         979 |       2.3× |      1.4× |
-| **500 k** | **1 116** |        1 787 |       1 365 |       1.6× |      1.2× |
-|  **2 M**  | **1 482** |        1 556 |       1 617 |   **1.05×** |     1.09× |
+| Bench | Holt (ns) | RocksDB (ns) | SQLite (ns) | vs RocksDB | vs SQLite |
+|---|---:|---:|---:|---:|---:|
+| memory get | **310** | 691 | 892 | 2.2x | 2.9x |
+| memory put | **478** | 2,016 | 995 | 4.2x | 2.1x |
+| memory mixed | **402** | 3,011 | 950 | 7.5x | 2.4x |
+| hot persist get | **314** | 709 | 2,262 | 2.3x | 7.2x |
+| hot persist put | **829** | 3,714 | 3,460 | 4.5x | 4.2x |
+| hot persist mixed | **617** | 3,807 | 2,963 | 6.2x | 4.8x |
+| memory list | **21,013** | 23,825 | 32,941 | 1.1x | 1.6x |
+| hot persist list | **20,816** | 23,875 | 34,634 | 1.1x | 1.7x |
+| list_dir | **4,204** | 638,397 | 584,494 | 151.9x | 139.0x |
 
-### Observations
+### Filesystem metadata
 
-#### Get path scales gracefully on all three workloads
+| Bench | Holt (ns) | RocksDB (ns) | SQLite (ns) | vs RocksDB | vs SQLite |
+|---|---:|---:|---:|---:|---:|
+| memory get | **374** | 700 | 885 | 1.9x | 2.4x |
+| memory put | **560** | 1,858 | 972 | 3.3x | 1.7x |
+| memory mixed | **480** | 2,740 | 960 | 5.7x | 2.0x |
+| hot persist get | **377** | 695 | 2,245 | 1.8x | 6.0x |
+| hot persist put | **891** | 3,802 | 3,467 | 4.3x | 3.9x |
+| hot persist mixed | **649** | 3,758 | 2,929 | 5.8x | 4.5x |
+| memory list | **21,822** | 24,008 | 32,457 | 1.1x | 1.5x |
+| hot persist list | **21,986** | 24,190 | 34,393 | 1.1x | 1.6x |
+| list_dir | **4,898** | 1,316,044 | 1,196,702 | 268.7x | 244.3x |
 
-Across kv / objstore / fs at every tier through 2 M keys, **holt
-wins point lookup**. The lead vs RocksDB widens dramatically at
-2 M because RocksDB's bloom filters start missing more often and
-the read has to descend multiple SST levels:
+## Metadata-native operations
 
-| 2 M get  | Holt   | RocksDB | speedup |
-| -------- | -----: | ------: | ------: |
-| kv       | 1 015  | 5 509   |  5.4×   |
-| objstore | 1 088  | 3 066   |  2.8×   |
-| fs       | 1 105  | 2 382   |  2.2×   |
+| Bench | Holt (ns) | RocksDB (ns) | SQLite (ns) | vs RocksDB | vs SQLite |
+|---|---:|---:|---:|---:|---:|
+| objstore create/delete | **473** | 1,250 | 5,478 | 2.6x | 11.6x |
+| objstore rename | **1,961** | 4,668 | 24,866 | 2.4x | 12.7x |
+| objstore metadata_mix | **2,251** | 98,064 | 66,394 | 43.6x | 29.5x |
+| fs create/delete | **780** | 1,260 | 5,499 | 1.6x | 7.1x |
+| fs rename | **2,529** | 4,819 | 24,903 | 1.9x | 9.8x |
+| fs metadata_mix | **2,462** | 162,939 | 131,395 | 66.2x | 53.4x |
 
-(The kv get speedup is largest because random 32-byte keys force
-the worst LSM behaviour — no path locality, every read is a
-fresh bloom probe. The path-key workloads still see a >2× lead
-even though RocksDB's prefix compression in SSTs softens the
-blow.) Holt's descent depth scales with `log(N)` of distinct
-prefixes, not with SST level count, so it grows
-**5.4× / 4.7× / 5.1×** across the 100× data growth (kv / objstore
-/ fs) — far less than RocksDB's 8× / 4.8× / 3.6× for the same
-range.
+The metadata mix is the best single summary for the project: it
+combines stat/get, metadata update, plain list, delimiter
+list-dir, create/delete, and rename. Generic KV baselines must
+reconstruct delimiter rollup above the engine; Holt implements it
+inside the ART walker and fast-forwards past rolled-up subtrees.
 
-SQLite get tightens to 1.2-1.4× at 2 M because its B-tree handles
-cache pressure gracefully — bounded fan-out + 64 MB page cache
-keeps lookup depth dominated by index height, which grows slowly.
+## Scale curve: 20 k to 2 M keys
 
-#### Put path: v0.3 close-out
+### Get
 
-v0.2.1 had an honest gap on 2 M path-shaped put: -13 % vs
-RocksDB on objstore, -18 % vs RocksDB on fs. The current v0.3
-line mostly closes that comparative gap, but **fs 2 M put remains
-the tight cell**: small changes in route cache / split shape move
-it between a small win and a small loss against RocksDB. Do not
-over-read absolute deltas against the older v0.2.1 numbers; the
-table below is useful for direction, while the speedup columns
-come from that same-run baseline.
+| Workload | Keys | Holt (ns) | RocksDB (ns) | SQLite (ns) | vs RocksDB | vs SQLite |
+|---|---:|---:|---:|---:|---:|---:|
+| kv | 20 k | **283** | 729 | 903 | 2.6x | 3.2x |
+| kv | 100 k | **505** | 1,202 | 1,301 | 2.4x | 2.6x |
+| kv | 500 k | **803** | 2,018 | 1,828 | 2.5x | 2.3x |
+| kv | 2 M | **1,406** | 9,006 | 2,327 | 6.4x | 1.7x |
+| objstore | 20 k | **314** | 732 | 913 | 2.3x | 2.9x |
+| objstore | 100 k | **559** | 1,057 | 1,287 | 1.9x | 2.3x |
+| objstore | 500 k | **962** | 1,554 | 1,739 | 1.6x | 1.8x |
+| objstore | 2 M | **1,457** | 4,765 | 2,093 | 3.3x | 1.4x |
+| fs | 20 k | **370** | 738 | 891 | 2.0x | 2.4x |
+| fs | 100 k | **588** | 1,043 | 1,213 | 1.8x | 2.1x |
+| fs | 500 k | **1,053** | 1,520 | 1,706 | 1.4x | 1.6x |
+| fs | 2 M | **1,262** | 3,797 | 2,088 | 3.0x | 1.7x |
 
-| 2 M put  | v0.2.1 | current v0.3 | Δ      | current v0.3 vs Rocks | vs SQLite |
-| -------- | -----: | -----------: | -----: | --------------------: | --------: |
-| kv       | 1 296  |        1 313 | +1 %   | **1.38×** ahead | 1.32× ahead |
-| objstore | 1 503  |        1 511 | +1 %   | **1.13×** ahead | 1.22× ahead |
-| fs       | 1 492  |        1 482 | -1 %   | **1.05×** ahead | 1.09× ahead |
+### Put
 
-A post-route-cache + path-boundary filtered smoke run (`cargo
-bench --bench main -- {objstore,fs}_scale_put/{engine}/2M
---quick --noplot --output-format bencher`) gave this narrower
-2 M-only view:
+| Workload | Keys | Holt (ns) | RocksDB (ns) | SQLite (ns) | vs RocksDB | vs SQLite |
+|---|---:|---:|---:|---:|---:|---:|
+| kv | 20 k | **410** | 1,803 | 1,015 | 4.4x | 2.5x |
+| kv | 100 k | **800** | 1,956 | 1,439 | 2.4x | 1.8x |
+| kv | 500 k | **1,183** | 1,958 | 1,950 | 1.7x | 1.6x |
+| kv | 2 M | **1,866** | 2,001 | 2,336 | 1.1x | 1.3x |
+| objstore | 20 k | **474** | 1,946 | 984 | 4.1x | 2.1x |
+| objstore | 100 k | **783** | 2,071 | 1,403 | 2.6x | 1.8x |
+| objstore | 500 k | **1,220** | 2,071 | 1,882 | 1.7x | 1.5x |
+| objstore | 2 M | **1,707** | 1,994 | 2,222 | 1.2x | 1.3x |
+| fs | 20 k | **562** | 1,911 | 976 | 3.4x | 1.7x |
+| fs | 100 k | **768** | 1,984 | 1,339 | 2.6x | 1.7x |
+| fs | 500 k | **1,264** | 2,081 | 1,844 | 1.6x | 1.5x |
+| fs | 2 M | **1,796** | 1,969 | 2,199 | 1.1x | 1.2x |
 
-| 2 M put  | Holt | RocksDB | SQLite | vs RocksDB | vs SQLite |
-| -------- | ---: | ------: | -----: | ---------: | --------: |
-| objstore | 1 368 | 1 479 | 1 517 | **1.08×** ahead | **1.11×** ahead |
-| fs       | 1 573 | 1 572 | 1 660 | ~tie | **1.06×** ahead |
+## Interpretation
 
-The root cause of the v0.2.1 gap was **API + walker constant-
-factor overhead**, not the cross-blob descent cost we initially
-attributed it to:
+Holt is not a generic RocksDB replacement. It is a persistent ART
+metadata engine for hierarchical keys.
 
-1. `Tree::put`'s `Result<Option<Vec<u8>>>` signature forced a
-   per-op leaf-extent value read + clone on every same-key
-   update, even though the bench never consumed the returned
-   `Option`. RocksDB / SQLite's blind overwrite paid no
-   equivalent cost.
-2. `insert_into_prefix` allocated a `Vec` per Prefix descent to
-   work around a borrow it didn't actually need (`Prefix` is
-   `Copy`). Hot on path-shaped keys where Prefix chains are
-   deep.
-3. WAL `Insert.prev_value` was encoded as `Some(prev)` on every
-   put even though replay never reads it; pure wire-format
-   overhead.
-
-v0.3.0 split `put` (blind, `Result<()>`) from `insert` (returning,
-`Result<Option<Vec<u8>>>`); same for `delete` / `remove`. Blind
-walker path skips the leaf-extent value read, drops the prefix
-`.to_vec()`, and writes `Option::None` into the WAL `prev_value`
-slot. The later cross-blob latch-coupling + `BlobNode` format
-break removes the parent-held fallback path and the child-entry
-repair work.
-
-The current v0.3 line adds three more hot-path fixes on top:
-
-1. Cross-blob updates return a precise `root_dirty` bit, so a
-   child-only update no longer takes the dirty-map mutex again to
-   mark the root dirty.
-2. Cross-blob puts route through the root under a shared latch,
-   acquire the child write latch while the edge is still stable,
-   then mutate only from the child down. This removes the root
-   exclusive latch from the large-tree steady state.
-3. Padded-key construction keeps the 256-byte inline fast path
-   but writes only the live key bytes + terminator, avoiding a
-   full stack-buffer clear per op.
-
-**Adjacent v0.3 wins.** These scale-put benches exercise blind
-`put` on a single op at a time. Several v0.3 changes matter more
-for adjacent surfaces than for this exact table:
-
-- **WAL format v3** (`Insert.prev_value` / `Erase.value` slots
-  removed entirely). Bench writes are blind, so the v0.3.0 path
-  already wrote `Option::None` for those slots — saving one
-  presence byte per record. The full win lands on the *returning*
-  `Tree::insert` / `Tree::remove` paths, which v0.3.0 still
-  wrote `Some(prev)` for; the current v0.3 line doesn't write the
-  prev value to the WAL at all (the walker hands it straight to
-  the caller).
-- **Public lookup surface stays owned.** The draft
-  `Tree::get_with` callback API was removed before v0.3 ships;
-  this bench continues to measure the stable `Tree::get` path
-  that returns owned `Vec<u8>` values.
-- **`Tree::txn` batch encoder bypass.** Single-op writes are
-  unaffected; multi-op batches skip per-op intermediate `Vec`
-  clones that the v0.3.0 `wal_ops: Vec<TxnOp>` aggregator forced.
-  Bench doesn't exercise `txn`.
-
-The weakest remaining cell is **`fs_scale_put` at 2 M**. Treat it
-as "roughly tied with generic engines, not a large write win." This
-is the regime where LSM and B-tree write paths are most
-competitive: WAL append + memtable/page update stay cheap
-regardless of working-set size, while ART-over-blobs pays
-cross-blob descent plus deeper Prefix chains on long path keys.
-The path-boundary spillover heuristic moves the fs smoke from a
-small RocksDB loss to a tie by preferring healthy child blobs whose
-route boundary ends on `/`. The larger claims are still on
-get/list/list_dir and metadata-native mixes.
-
-#### What this means in practice
-
-- **Read-dominated metadata workloads at any scale**: holt wins
-  cleanly across kv / objstore / fs / list / list_dir, with the
-  lead widening at larger working sets (5.4× / 2.8× / 2.2× at
-  2 M get).
-- **Mixed workloads**: holt wins puts in most scale cells. The
-  caveat is 2 M fs put: it is effectively tied with RocksDB/SQLite
-  in quick filtered runs, not a meaningful win. If your workload
-  sits there with heavy write skew, size the holt buffer pool to
-  hold the hot set and benchmark the exact key shape before making
-  a durability choice.
+- The strongest release claim is metadata semantics:
+  `list_dir` and `metadata_mix` are tens to hundreds of times
+  faster because Holt can skip whole subtrees after emitting a
+  delimiter rollup.
+- Point reads remain strong at 2 M keys across all three shapes.
+  RocksDB suffers most at this tier; SQLite stays closer but still
+  trails Holt.
+- Point writes are competitive but are the current bottleneck. At
+  2 M keys Holt wins every point-put cell in this run, but the
+  margin against RocksDB is only 1.07-1.17x. The limiting work is
+  CPU-side path descent, cross-blob traversal, dirty bookkeeping,
+  and WAL submission, not data-file I/O.
+- Plain prefix `list` is only a small win. Generic iterators are
+  already good at "take 100 under a prefix"; Holt's structural
+  advantage shows up when the operation has metadata semantics
+  such as delimiter rollup.

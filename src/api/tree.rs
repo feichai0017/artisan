@@ -364,7 +364,7 @@ impl Tree {
     /// the walker materialises the existing leaf's value bytes —
     /// only the caller-visible return path is affected; the WAL
     /// record is identical for both variants (key + value only,
-    /// no prev_value field on disk since v0.3.1 / format v3).
+    /// no prev_value field on disk since v0.3.0 / format v3).
     ///
     /// W2D-strict protocol (WAL mode): walker descent, `mark_dirty`,
     /// and journal submission happen inside the writer side of
@@ -461,7 +461,7 @@ impl Tree {
     ///
     /// Blind delete (`wants_prev = false`) saves the walker
     /// leaf-extent value read; the WAL record itself is identical
-    /// for both variants (key only since v0.3.1 / format v3).
+    /// for both variants (key only since v0.3.0 / format v3).
     /// `EraseOutcome.mutated` is the authoritative "anything
     /// happened" signal, independent of `EraseOutcome.previous`.
     fn delete_inner(&self, key: &[u8], wants_prev: bool) -> Result<engine::EraseOutcome> {

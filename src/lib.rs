@@ -15,7 +15,7 @@
 //! (`O_DIRECT` + optional `io_uring`), WAL with replay, sharded
 //! buffer manager, background checkpointer — are in place and
 //! covered by integration + property tests. See `ROADMAP.md`
-//! for the next milestone's work items.
+//! for the post-0.3 direction.
 //!
 //! ## Quick taste
 //!
