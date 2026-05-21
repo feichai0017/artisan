@@ -73,6 +73,13 @@ is paired with journal `syncs` / checkpointer `truncates`
 counters, so regressions show up even when data-file flush cost
 dominates wall-clock latency.
 
+A seventh probe — **2M path-put shape** — lives in
+`tests/bench_path_put_2m.rs`. It is holt-only and focuses on the
+large-tree objstore/fs put path, printing update latency together
+with blob count, average/max blob hops, max cross-blob depth, and
+spillovers. Use it before/after CPU hot-path changes; use
+Criterion `_scale_put` for RocksDB/SQLite comparisons.
+
 ## Running
 
 ```sh
@@ -122,6 +129,16 @@ cargo test --release --test bench_wal_checkpoint \
 HOLT_WAL_BENCH_CLEAN_ITERS=50 \
 HOLT_WAL_BENCH_MUTATIONS=10 \
 cargo test --release --test bench_wal_checkpoint \
+    -- --ignored --nocapture
+
+# Holt-only 2M path-put shape probe:
+cargo test --release --test bench_path_put_2m \
+    -- --ignored --nocapture
+
+# Short 2M path-put smoke:
+HOLT_PATH_PUT_KEYS=20000 \
+HOLT_PATH_PUT_UPDATES=5000 \
+cargo test --release --test bench_path_put_2m \
     -- --ignored --nocapture
 ```
 

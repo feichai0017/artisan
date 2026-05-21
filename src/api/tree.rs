@@ -371,7 +371,8 @@ impl Tree {
                 wants_prev,
             )?;
             if outcome.root_dirty {
-                self.backend.mark_dirty(self.root_guid, seq);
+                self.backend
+                    .mark_dirty_cached(self.root_guid, seq, self.root_pin.as_ref());
             }
             let mut record = Vec::with_capacity(encoded_insert_record_len(key.len(), value.len()));
             encode_insert_record(&mut record, seq, 0, key, value);
@@ -391,7 +392,8 @@ impl Tree {
                 wants_prev,
             )?;
             if outcome.root_dirty {
-                self.backend.mark_dirty(self.root_guid, seq);
+                self.backend
+                    .mark_dirty_cached(self.root_guid, seq, self.root_pin.as_ref());
             }
             if self.cfg.memory_flush_on_write {
                 self.flush_dirty_inline()?;
@@ -463,7 +465,8 @@ impl Tree {
                 // Cross-blob erases mark their child blob inside
                 // the walker; absent-key no-ops mark nothing.
                 if outcome.root_dirty {
-                    self.backend.mark_dirty(self.root_guid, seq);
+                    self.backend
+                        .mark_dirty_cached(self.root_guid, seq, self.root_pin.as_ref());
                 }
                 let mut record = Vec::with_capacity(encoded_erase_record_len(key.len()));
                 encode_erase_record(&mut record, seq, 0, key);
@@ -477,7 +480,8 @@ impl Tree {
             let outcome =
                 engine::erase_multi(&self.backend, &self.root_pin, search, seq, wants_prev)?;
             if outcome.mutated && outcome.root_dirty {
-                self.backend.mark_dirty(self.root_guid, seq);
+                self.backend
+                    .mark_dirty_cached(self.root_guid, seq, self.root_pin.as_ref());
             }
             if self.cfg.memory_flush_on_write {
                 // Flush every blob the walker touched (root + any
@@ -563,7 +567,8 @@ impl Tree {
                 false,
             )?;
             if erase_out.root_dirty || insert_out.root_dirty {
-                self.backend.mark_dirty(self.root_guid, seq);
+                self.backend
+                    .mark_dirty_cached(self.root_guid, seq, self.root_pin.as_ref());
             }
             let mut record =
                 Vec::with_capacity(encoded_rename_object_record_len(src.len(), dst.len()));
@@ -581,7 +586,8 @@ impl Tree {
                 false,
             )?;
             if erase_out.root_dirty || insert_out.root_dirty {
-                self.backend.mark_dirty(self.root_guid, seq);
+                self.backend
+                    .mark_dirty_cached(self.root_guid, seq, self.root_pin.as_ref());
             }
             if self.cfg.memory_flush_on_write {
                 // Walker may have dirtied child blobs across the
@@ -723,7 +729,8 @@ impl Tree {
                         false,
                     )?;
                     if outcome.root_dirty {
-                        self.backend.mark_dirty(self.root_guid, seq);
+                        self.backend
+                            .mark_dirty_cached(self.root_guid, seq, self.root_pin.as_ref());
                     }
                     if let Some(enc) = enc.as_deref_mut() {
                         enc.push_insert(0, &key, &value);
@@ -735,7 +742,11 @@ impl Tree {
                         engine::erase_multi(&self.backend, &self.root_pin, search, seq, false)?;
                     if outcome.mutated {
                         if outcome.root_dirty {
-                            self.backend.mark_dirty(self.root_guid, seq);
+                            self.backend.mark_dirty_cached(
+                                self.root_guid,
+                                seq,
+                                self.root_pin.as_ref(),
+                            );
                         }
                         if let Some(enc) = enc.as_deref_mut() {
                             enc.push_erase(0, &key);
@@ -784,7 +795,11 @@ impl Tree {
                             false,
                         )?;
                         if erase_out.root_dirty || insert_out.root_dirty {
-                            self.backend.mark_dirty(self.root_guid, seq);
+                            self.backend.mark_dirty_cached(
+                                self.root_guid,
+                                seq,
+                                self.root_pin.as_ref(),
+                            );
                         }
                     }
                     if let Some(enc) = enc.as_deref_mut() {

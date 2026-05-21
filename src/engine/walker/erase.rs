@@ -82,6 +82,7 @@ pub fn erase_multi(
     let outcome = lock_coupled_erase_in_blob(
         bm,
         guard,
+        root_pin.as_ref(),
         root_guid,
         true,
         key,
@@ -112,6 +113,7 @@ enum EraseStep {
 fn lock_coupled_erase_in_blob(
     bm: &BufferManager,
     mut guard: BlobWriteGuard<'_>,
+    current_entry: &CachedBlob,
     current_guid: crate::layout::BlobGuid,
     is_top_blob: bool,
     key: SearchKey<'_>,
@@ -140,6 +142,7 @@ fn lock_coupled_erase_in_blob(
             let outcome = lock_coupled_erase_in_blob(
                 bm,
                 child_guard,
+                child_pin.as_ref(),
                 crossing.child_guid,
                 false,
                 key,
@@ -169,7 +172,7 @@ fn lock_coupled_erase_in_blob(
     if child_touched {
         bm.note_compaction_candidate(current_guid);
         if !is_top_blob {
-            bm.mark_dirty(current_guid, seq);
+            bm.mark_dirty_cached(current_guid, seq, current_entry);
         }
     }
 

@@ -148,6 +148,7 @@ use super::backend::{AlignedBlobBuf, Backend};
 pub const STRUCTURAL_SEQ: u64 = u64::MAX;
 
 const BOOKKEEPING_SHARDS: usize = 64;
+const CLEAN_DIRTY_SEQ: u64 = 0;
 
 /// One pre-snapshotted blob image ready for checkpoint write-through.
 ///
@@ -357,6 +358,16 @@ pub struct BufferManager {
 pub struct CachedBlob {
     latch: HybridLatch,
     buf: UnsafeCell<AlignedBlobBuf>,
+    /// Fast-path low-watermark for dirty tracking. `0` means no
+    /// live dirty-map entry is known for this cached blob; any
+    /// non-zero value is the lowest unflushed seq observed by
+    /// `mark_dirty`.
+    ///
+    /// The authoritative enumeration source remains
+    /// `MutationState::dirty`. This hint lets repeated writes to an
+    /// already-dirty cached blob skip the shard mutex when the
+    /// existing low-watermark already covers the new seq.
+    dirty_seq_hint: AtomicU64,
     /// Stamp set by `BufferManager` on every `pin` / `get_cached`.
     /// Read by the eviction thread to decide if this entry is
     /// cold enough to drop. Relaxed reads/writes — see
@@ -387,8 +398,50 @@ impl CachedBlob {
         Self {
             latch: HybridLatch::new(),
             buf: UnsafeCell::new(buf),
+            dirty_seq_hint: AtomicU64::new(CLEAN_DIRTY_SEQ),
             last_touched: AtomicU64::new(0),
         }
+    }
+
+    /// Try to cover `txn_id` with this blob's dirty hint.
+    ///
+    /// Returns `true` when the caller must still publish/merge the
+    /// guid into `MutationState::dirty`; returns `false` when the
+    /// existing hint already has a lower-or-equal unflushed seq and
+    /// therefore the dirty map entry is already sufficient.
+    fn dirty_hint_needs_map_publish(&self, txn_id: u64) -> bool {
+        let mut cur = self.dirty_seq_hint.load(Ordering::Acquire);
+        loop {
+            if cur != CLEAN_DIRTY_SEQ && cur <= txn_id {
+                return false;
+            }
+            let next = if cur == CLEAN_DIRTY_SEQ {
+                txn_id
+            } else {
+                cur.min(txn_id)
+            };
+            match self.dirty_seq_hint.compare_exchange_weak(
+                cur,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(actual) => cur = actual,
+            }
+        }
+    }
+
+    fn take_dirty_hint(&self) -> Option<u64> {
+        match self.dirty_seq_hint.swap(CLEAN_DIRTY_SEQ, Ordering::AcqRel) {
+            CLEAN_DIRTY_SEQ => None,
+            seq => Some(seq),
+        }
+    }
+
+    fn clear_dirty_hint(&self) {
+        self.dirty_seq_hint
+            .store(CLEAN_DIRTY_SEQ, Ordering::Release);
     }
 
     /// Logical tick at which this entry was last looked up. Used
@@ -886,7 +939,9 @@ impl BufferManager {
     /// any pending dirty write would race with the delete in the
     /// backend.
     fn evict_from_cache(&self, guid: BlobGuid) {
-        self.cache.remove(&guid);
+        if let Some((_, entry)) = self.cache.remove(&guid) {
+            entry.clear_dirty_hint();
+        }
         let mut state = self.mutation_shard(guid).lock().unwrap();
         state.remove_dirty(&guid);
         let removed = state.remove_maintenance_candidates(&guid);
@@ -998,8 +1053,28 @@ impl BufferManager {
     /// checkpointer-side drains the map via
     /// [`Self::snapshot_dirty`].
     pub fn mark_dirty(&self, guid: BlobGuid, txn_id: u64) {
+        let cached = self.get_cached_silent(guid);
+        self.mark_dirty_with_hint(guid, txn_id, cached.as_deref());
+    }
+
+    /// Same contract as [`Self::mark_dirty`], but the caller
+    /// already holds the cached blob pin from the walker descent.
+    /// This avoids a second DashMap lookup on the mutation hot path.
+    pub(crate) fn mark_dirty_cached(&self, guid: BlobGuid, txn_id: u64, entry: &CachedBlob) {
+        self.mark_dirty_with_hint(guid, txn_id, Some(entry));
+    }
+
+    fn mark_dirty_with_hint(&self, guid: BlobGuid, txn_id: u64, cached: Option<&CachedBlob>) {
+        if let Some(entry) = cached {
+            if !entry.dirty_hint_needs_map_publish(txn_id) {
+                return;
+            }
+        }
         let mut state = self.mutation_shard(guid).lock().unwrap();
         if state.pending_deletes.contains_key(&guid) {
+            if let Some(entry) = cached {
+                entry.clear_dirty_hint();
+            }
             return;
         }
         state
@@ -1025,9 +1100,22 @@ impl BufferManager {
         let mut out = HashMap::new();
         for shard in &self.mutation {
             let mut state = shard.lock().unwrap();
-            let mut snap = std::mem::take(&mut state.dirty);
-            snap.retain(|guid, _| !state.pending_deletes.contains_key(guid));
+            for (guid, txn_id) in &mut state.dirty {
+                if let Some(hinted_seq) = self
+                    .get_cached_silent(*guid)
+                    .and_then(|entry| entry.take_dirty_hint())
+                {
+                    *txn_id = (*txn_id).min(hinted_seq);
+                }
+            }
+            let snap = std::mem::take(&mut state.dirty);
             for (guid, txn_id) in snap {
+                if state.pending_deletes.contains_key(&guid) {
+                    if let Some(entry) = self.get_cached_silent(guid) {
+                        entry.clear_dirty_hint();
+                    }
+                    continue;
+                }
                 state
                     .flushing
                     .entry(guid)
@@ -1052,8 +1140,15 @@ impl BufferManager {
             return;
         }
         for (guid, t) in entries {
+            let cached = self.get_cached_silent(guid);
+            if let Some(entry) = &cached {
+                let _ = entry.dirty_hint_needs_map_publish(t);
+            }
             let mut state = self.mutation_shard(guid).lock().unwrap();
             if state.pending_deletes.contains_key(&guid) {
+                if let Some(entry) = cached {
+                    entry.clear_dirty_hint();
+                }
                 state.flushing.remove(&guid);
                 continue;
             }
@@ -1111,7 +1206,9 @@ impl BufferManager {
         let removed = state.remove_maintenance_candidates(&guid);
         drop(state);
         self.decrement_candidate_totals(removed);
-        self.cache.remove(&guid);
+        if let Some((_, entry)) = self.cache.remove(&guid) {
+            entry.clear_dirty_hint();
+        }
     }
 
     /// Drain the current pending-delete entries from every
@@ -1279,6 +1376,13 @@ impl BufferManager {
         if matches!(state.flushing.get(&guid), Some(seq) if *seq == expected_seq) {
             state.flushing.remove(&guid);
         }
+        let still_dirty = state.dirty.contains_key(&guid) || state.flushing.contains_key(&guid);
+        drop(state);
+        if !still_dirty {
+            if let Some(entry) = self.get_cached_silent(guid) {
+                entry.clear_dirty_hint();
+            }
+        }
     }
 
     /// Forward `flush` to the inner backend without touching the
@@ -1322,6 +1426,7 @@ impl BufferManager {
         // background sweep cannot drop this fresh cache entry in
         // the small window before the dirty bit is visible.
         self.cache.insert(guid, Arc::clone(&entry));
+        let _ = entry.dirty_hint_needs_map_publish(seq);
         let mut state = self.mutation_shard(guid).lock().unwrap();
         state
             .dirty
@@ -1353,6 +1458,7 @@ impl Backend for BufferManager {
         if let Some(entry) = self.get_cached(guid) {
             let mut buf = entry.write();
             buf.as_mut_slice().copy_from_slice(src.as_slice());
+            entry.clear_dirty_hint();
         }
         self.backend.write_blob(guid, src)?;
         // Backend now holds these exact bytes; any pending dirty
@@ -1371,6 +1477,7 @@ impl Backend for BufferManager {
             if let Some(entry) = self.get_cached(*guid) {
                 let mut buf = entry.write();
                 buf.as_mut_slice().copy_from_slice(src.as_slice());
+                entry.clear_dirty_hint();
             }
         }
         self.backend.write_blobs(writes)?;
@@ -1733,6 +1840,55 @@ mod tests {
         assert_eq!(bm.dirty_count(), 1);
         let snap = bm.snapshot_dirty();
         assert_eq!(snap[&[0x01; 16]], 30);
+    }
+
+    #[test]
+    fn cached_dirty_hint_resets_after_snapshot() {
+        let inner: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        let guid = [0xD1; 16];
+        inner.write_blob(guid, &make_buf(1)).unwrap();
+        let bm = BufferManager::new(inner, 4);
+        let _pin = bm.pin(guid).unwrap();
+
+        bm.mark_dirty(guid, 10);
+        bm.mark_dirty(guid, 20);
+        let snap = bm.snapshot_dirty();
+        assert_eq!(snap[&guid], 10);
+        assert_eq!(bm.dirty_count(), 0);
+
+        bm.mark_dirty(guid, 30);
+        let next = bm.snapshot_dirty();
+        assert_eq!(
+            next[&guid], 30,
+            "mark_dirty after snapshot must publish a fresh dirty entry",
+        );
+    }
+
+    #[test]
+    fn cached_dirty_hint_preserves_lower_restored_seq() {
+        let inner: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        let guid = [0xD2; 16];
+        inner.write_blob(guid, &make_buf(1)).unwrap();
+        let bm = BufferManager::new(inner, 4);
+        let _pin = bm.pin(guid).unwrap();
+
+        let mut restored = HashMap::new();
+        restored.insert(guid, 40);
+        bm.restore_dirty(restored);
+        bm.mark_dirty(guid, 90);
+        let snap = bm.snapshot_dirty();
+        assert_eq!(
+            snap[&guid], 40,
+            "duplicate higher seq must be covered by restored low-watermark",
+        );
+
+        bm.restore_dirty(snap);
+        bm.mark_dirty(guid, 20);
+        let lowered = bm.snapshot_dirty();
+        assert_eq!(
+            lowered[&guid], 20,
+            "lower seq must still update the dirty low-watermark",
+        );
     }
 
     #[test]

@@ -113,6 +113,7 @@ pub fn insert_multi(
             let outcome = lock_coupled_insert_in_blob(
                 bm,
                 child_guard,
+                child_pin.as_ref(),
                 crossing.child_guid,
                 false,
                 key,
@@ -141,6 +142,7 @@ pub fn insert_multi(
     let outcome = lock_coupled_insert_in_blob(
         bm,
         guard,
+        root_pin.as_ref(),
         root_guid,
         true,
         key,
@@ -172,6 +174,7 @@ enum InsertStep {
 fn lock_coupled_insert_in_blob(
     bm: &BufferManager,
     mut guard: BlobWriteGuard<'_>,
+    current_entry: &CachedBlob,
     current_guid: crate::layout::BlobGuid,
     is_top_blob: bool,
     key: SearchKey<'_>,
@@ -206,7 +209,7 @@ fn lock_coupled_insert_in_blob(
                     bm.note_compaction_candidate(current_guid);
                 }
                 if !is_top_blob {
-                    bm.mark_dirty(current_guid, seq);
+                    bm.mark_dirty_cached(current_guid, seq, current_entry);
                 }
 
                 return Ok(InsertOutcome {
@@ -222,6 +225,7 @@ fn lock_coupled_insert_in_blob(
                 let mut outcome = lock_coupled_insert_in_blob(
                     bm,
                     child_guard,
+                    child_pin.as_ref(),
                     crossing.child_guid,
                     false,
                     key,
@@ -235,7 +239,7 @@ fn lock_coupled_insert_in_blob(
                 drop(child_pin);
 
                 if outcome.is_ok() && current_dirty && !is_top_blob {
-                    bm.mark_dirty(current_guid, seq);
+                    bm.mark_dirty_cached(current_guid, seq, current_entry);
                 }
                 if let Ok(outcome) = &mut outcome {
                     outcome.root_dirty |= is_top_blob && current_dirty;
