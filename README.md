@@ -68,7 +68,7 @@ without coordinating.
 **Pre-1.0, actively maintained.** The v0.3 metadata-engine core is
 landed: insert / lookup / erase / rename / range / txn / compact,
 multi-blob crossings, online maintenance gates, persistent backend
-with `O_DIRECT` and optional Linux `io_uring`, physiological WAL
+with `O_DIRECT` and optional Linux `io_uring`, logical WAL
 with group commit, sharded buffer manager, 3-thread background
 checkpointer, SIMD CRC32 + node scans, and stateful `Tree::range`
 with prefix, `start_after`, and S3 delimiter rollup.

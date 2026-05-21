@@ -1516,15 +1516,16 @@ impl Tree {
 /// `next_seq` the tree should resume from.
 ///
 /// Each record's logical mutation is re-applied through the
-/// engine. Structural ops (`Split` / `Merge` / `Compact`) are
-/// already reflected in the blob image on disk, so they're
-/// no-ops during replay; `MemMarker` is the explicit
-/// post-replay reconciliation marker and is ignored.
+/// engine. Blob-shape changes (`splitBlob`, `mergeBlob`,
+/// `compactBlob`) are deliberately not independent WAL records:
+/// they are derived from replaying logical operations or from
+/// checkpointed blob images. A standalone structural record would
+/// need full physical context to be recoverable, so the codec
+/// rejects those old draft tags instead of treating them as
+/// successful no-ops.
 ///
 /// `RenameObject` is rebuilt as the same erase + insert it ran
-/// originally. `Rename` (cross-tree) doesn't apply to the
-/// single-tree API surface and is rejected. `NewTree` / `RmTree`
-/// reserved for multi-tenant deployment; ignored here.
+/// originally.
 ///
 /// ## Dirty tracking on replay
 ///
@@ -1594,19 +1595,10 @@ fn replay_wal(path: &std::path::Path, bm: &Arc<BufferManager>, root_guid: BlobGu
                     engine::insert_multi(bm, &root_pin, None, dst_search, &value, seq, false)?;
                 erase_out.root_dirty || insert_out.root_dirty
             }
-            // Structural / multi-tenant / marker variants don't
-            // affect logical state at the single-tree API surface.
             // `Batch` is unpacked into per-inner callbacks inside
             // `journal::reader::replay_bytes`, so it never reaches
             // this match — defensive arm only.
-            TxnOp::Split { .. }
-            | TxnOp::Merge { .. }
-            | TxnOp::Compact { .. }
-            | TxnOp::Rename { .. }
-            | TxnOp::NewTree { .. }
-            | TxnOp::RmTree { .. }
-            | TxnOp::MemMarker { .. }
-            | TxnOp::Batch { .. } => false,
+            TxnOp::Batch { .. } => false,
         };
         if root_dirty {
             // Honour the walker's caller-side `mark_dirty(root,

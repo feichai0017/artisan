@@ -1,24 +1,9 @@
-//! TxnOp variants — one per ART mutation kind.
+//! TxnOp variants — durable logical redo records.
 //!
 //! Each variant carries the minimal info needed to replay the
 //! operation deterministically during WAL recovery.
 
-/// Reason a `compactBlob` (or `splitBlob`-triggered compact)
-/// fired. Encoded into the WAL as the `reason` body of
-/// [`TxnOp::Compact`]. Stable on-disk tag values are assigned
-/// in [`super::codec`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CompactReason {
-    /// Too many tombstone leaves; rebuild dropping them.
-    SplitTombstone,
-    /// Bump-allocator wasted space exceeds threshold; rebuild
-    /// compactly.
-    SplitGapSpace,
-    /// Alloc failed in the current blob; spill a subtree out.
-    OutOfBlobFrame,
-}
-
-/// 11 transaction-op variants emitted by the walker.
+/// Transaction-op variants emitted by the public tree API.
 ///
 /// Variant tags are stable on-disk constants — see the `TY_*`
 /// block in [`super::codec`]. Never renumber; only append.
@@ -61,33 +46,6 @@ pub enum TxnOp {
         /// Key bytes.
         key: Vec<u8>,
     },
-    /// `splitBlob` — subtree moved to a new blob.
-    Split {
-        /// Parent blob's GUID.
-        parent_blob: [u8; 16],
-        /// Slot that pointed at the pre-split node.
-        pre_split_node: u16,
-        /// New child blob's GUID.
-        new_child_blob: [u8; 16],
-        /// Entry slot inside the new child blob.
-        new_child_entry: u16,
-    },
-    /// `mergeBlob` — child blob's contents pulled back into parent.
-    Merge {
-        /// Parent blob's GUID.
-        parent_blob: [u8; 16],
-        /// Slot at which the merge-target sat.
-        pre_merge_node: u16,
-        /// Child blob that was merged + freed.
-        child_blob: [u8; 16],
-    },
-    /// `compactBlob` — in-place rebuild dropping orphans.
-    Compact {
-        /// Compacted blob's GUID.
-        blob: [u8; 16],
-        /// Why we compacted.
-        reason: CompactReason,
-    },
     /// Atomic in-tree rename.
     RenameObject {
         /// Owning tree root identifier.
@@ -100,39 +58,6 @@ pub enum TxnOp {
         dst_key: Vec<u8>,
         /// Overwrite if dst exists.
         force: bool,
-    },
-    /// Cross-tree rename (different bucket / root).
-    Rename {
-        /// Source tree.
-        src_tree_id: u64,
-        /// Destination tree.
-        dst_tree_id: u64,
-        /// MVCC seq.
-        seq: u64,
-        /// Source key.
-        src_key: Vec<u8>,
-        /// Destination key.
-        dst_key: Vec<u8>,
-        /// Overwrite if dst exists.
-        force: bool,
-    },
-    /// Create a new tree (NewTreeTxnOp).
-    NewTree {
-        /// Tree root identifier to allocate.
-        tree_id: u64,
-        /// Tree's name (bucket name in S3 terms).
-        name: Vec<u8>,
-    },
-    /// Drop a tree (RmTreeTxnOp).
-    RmTree {
-        /// Tree root identifier.
-        tree_id: u64,
-    },
-    /// Memory-only twin: SplitMemOp, MergeMemOp, etc.
-    /// (Post-replay-ack reconciliation; carries no durable state.)
-    MemMarker {
-        /// Sequence number for reconciliation.
-        seq: u64,
     },
     /// Batch — one WAL record carrying multiple primitive ops so a
     /// crash either replays all of them or none.

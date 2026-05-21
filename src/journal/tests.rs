@@ -8,7 +8,9 @@ use std::path::PathBuf;
 
 use tempfile::tempdir;
 
-use super::codec::{FILE_HEADER_SIZE, FORMAT_VERSION};
+use super::codec::{
+    crc32, encode_file_header, FileHeader, FILE_HEADER_SIZE, FORMAT_VERSION, RECORD_MAGIC,
+};
 use super::reader::replay;
 use super::txn_op::TxnOp;
 use super::writer::{WalWriter, AUTO_FLUSH_THRESHOLD};
@@ -16,6 +18,17 @@ use crate::api::errors::Error;
 
 fn wal_path(dir: &tempfile::TempDir) -> PathBuf {
     dir.path().join("test.wal")
+}
+
+fn append_raw_record(out: &mut Vec<u8>, seq: u64, ty: u8, body: &[u8]) {
+    let start = out.len();
+    out.extend_from_slice(&RECORD_MAGIC.to_le_bytes());
+    out.extend_from_slice(&(body.len() as u32).to_le_bytes());
+    out.extend_from_slice(&seq.to_le_bytes());
+    out.push(ty);
+    out.extend_from_slice(body);
+    let crc = crc32(&out[start..]);
+    out.extend_from_slice(&crc.to_le_bytes());
 }
 
 fn sample_ops() -> Vec<TxnOp> {
@@ -43,12 +56,6 @@ fn sample_ops() -> Vec<TxnOp> {
             src_key: b"img/02.jpg".to_vec(),
             dst_key: b"img/02-renamed.jpg".to_vec(),
             force: false,
-        },
-        TxnOp::Split {
-            parent_blob: [0; 16],
-            pre_split_node: 7,
-            new_child_blob: [0xCD; 16],
-            new_child_entry: 1,
         },
     ]
 }
@@ -83,6 +90,34 @@ fn create_open_round_trip_all_variants() {
     for (i, (decoded_dbg, seq)) in collected.iter().enumerate() {
         assert_eq!(*seq, i as u64 + 1);
         assert_eq!(decoded_dbg, &format!("{:?}", ops[i]));
+    }
+}
+
+#[test]
+fn replay_rejects_removed_structural_tag() {
+    let dir = tempdir().unwrap();
+    let path = wal_path(&dir);
+
+    let mut bytes = Vec::new();
+    encode_file_header(
+        &FileHeader {
+            tree_id: 0,
+            created_at: 0,
+        },
+        &mut bytes,
+    );
+    append_raw_record(&mut bytes, 7, 2, &[]);
+    fs::write(&path, &bytes).unwrap();
+
+    match replay(&path, |_, _, _| Ok(())) {
+        Err(Error::ReplaySanityFailed {
+            context,
+            record_offset,
+        }) => {
+            assert!(context.contains("variant"));
+            assert_eq!(record_offset, FILE_HEADER_SIZE as u64);
+        }
+        other => panic!("expected removed structural tag rejection, got {other:?}"),
     }
 }
 

@@ -23,7 +23,7 @@ workload can use it on a single node.
 Delivered: 9-NodeType ART layout pinned at compile time, recursive
 walker (insert / lookup / erase / rename), cross-blob `splitBlob`
 / `mergeBlob` / `compactBlob`, `PersistentBackend` (`O_DIRECT`
-Linux + `F_NOCACHE` macOS), physiological WAL with replay,
+Linux + `F_NOCACHE` macOS), logical WAL with replay,
 `Tree::range` iterator with prefix + start-after + S3-style
 delimiter rollup, `Tree::txn` batch transactions under one WAL
 record, four examples (`basic_kv` / `filesystem_meta` /

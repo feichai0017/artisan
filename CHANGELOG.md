@@ -9,7 +9,19 @@ fine-grained per-commit history is in `git log`.
 
 ## [Unreleased]
 
-No unreleased changes yet.
+### Changed
+
+- WAL `TxnOp` is now a logical redo surface only: `Insert`,
+  `Erase`, `RenameObject`, and `Batch`. Removed draft
+  structural / multi-tree variants that production never emitted
+  and replay previously treated as successful no-ops; their old
+  draft tags now fail decode as unsupported records.
+
+### Fixed
+
+- CI and release test gates no longer execute the Criterion
+  benchmark harness through `cargo test --all-targets`; benchmark
+  coverage stays in the dedicated bench job.
 
 ## [0.3.0] — 2026-05-21
 
@@ -521,7 +533,7 @@ Full numbers in [`benches/RESULTS.md`](benches/RESULTS.md).
 First crates.io release. The v0.1 cycle built the engine end-to-
 end on a single Unix-only stack: ART core, multi-blob `splitBlob`
 / `mergeBlob` / `compactBlob`, `PersistentBackend` (`O_DIRECT`
-Linux + `F_NOCACHE` macOS), physiological WAL with replay,
+Linux + `F_NOCACHE` macOS), logical WAL with replay,
 S3-style range iteration with delimiter rollup. 203 tests on
 ubuntu + macOS CI.
 

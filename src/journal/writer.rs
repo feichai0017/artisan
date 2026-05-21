@@ -151,11 +151,10 @@ impl WalWriter {
     /// `sync_data`) — bounded user-space buffering, but per-op
     /// cost stays at an in-memory copy.
     ///
-    /// Generic test-time entry point for exercising structural
-    /// variants (Split / Merge / Compact / MemMarker / NewTree /
-    /// RmTree) end-to-end through the writer + replay path.
-    /// Production hot paths encode records before handing them to
-    /// the group-commit journal worker.
+    /// Generic test-time entry point for exercising enum encoding
+    /// end-to-end through the writer + replay path. Production
+    /// hot paths encode records before handing them to the
+    /// group-commit journal worker.
     #[cfg(test)]
     pub fn append(&mut self, op: &TxnOp, seq: u64) -> Result<()> {
         encode_record(op, seq, &mut self.pending);

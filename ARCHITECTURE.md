@@ -196,13 +196,15 @@ atomically. `put` / `delete` / `get` never take `rename_lock`.
 
 ## 6. Persistence + crash safety
 
-### WAL — physiological log of TxnOps
+### WAL — logical redo log of TxnOps
 
 Mutations emit encoded `TxnOp` records to an append-only
-`journal.wal` file via the journal worker. Eleven variants today:
-`Insert`, `Erase`, `Split`, `Merge`,
-`Compact`, `RenameObject`, `Rename`, `NewTree`, `RmTree`,
-`MemMarker`, `Batch`. Each record is
+`journal.wal` file via the journal worker. The durable variants
+are the logical API mutations: `Insert`, `Erase`, `RenameObject`,
+and `Batch`. Blob-shape changes (`splitBlob`, `mergeBlob`,
+`compactBlob`) are recovered either by replaying those logical
+records or by loading checkpointed blob images; they are not
+standalone WAL records. Each record is
 
 ```text
 MAGIC | LEN | SEQ | TY | BODY | CRC32

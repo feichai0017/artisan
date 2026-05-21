@@ -1,4 +1,4 @@
-//! Physiological WAL record codec — binary encoding for [`TxnOp`].
+//! Logical WAL record codec — binary encoding for [`TxnOp`].
 //!
 //! Each record on disk has the shape
 //!
@@ -31,12 +31,8 @@
 //! strings (keys, values, tree names) use a `u32` LE length
 //! followed by raw bytes.
 
-use crate::api::errors::{Error, Result};
-use crate::layout::BlobGuid;
-
-use super::txn_op::CompactReason;
-
 use super::txn_op::TxnOp;
+use crate::api::errors::{Error, Result};
 
 /// Start-of-record magic — `"RECR"` little-endian.
 pub const RECORD_MAGIC: u32 = 0x5243_4552;
@@ -154,24 +150,16 @@ pub fn decode_file_header(buf: &[u8]) -> Result<FileHeader> {
     })
 }
 
-// On-disk variant tags. Stable; only ever add new tags, never
-// renumber existing ones.
+// On-disk variant tags. Stable for format v3; only ever add new
+// tags, never renumber existing ones. Tags 2..4 and 6..9 are
+// intentionally unassigned in production: an internal v0.3 draft
+// had non-emitted structural / multi-tree variants there, but
+// Holt's recovery contract is logical redo plus checkpointed blob
+// images, not standalone structural WAL replay.
 const TY_INSERT: u8 = 0;
 const TY_ERASE: u8 = 1;
-const TY_SPLIT: u8 = 2;
-const TY_MERGE: u8 = 3;
-const TY_COMPACT: u8 = 4;
 const TY_RENAME_OBJECT: u8 = 5;
-const TY_RENAME: u8 = 6;
-const TY_NEW_TREE: u8 = 7;
-const TY_RM_TREE: u8 = 8;
-const TY_MEM_MARKER: u8 = 9;
 const TY_BATCH: u8 = 10;
-
-// CompactReason on-disk tags (stable).
-const REASON_SPLIT_TOMBSTONE: u8 = 0;
-const REASON_SPLIT_GAP_SPACE: u8 = 1;
-const REASON_OUT_OF_BLOB_FRAME: u8 = 2;
 
 // ---------- CRC32 (IEEE 802.3) ----------
 
@@ -191,7 +179,7 @@ pub fn crc32(bytes: &[u8]) -> u32 {
 
 // ---------- encode ----------
 
-/// Test-only generic encoder for structural `TxnOp` variants.
+/// Test-only generic encoder for `TxnOp` variants.
 ///
 /// Production hot paths use the per-variant encoders below. Keeping
 /// this generic enum path out of release builds prevents it from
@@ -418,14 +406,7 @@ fn variant_tag(op: &TxnOp) -> u8 {
     match op {
         TxnOp::Insert { .. } => TY_INSERT,
         TxnOp::Erase { .. } => TY_ERASE,
-        TxnOp::Split { .. } => TY_SPLIT,
-        TxnOp::Merge { .. } => TY_MERGE,
-        TxnOp::Compact { .. } => TY_COMPACT,
         TxnOp::RenameObject { .. } => TY_RENAME_OBJECT,
-        TxnOp::Rename { .. } => TY_RENAME,
-        TxnOp::NewTree { .. } => TY_NEW_TREE,
-        TxnOp::RmTree { .. } => TY_RM_TREE,
-        TxnOp::MemMarker { .. } => TY_MEM_MARKER,
         TxnOp::Batch { .. } => TY_BATCH,
     }
 }
@@ -451,30 +432,6 @@ fn encode_body(op: &TxnOp, out: &mut Vec<u8>) {
             out.extend_from_slice(&tree_id.to_le_bytes());
             write_bytes(out, key);
         }
-        TxnOp::Split {
-            parent_blob,
-            pre_split_node,
-            new_child_blob,
-            new_child_entry,
-        } => {
-            out.extend_from_slice(parent_blob);
-            out.extend_from_slice(&pre_split_node.to_le_bytes());
-            out.extend_from_slice(new_child_blob);
-            out.extend_from_slice(&new_child_entry.to_le_bytes());
-        }
-        TxnOp::Merge {
-            parent_blob,
-            pre_merge_node,
-            child_blob,
-        } => {
-            out.extend_from_slice(parent_blob);
-            out.extend_from_slice(&pre_merge_node.to_le_bytes());
-            out.extend_from_slice(child_blob);
-        }
-        TxnOp::Compact { blob, reason } => {
-            out.extend_from_slice(blob);
-            out.push(encode_reason(*reason));
-        }
         TxnOp::RenameObject {
             tree_id,
             seq: _,
@@ -486,30 +443,6 @@ fn encode_body(op: &TxnOp, out: &mut Vec<u8>) {
             write_bytes(out, src_key);
             write_bytes(out, dst_key);
             out.push(u8::from(*force));
-        }
-        TxnOp::Rename {
-            src_tree_id,
-            dst_tree_id,
-            seq: _,
-            src_key,
-            dst_key,
-            force,
-        } => {
-            out.extend_from_slice(&src_tree_id.to_le_bytes());
-            out.extend_from_slice(&dst_tree_id.to_le_bytes());
-            write_bytes(out, src_key);
-            write_bytes(out, dst_key);
-            out.push(u8::from(*force));
-        }
-        TxnOp::NewTree { tree_id, name } => {
-            out.extend_from_slice(&tree_id.to_le_bytes());
-            write_bytes(out, name);
-        }
-        TxnOp::RmTree { tree_id } => {
-            out.extend_from_slice(&tree_id.to_le_bytes());
-        }
-        TxnOp::MemMarker { seq: _ } => {
-            // Body is empty — seq travels in the record header.
         }
         TxnOp::Batch { tree_id, ops } => {
             out.extend_from_slice(&tree_id.to_le_bytes());
@@ -525,15 +458,6 @@ fn encode_body(op: &TxnOp, out: &mut Vec<u8>) {
                 encode_body(inner, out);
             }
         }
-    }
-}
-
-#[cfg(test)]
-fn encode_reason(r: CompactReason) -> u8 {
-    match r {
-        CompactReason::SplitTombstone => REASON_SPLIT_TOMBSTONE,
-        CompactReason::SplitGapSpace => REASON_SPLIT_GAP_SPACE,
-        CompactReason::OutOfBlobFrame => REASON_OUT_OF_BLOB_FRAME,
     }
 }
 
@@ -607,10 +531,9 @@ fn decode_body(ty: u8, body: &[u8], seq: u64) -> Result<TxnOp> {
 }
 
 /// Internal: decode one variant body from `cursor`, advancing it.
-/// Doesn't enforce body-exhaustion — `decode_body` wraps with that
-/// check, and `TY_BATCH` re-enters this for each inner op (sharing
-/// the parent's cursor as the inner-frame stream).
-#[allow(clippy::too_many_lines)] // single big match over 11 variants reads cleaner inline than split
+/// Doesn't enforce body-exhaustion — `decode_body` wraps with
+/// that check, and `TY_BATCH` re-enters this for each inner op
+/// (sharing the parent's cursor as the inner-frame stream).
 fn decode_body_into(ty: u8, body: &mut &[u8], seq: u64) -> Result<TxnOp> {
     let op = match ty {
         TY_INSERT => {
@@ -629,33 +552,6 @@ fn decode_body_into(ty: u8, body: &mut &[u8], seq: u64) -> Result<TxnOp> {
             let key = read_bytes(body)?;
             TxnOp::Erase { tree_id, seq, key }
         }
-        TY_SPLIT => {
-            let parent_blob = read_guid(body)?;
-            let pre_split_node = read_u16(body)?;
-            let new_child_blob = read_guid(body)?;
-            let new_child_entry = read_u16(body)?;
-            TxnOp::Split {
-                parent_blob,
-                pre_split_node,
-                new_child_blob,
-                new_child_entry,
-            }
-        }
-        TY_MERGE => {
-            let parent_blob = read_guid(body)?;
-            let pre_merge_node = read_u16(body)?;
-            let child_blob = read_guid(body)?;
-            TxnOp::Merge {
-                parent_blob,
-                pre_merge_node,
-                child_blob,
-            }
-        }
-        TY_COMPACT => {
-            let blob = read_guid(body)?;
-            let reason = decode_reason(read_u8(body)?)?;
-            TxnOp::Compact { blob, reason }
-        }
         TY_RENAME_OBJECT => {
             let tree_id = read_u64(body)?;
             let src_key = read_bytes(body)?;
@@ -669,31 +565,6 @@ fn decode_body_into(ty: u8, body: &mut &[u8], seq: u64) -> Result<TxnOp> {
                 force,
             }
         }
-        TY_RENAME => {
-            let src_tree_id = read_u64(body)?;
-            let dst_tree_id = read_u64(body)?;
-            let src_key = read_bytes(body)?;
-            let dst_key = read_bytes(body)?;
-            let force = read_u8(body)? != 0;
-            TxnOp::Rename {
-                src_tree_id,
-                dst_tree_id,
-                seq,
-                src_key,
-                dst_key,
-                force,
-            }
-        }
-        TY_NEW_TREE => {
-            let tree_id = read_u64(body)?;
-            let name = read_bytes(body)?;
-            TxnOp::NewTree { tree_id, name }
-        }
-        TY_RM_TREE => {
-            let tree_id = read_u64(body)?;
-            TxnOp::RmTree { tree_id }
-        }
-        TY_MEM_MARKER => TxnOp::MemMarker { seq },
         TY_BATCH => {
             let tree_id = read_u64(body)?;
             let count = read_u32(body)? as usize;
@@ -714,25 +585,10 @@ fn decode_body_into(ty: u8, body: &mut &[u8], seq: u64) -> Result<TxnOp> {
     Ok(op)
 }
 
-fn decode_reason(t: u8) -> Result<CompactReason> {
-    match t {
-        REASON_SPLIT_TOMBSTONE => Ok(CompactReason::SplitTombstone),
-        REASON_SPLIT_GAP_SPACE => Ok(CompactReason::SplitGapSpace),
-        REASON_OUT_OF_BLOB_FRAME => Ok(CompactReason::OutOfBlobFrame),
-        _ => Err(sanity("unknown CompactReason tag")),
-    }
-}
-
 fn read_u8(body: &mut &[u8]) -> Result<u8> {
     let (front, rest) = take(body, 1)?;
     *body = rest;
     Ok(front[0])
-}
-
-fn read_u16(body: &mut &[u8]) -> Result<u16> {
-    let (front, rest) = take(body, 2)?;
-    *body = rest;
-    Ok(u16::from_le_bytes(front.try_into().unwrap()))
 }
 
 fn read_u32(body: &mut &[u8]) -> Result<u32> {
@@ -745,14 +601,6 @@ fn read_u64(body: &mut &[u8]) -> Result<u64> {
     let (front, rest) = take(body, 8)?;
     *body = rest;
     Ok(u64::from_le_bytes(front.try_into().unwrap()))
-}
-
-fn read_guid(body: &mut &[u8]) -> Result<BlobGuid> {
-    let (front, rest) = take(body, 16)?;
-    *body = rest;
-    let mut g = [0u8; 16];
-    g.copy_from_slice(front);
-    Ok(g)
 }
 
 fn read_bytes(body: &mut &[u8]) -> Result<Vec<u8>> {
@@ -837,48 +685,6 @@ mod tests {
     }
 
     #[test]
-    fn roundtrip_split() {
-        roundtrip(
-            TxnOp::Split {
-                parent_blob: [0xAA; 16],
-                pre_split_node: 123,
-                new_child_blob: [0xBB; 16],
-                new_child_entry: 7,
-            },
-            500,
-        );
-    }
-
-    #[test]
-    fn roundtrip_merge() {
-        roundtrip(
-            TxnOp::Merge {
-                parent_blob: [0x33; 16],
-                pre_merge_node: 200,
-                child_blob: [0x44; 16],
-            },
-            501,
-        );
-    }
-
-    #[test]
-    fn roundtrip_compact_each_reason() {
-        for reason in [
-            CompactReason::SplitTombstone,
-            CompactReason::SplitGapSpace,
-            CompactReason::OutOfBlobFrame,
-        ] {
-            roundtrip(
-                TxnOp::Compact {
-                    blob: [0x77; 16],
-                    reason,
-                },
-                700,
-            );
-        }
-    }
-
-    #[test]
     fn roundtrip_rename_object() {
         roundtrip(
             TxnOp::RenameObject {
@@ -893,35 +699,41 @@ mod tests {
     }
 
     #[test]
-    fn roundtrip_cross_tree_rename() {
-        roundtrip(
-            TxnOp::Rename {
-                src_tree_id: 1,
-                dst_tree_id: 2,
-                seq: 11,
-                src_key: b"x".to_vec(),
-                dst_key: b"y".to_vec(),
-                force: false,
-            },
-            11,
-        );
+    fn removed_cross_tree_rename_tag_is_rejected() {
+        let mut buf = Vec::new();
+        write_record(&mut buf, 11, 6, |body| {
+            body.extend_from_slice(&1u64.to_le_bytes());
+            body.extend_from_slice(&2u64.to_le_bytes());
+            write_bytes(body, b"x");
+            write_bytes(body, b"y");
+            body.push(0);
+        });
+
+        assert!(matches!(
+            decode_record(&buf),
+            Err(Error::ReplaySanityFailed {
+                context: "unknown TxnOp variant tag",
+                ..
+            })
+        ));
     }
 
     #[test]
-    fn roundtrip_new_and_rm_tree() {
-        roundtrip(
-            TxnOp::NewTree {
-                tree_id: 5,
-                name: b"bucket-images".to_vec(),
-            },
-            1,
-        );
-        roundtrip(TxnOp::RmTree { tree_id: 5 }, 2);
-    }
-
-    #[test]
-    fn roundtrip_mem_marker() {
-        roundtrip(TxnOp::MemMarker { seq: 999 }, 999);
+    fn removed_structural_tags_are_rejected() {
+        for ty in [2, 3, 4] {
+            let mut buf = Vec::new();
+            write_record(&mut buf, 500 + u64::from(ty), ty, |_| {});
+            assert!(
+                matches!(
+                    decode_record(&buf),
+                    Err(Error::ReplaySanityFailed {
+                        context: "unknown TxnOp variant tag",
+                        ..
+                    })
+                ),
+                "removed structural tag {ty} should not decode",
+            );
+        }
     }
 
     #[test]
@@ -961,7 +773,11 @@ mod tests {
 
     #[test]
     fn corrupt_magic_is_caught() {
-        let op = TxnOp::MemMarker { seq: 5 };
+        let op = TxnOp::Erase {
+            tree_id: 0,
+            seq: 5,
+            key: b"k".to_vec(),
+        };
         let mut buf = Vec::new();
         encode_record(&op, 5, &mut buf);
         buf[0] ^= 0xFF;
@@ -996,14 +812,19 @@ mod tests {
 
     #[test]
     fn unknown_variant_tag_is_caught() {
-        let op = TxnOp::MemMarker { seq: 1 };
+        let op = TxnOp::Erase {
+            tree_id: 0,
+            seq: 1,
+            key: b"k".to_vec(),
+        };
         let mut buf = Vec::new();
         encode_record(&op, 1, &mut buf);
         // Overwrite the ty byte (header offset 16) with a bogus value.
         buf[16] = 0xFF;
         // Recompute the CRC so the corruption looks plausible
         // — confirms the "unknown tag" path triggers (and not "CRC").
-        let body_end = RECORD_HEADER_SIZE; // MemMarker has empty body
+        let body_len = u32::from_le_bytes(buf[4..8].try_into().unwrap()) as usize;
+        let body_end = RECORD_HEADER_SIZE + body_len;
         let crc = crc32(&buf[..body_end]);
         buf[body_end..body_end + 4].copy_from_slice(&crc.to_le_bytes());
 

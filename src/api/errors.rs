@@ -65,9 +65,9 @@ pub enum Error {
         /// problems.
         slot: Option<u16>,
     },
-    /// WAL replay encountered a TxnOp whose `sanity_info`
-    /// validation failed — record magic mismatch, CRC32 mismatch,
-    /// unknown variant tag, truncated body, etc.
+    /// WAL replay encountered a record whose sanity validation
+    /// failed — record magic mismatch, CRC32 mismatch, unknown
+    /// variant tag, truncated body, etc.
     ReplaySanityFailed {
         /// What went wrong (decoder-supplied static string).
         context: &'static str,

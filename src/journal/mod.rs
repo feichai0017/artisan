@@ -1,11 +1,9 @@
-//! Journal — physiological WAL + replay.
+//! Journal — logical WAL + replay.
 //!
 //! Layered design:
 //!
-//! - [`txn_op`] — the `TxnOp` variant union; one variant per
-//!   walker-level mutation kind (`Insert`, `Erase`, `Split`,
-//!   `Merge`, `Compact`, two `Rename` flavours, `NewTree`,
-//!   `RmTree`, `MemMarker`, `Batch`).
+//! - [`txn_op`] — the `TxnOp` variant union for durable logical
+//!   mutations (`Insert`, `Erase`, `RenameObject`, `Batch`).
 //! - [`codec`] — binary record codec + file header. Pure
 //!   in-memory bytes ↔ `TxnOp`.
 //! - [`writer`] — append-only WAL file with
