@@ -18,6 +18,7 @@ use std::sync::{Arc, Mutex};
 use super::config::{Storage, TreeConfig};
 use super::errors::{Error, Result};
 use super::stats::{BlobStats, CheckpointerStats, JournalStats, RouteCacheStats, TreeStats};
+use super::view::View;
 use crate::concurrency::{CommitGate, MaintenanceGate};
 use crate::engine;
 use crate::engine::{KeyRangeBuilder, KeyRangeEntry, RangeBuilder};
@@ -1345,6 +1346,46 @@ impl Tree {
     /// values are not needed for every emitted key.
     pub fn scan_keys(&self, prefix: &[u8]) -> KeyRangeBuilder {
         self.range_keys().prefix(prefix)
+    }
+
+    /// Run a read-only transaction over a prefix snapshot.
+    ///
+    /// The tree captures the blob frames reachable for `prefix`
+    /// under a short exclusive maintenance gate, releases the live
+    /// tree, then invokes `read` with an immutable [`View`]. Writes
+    /// committed after the capture are invisible to all reads made
+    /// through that view. The implementation copies blob frames, not
+    /// decoded entries, so point lookup and range/list operations
+    /// keep using the ART walker.
+    ///
+    /// A view is scoped: reads outside `prefix` return
+    /// [`Error::OutsideViewScope`]. Use `prefix = b""` only when a
+    /// whole-tree snapshot is intentional.
+    pub fn view<F, R>(&self, prefix: &[u8], read: F) -> Result<R>
+    where
+        F: FnOnce(&View) -> Result<R>,
+    {
+        let view = self.capture_view(prefix)?;
+        read(&view)
+    }
+
+    fn capture_view(&self, prefix: &[u8]) -> Result<View> {
+        let scope = prefix.to_vec();
+        let (snapshot_store, blob_count) = {
+            let _maintenance = self.maintenance_gate.enter_exclusive();
+            let topology =
+                engine::collect_prefix_blob_topology_silent(&self.store, self.root_guid, prefix)?;
+            let snapshot_store = Arc::new(MemoryBlobStore::new());
+            for entry in &topology {
+                let bytes = self.store.snapshot_blob_image(entry.guid)?;
+                snapshot_store.write_blob(entry.guid, &bytes)?;
+            }
+            (snapshot_store, topology.len())
+        };
+
+        let snapshot_bm = Arc::new(BufferManager::new(snapshot_store, blob_count.max(1)));
+        let root_pin = snapshot_bm.pin(self.root_guid)?;
+        Ok(View::new(scope, snapshot_bm, self.root_guid, root_pin))
     }
 
     /// Return `true` if no live key starts with `prefix`.

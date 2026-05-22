@@ -37,8 +37,8 @@
 //!
 //! The supported import surface is the flat crate root:
 //! [`Tree`], [`TreeBuilder`], [`AtomicBatch`], [`Record`],
-//! [`RecordVersion`], range iterator types, stats snapshots, and
-//! the optional `metrics` renderer.
+//! [`RecordVersion`], [`View`], range iterator types, stats
+//! snapshots, and the optional `metrics` renderer.
 //!
 //! All implementation modules are crate-private. This keeps the
 //! on-disk format, WAL codec, walker, and buffer-manager internals
@@ -153,6 +153,7 @@ pub use api::builder::TreeBuilder;
 pub use api::config::{Storage, TreeConfig, WalCommit};
 pub use api::errors::{Error, Result};
 pub use api::tree::Tree;
+pub use api::view::{View, ViewKeyRangeBuilder, ViewRangeBuilder};
 
 // Range-scan iterator surface.
 pub use engine::{

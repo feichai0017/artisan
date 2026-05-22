@@ -1044,6 +1044,25 @@ impl BufferManager {
         Some(out)
     }
 
+    /// Snapshot the latest image of `guid` whether or not it is
+    /// currently cached.
+    ///
+    /// Cached entries win because they may contain dirty bytes that
+    /// have not reached the inner store yet. On a cache miss, the
+    /// blob is known to be clean from the buffer manager's point of
+    /// view and can be copied directly from the store.
+    pub(crate) fn snapshot_blob_image(&self, guid: BlobGuid) -> Result<AlignedBlobBuf> {
+        if let Some(entry) = self.get_cached_silent(guid) {
+            let buf = entry.read();
+            let mut out = self.store.alloc_blob_buf_uninit();
+            out.as_mut_slice().copy_from_slice(buf.as_slice());
+            return Ok(out);
+        }
+        let mut out = self.store.alloc_blob_buf_uninit();
+        self.store.read_blob(guid, &mut out)?;
+        Ok(out)
+    }
+
     /// Allocate a zero-filled blob buffer from the inner store's
     /// preferred allocator.
     #[must_use]

@@ -33,6 +33,23 @@ fn durable_cfg(dir: &std::path::Path) -> TreeConfig {
 }
 
 #[test]
+fn view_snapshots_uncheckpointed_persistent_bytes() {
+    let dir = tempdir().unwrap();
+    let tree = Tree::open(durable_cfg(dir.path())).unwrap();
+
+    tree.put(b"tenant-a/file", b"old").unwrap();
+    tree.view(b"tenant-a/", |view| {
+        tree.put(b"tenant-a/file", b"new").unwrap();
+        tree.put(b"tenant-a/after-view", b"new").unwrap();
+
+        assert_eq!(view.get(b"tenant-a/file")?.as_deref(), Some(&b"old"[..]));
+        assert!(view.get(b"tenant-a/after-view")?.is_none());
+        Ok(())
+    })
+    .unwrap();
+}
+
+#[test]
 fn durable_writers_share_group_commit_syncs() {
     let dir = tempdir().unwrap();
     let tree = Arc::new(Tree::open(durable_cfg(dir.path())).unwrap());

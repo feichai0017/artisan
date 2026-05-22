@@ -84,6 +84,14 @@ pub enum Error {
     /// already has a leaf. Caller can retry with `force=true` to
     /// overwrite.
     DstExists,
+    /// A scoped [`crate::View`] read tried to access a key or range
+    /// prefix outside the subtree captured when the view was opened.
+    OutsideViewScope {
+        /// Length of the requested key or prefix.
+        requested_len: usize,
+        /// Length of the view's captured prefix.
+        scope_len: usize,
+    },
 }
 
 impl Error {
@@ -169,6 +177,13 @@ impl std::fmt::Display for Error {
             Self::DstExists => write!(
                 f,
                 "destination key already exists (use force=true to overwrite)"
+            ),
+            Self::OutsideViewScope {
+                requested_len,
+                scope_len,
+            } => write!(
+                f,
+                "view access outside captured scope (requested {requested_len} bytes, scope {scope_len} bytes)"
             ),
         }
     }

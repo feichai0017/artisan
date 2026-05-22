@@ -1684,6 +1684,130 @@ fn key_range_builder_visit_honors_limit() {
     );
 }
 
+// ----------------------------------------------------------------
+// Tree::view
+// ----------------------------------------------------------------
+
+#[test]
+fn view_get_reads_captured_state_after_live_mutation() {
+    let tree = Tree::open(TreeConfig::memory()).unwrap();
+    tree.put(b"tenant-a/file", b"old").unwrap();
+    tree.put(b"tenant-b/file", b"outside").unwrap();
+
+    tree.view(b"tenant-a/", |view| {
+        assert_eq!(view.get(b"tenant-a/file")?.as_deref(), Some(&b"old"[..]));
+
+        tree.put(b"tenant-a/file", b"new").unwrap();
+        tree.put(b"tenant-a/created-after-view", b"new").unwrap();
+        tree.delete(b"tenant-a/file").unwrap();
+
+        assert_eq!(view.get(b"tenant-a/file")?.as_deref(), Some(&b"old"[..]));
+        assert!(view.get(b"tenant-a/created-after-view")?.is_none());
+        Ok(())
+    })
+    .unwrap();
+
+    assert!(tree.get(b"tenant-a/file").unwrap().is_none());
+    assert_eq!(
+        tree.get(b"tenant-a/created-after-view").unwrap().as_deref(),
+        Some(&b"new"[..])
+    );
+}
+
+#[test]
+fn view_range_and_key_visit_are_snapshot_consistent() {
+    let tree = Tree::open(TreeConfig::memory()).unwrap();
+    for key in [b"dir/a".as_slice(), b"dir/b", b"dir/sub/x"] {
+        tree.put(key, b"value").unwrap();
+    }
+
+    tree.view(b"dir/", |view| {
+        tree.put(b"dir/c", b"value").unwrap();
+        tree.put(b"dir/sub/y", b"value").unwrap();
+
+        let records = collect_keys(view.range().delimiter(b'/'));
+        assert_eq!(
+            records,
+            vec![b"dir/a".to_vec(), b"dir/b".to_vec(), b"dir/sub/".to_vec()]
+        );
+
+        let mut keys = Vec::new();
+        view.range_keys().delimiter(b'/').visit(16, |entry| {
+            match entry {
+                KeyRangeEntryRef::Key { key, .. } => keys.push(key.to_vec()),
+                KeyRangeEntryRef::CommonPrefix(prefix) => keys.push(prefix.to_vec()),
+                _ => panic!("KeyRangeEntryRef got a new variant"),
+            }
+            Ok(())
+        })?;
+        assert_eq!(keys, records);
+        Ok(())
+    })
+    .unwrap();
+
+    let live = collect_keys(tree.scan(b"dir/").delimiter(b'/'));
+    assert_eq!(
+        live,
+        vec![
+            b"dir/a".to_vec(),
+            b"dir/b".to_vec(),
+            b"dir/c".to_vec(),
+            b"dir/sub/".to_vec(),
+        ]
+    );
+}
+
+#[test]
+fn view_rejects_reads_outside_captured_scope() {
+    let tree = Tree::open(TreeConfig::memory()).unwrap();
+    tree.put(b"tenant-a/file", b"a").unwrap();
+    tree.put(b"tenant-b/file", b"b").unwrap();
+
+    tree.view(b"tenant-a/", |view| {
+        assert!(matches!(
+            view.get(b"tenant-b/file"),
+            Err(holt::Error::OutsideViewScope { .. })
+        ));
+        assert!(matches!(
+            view.scan(b"tenant-b/"),
+            Err(holt::Error::OutsideViewScope { .. })
+        ));
+        assert!(matches!(
+            view.is_prefix_empty(b"tenant-"),
+            Err(holt::Error::OutsideViewScope { .. })
+        ));
+        Ok(())
+    })
+    .unwrap();
+}
+
+#[test]
+fn view_prefix_snapshot_spans_child_blobs() {
+    let tree = Tree::open(TreeConfig::memory()).unwrap();
+    let value = vec![0x7A; 220];
+    for i in 0..1800u32 {
+        tree.put(format!("tenant-a/dir-{i:04}/file").as_bytes(), &value)
+            .unwrap();
+    }
+    assert!(
+        tree.stats().unwrap().blob_count >= 2,
+        "test precondition: tenant-a prefix should spill into child blobs",
+    );
+
+    tree.view(b"tenant-a/", |view| {
+        tree.put(b"tenant-a/dir-0000/file", b"updated").unwrap();
+        tree.put(b"tenant-a/new-after-view", b"new").unwrap();
+
+        for i in [0, 17, 511, 1023, 1799] {
+            let key = format!("tenant-a/dir-{i:04}/file");
+            assert_eq!(view.get(key.as_bytes())?.as_deref(), Some(&value[..]));
+        }
+        assert!(view.get(b"tenant-a/new-after-view")?.is_none());
+        Ok(())
+    })
+    .unwrap();
+}
+
 #[test]
 fn key_range_builder_visit_does_not_emit_fully_tombstoned_rollup() {
     let tree = Tree::open(TreeConfig::memory()).unwrap();

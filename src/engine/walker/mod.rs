@@ -71,7 +71,9 @@ pub use range::{
     KeyRangeBuilder, KeyRangeEntry, KeyRangeEntryRef, KeyRangeIter, RangeBuilder, RangeEntry,
     RangeIter,
 };
-pub use scan::{collect_blob_guids, collect_blob_topology_silent};
+pub use scan::{
+    collect_blob_guids, collect_blob_topology_silent, collect_prefix_blob_topology_silent,
+};
 pub use types::{EraseCondition, EraseOutcome, InsertCondition, InsertOutcome};
 
 // ---------- shared internals ----------
