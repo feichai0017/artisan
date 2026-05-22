@@ -9,6 +9,13 @@ fine-grained per-commit history is in `git log`.
 
 ## [Unreleased]
 
+### Added
+
+- Added scoped read transactions via `Tree::view(prefix, |view| ...)`.
+  A view captures the prefix's reachable blob frames, releases the
+  live tree, and serves point reads plus record/key range scans from
+  that stable frame set.
+
 ### Changed
 
 - Renamed `Tree::scan_prefix(prefix)` to `Tree::scan(prefix)`.

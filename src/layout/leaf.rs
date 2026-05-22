@@ -33,9 +33,8 @@ pub struct Leaf {
     /// extent layout is `u16 key_len ++ key_bytes ++ value_bytes`,
     /// 8-byte-aligned tail-padded.
     pub key_offset: u32,
-    /// Monotonically-increasing seq counter — bumped on every
-    /// write that touches this slot. Reused for MVCC snapshot
-    /// isolation and journal-replay ordering.
+    /// Monotonic record sequence, bumped on every write that
+    /// touches this slot. Used for CAS tokens and WAL replay.
     pub seq: u64,
 }
 

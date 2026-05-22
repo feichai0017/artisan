@@ -67,13 +67,10 @@ pub fn collect_blob_topology_silent(
     collect_blob_topology_inner(bm, root_guid, /*silent=*/ true)
 }
 
-/// Return the blob topology needed to read the subtree rooted at
-/// `prefix`.
+/// Return the blobs needed to read `prefix`.
 ///
-/// The root blob is always included because it owns the tree root and
-/// the first routing decisions. Once the walk reaches a path that is
-/// already inside `prefix`, it switches to a topology-only scan for
-/// that subtree instead of descending to every leaf.
+/// The root blob is always included. Once the walk enters `prefix`,
+/// it switches to a topology-only scan instead of decoding leaves.
 pub fn collect_prefix_blob_topology_silent(
     bm: &BufferManager,
     root_guid: BlobGuid,

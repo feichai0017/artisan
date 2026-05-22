@@ -360,17 +360,13 @@ Goal: add the missing semantics that real metadata servers need while
 preserving Holt's core design: path-shaped keys, opaque byte values,
 single-node embedded library, no always-on MVCC version chains.
 
-### P0 — Snapshot view for list/readdir
+### Completed — Scoped snapshot view
 
-- Add a `view` / snapshot-list path that copies the blobs needed for a
-  prefix scan into private memory, then scans the copy without holding
-  writer latches.
-- This gives stable list/readdir semantics without per-write MVCC
-  overhead. The cost is paid by the list operation proportional to the
-  prefix it asks to observe.
-- Keep ordinary `range()` as the fast best-effort iterator only if the
-  API clearly distinguishes the two modes. If the public API must stay
-  minimal, prefer one strong iterator and optimize it.
+- `Tree::view(prefix, |view| ...)` captures the blob frames reachable
+  for a prefix, releases the live tree, and serves point reads and
+  scans from the private frame set.
+- Ordinary `range()` / `range_keys()` remain the hot restart-on-conflict
+  iterators; `View` is the explicit stable-read path for list/readdir.
 
 ### P1 — WAL tail / change feed with explicit retention
 

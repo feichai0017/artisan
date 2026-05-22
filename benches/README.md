@@ -294,7 +294,9 @@ delimiter-list API.
    `Tree::range_keys` store blob versions in their cursor path and
    seek from the last emitted lower bound if a writer invalidates
    that path. A long scan can still observe keys committed after
-   iterator creation if they sort after the current cursor.
+   iterator creation if they sort after the current cursor. Use
+   `Tree::view(prefix, ...)` when a benchmark needs stable read
+   transaction semantics.
 
 This bench is the right comparison for **metadata-engine
 workloads** with bounded per-tree dataset and hierarchical keys —

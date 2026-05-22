@@ -347,6 +347,11 @@ because stale paths are handled internally. It is still not MVCC:
 a long scan can observe keys committed after iterator creation if
 they sort after the current cursor.
 
+For stable read transactions, `Tree::view(prefix, |view| ...)`
+captures the prefix's reachable blob frames into a private in-memory
+store and then scans that copy. This pays copy cost proportional to
+the observed prefix instead of adding per-write MVCC chains.
+
 ## 8. BlobStore abstraction
 
 ```rust

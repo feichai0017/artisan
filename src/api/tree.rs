@@ -1412,11 +1412,8 @@ impl Tree {
     /// `snapshot_dirty` atomically drains the map; concurrent
     /// `mark_dirty` calls land in the fresh empty map and stay
     /// tracked for the next round. Write-through with `expected_seq`
-    /// matches the checkpoint round's protocol: the dirty entry
-    /// is retired only when no racing writer has bumped its seq
-    /// in the meantime (snapshot 的 expected_seq 反映了我们抓到的
-    /// 那个 entry；之后 racing writer 写的 newer-seq 留给下一次
-    /// flush).
+    /// matches checkpoint: retire only the entry captured by this
+    /// snapshot, leaving any racing newer seq for a later flush.
     fn flush_dirty_inline(&self) -> Result<()> {
         let snap = self.store.snapshot_dirty();
         let mut failed: std::collections::HashMap<BlobGuid, u64> = std::collections::HashMap::new();

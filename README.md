@@ -237,6 +237,27 @@ for entry in tree.scan_keys(b"img/").delimiter(b'/') {
 }
 ```
 
+### Snapshot reads
+
+`Tree::range` and `Tree::range_keys` are the hot restart-on-conflict
+iterators. Use `Tree::view(prefix, |view| { ... })` when multiple
+reads must observe one stable prefix snapshot. A view copies the
+reachable blob frames for `prefix`, releases the live tree, then
+runs point reads and scans against that private frame set.
+
+```rust
+tree.view(b"img/", |view| {
+    let meta = view.get_record(b"img/01.jpg")?;
+    let first_page: Vec<_> = view
+        .range_keys()
+        .delimiter(b'/')
+        .into_iter()
+        .take(100)
+        .collect::<Result<_, _>>()?;
+    Ok(())
+})?;
+```
+
 ### Durability
 
 Per-op writes land in the journal worker + BufferManager cache.

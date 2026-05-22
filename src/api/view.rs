@@ -1,10 +1,8 @@
-//! Read-only scoped snapshot view.
+//! Scoped read transaction.
 //!
-//! `View` is the read-side companion to [`crate::Tree::atomic`]:
-//! entering the view captures a prefix subtree as immutable blob
-//! frames, then releases the live tree. Reads inside the closure run
-//! against that private frame set, so later writers are invisible
-//! without keeping a global read lock or maintaining MVCC chains.
+//! `View` captures a prefix subtree as immutable blob frames, then
+//! reads from that private frame set. It gives stable list/readdir
+//! semantics without keeping a live-tree read lock or MVCC chains.
 
 use std::sync::Arc;
 
@@ -15,12 +13,10 @@ use crate::engine::{self, KeyRangeBuilder, RangeBuilder};
 use crate::layout::BlobGuid;
 use crate::store::{BufferManager, CachedBlob};
 
-/// Immutable read transaction over one captured key prefix.
+/// Immutable read transaction over one captured prefix.
 ///
-/// A `View` is created by [`crate::Tree::view`]. It owns a private
-/// in-memory blob store containing the frames reachable for the
-/// requested prefix at the instant the view was opened. Subsequent
-/// live-tree writes do not affect it.
+/// Created by [`crate::Tree::view`]. Subsequent live-tree writes do
+/// not affect it.
 #[derive(Clone)]
 pub struct View {
     scope: Vec<u8>,

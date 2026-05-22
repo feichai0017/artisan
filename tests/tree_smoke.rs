@@ -1758,6 +1758,54 @@ fn view_range_and_key_visit_are_snapshot_consistent() {
 }
 
 #[test]
+fn view_scoped_reads_expose_versions_and_bounds() {
+    let tree = Tree::open(TreeConfig::memory()).unwrap();
+    for (key, value) in [
+        (b"dir/a".as_slice(), b"a".as_slice()),
+        (b"dir/b", b"b"),
+        (b"dir/sub/a", b"sub-a"),
+        (b"other/a", b"other"),
+    ] {
+        tree.put(key, value).unwrap();
+    }
+    let live_b = tree.get_record(b"dir/b").unwrap().unwrap();
+
+    tree.view(b"dir/", |view| {
+        assert_eq!(view.scope(), b"dir/");
+        assert_eq!(view.get_record(b"dir/b")?, Some(live_b.clone()));
+        assert_eq!(view.get_version(b"dir/b")?, Some(live_b.version));
+        assert!(!view.is_prefix_empty(b"dir/sub/")?);
+        assert!(view.is_prefix_empty(b"dir/missing/")?);
+
+        let scoped = collect_keys(view.scan(b"dir/")?.start_after(b"dir/a"));
+        assert_eq!(scoped, vec![b"dir/b".to_vec(), b"dir/sub/a".to_vec()],);
+
+        let scoped_keys = collect_key_range(view.scan_keys(b"dir/")?.start_after(b"dir/a"));
+        assert_eq!(scoped_keys, scoped);
+        Ok(())
+    })
+    .unwrap();
+}
+
+#[test]
+fn view_empty_scope_reads_the_whole_tree() {
+    let tree = Tree::open(TreeConfig::memory()).unwrap();
+    tree.put(b"tenant-a/file", b"a").unwrap();
+    tree.put(b"tenant-b/file", b"b").unwrap();
+
+    tree.view(b"", |view| {
+        assert_eq!(view.scope(), b"");
+        assert_eq!(view.get(b"tenant-a/file")?.as_deref(), Some(&b"a"[..]));
+        assert_eq!(view.get(b"tenant-b/file")?.as_deref(), Some(&b"b"[..]));
+
+        let rolled = collect_key_range(view.scan_keys(b"tenant-")?.delimiter(b'/'));
+        assert_eq!(rolled, vec![b"tenant-a/".to_vec(), b"tenant-b/".to_vec()]);
+        Ok(())
+    })
+    .unwrap();
+}
+
+#[test]
 fn view_rejects_reads_outside_captured_scope() {
     let tree = Tree::open(TreeConfig::memory()).unwrap();
     tree.put(b"tenant-a/file", b"a").unwrap();
