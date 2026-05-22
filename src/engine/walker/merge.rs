@@ -4,7 +4,7 @@
 //! [`super::merge_blob`].
 //!
 //! Triggered by candidate-driven maintenance in
-//! [`crate::api::Tree::compact`] and checkpoint auto-merge. A
+//! [`crate::Tree::compact`] and checkpoint auto-merge. A
 //! typical churn workload (lots of erases) leaves child blobs with
 //! little data, and each queued parent can collapse its direct
 //! children without forcing a whole-tree merge scan.
@@ -46,7 +46,7 @@ pub struct MergeStats {
 /// `seq` is forwarded to [`merge_blob`] so the deferred-delete
 /// entry it generates carries the correct WAL stamp. Internal
 /// callers (compact / checkpoint round) pass
-/// [`crate::store::buffer_manager::STRUCTURAL_SEQ`].
+/// [`crate::store::STRUCTURAL_SEQ`].
 pub fn try_merge_children(
     bm: &BufferManager,
     parent_frame: &mut BlobFrame<'_>,

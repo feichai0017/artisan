@@ -67,7 +67,7 @@ last error.
 The ABI exposes the same semantics as Holt's Rust iterators:
 
 - key-only scans use `Tree::scan_keys`;
-- record scans use `Tree::scan_prefix`;
+- record scans use `Tree::scan`;
 - delimiter values below zero mean "no delimiter";
 - delimiter values `0..=255` enable common-prefix rollup;
 - `start_after == NULL && start_after_len == 0` means "no marker".

@@ -2,14 +2,6 @@
 //! blobs with marker-aware lower-bound seek, `prefix` filtering,
 //! and S3-style `delimiter` rollup.
 //!
-//! Modelled on the upstream `fa_iter` shape extracted from the
-//! original binary's log strings: `path` (parent-chain stack of
-//! `(blob_guid, slot)`), `curr_key` (materialised current path
-//! bytes), `marker` (exclusive lower bound), `delimiter` (single
-//! byte that collapses sub-subtrees into a single `CommonPrefix`
-//! emit), `start_index_in_node` (resume cursor inside `Node4/16/48/256`
-//! to avoid re-scanning all children). Forward-only — no `findPrev`.
-//!
 //! ## Concurrency
 //!
 //! The cursor is restart-on-conflict. Each stack frame records the
@@ -18,9 +10,8 @@
 //! `CommonPrefix` — the iterator verifies those versions. If an
 //! interleaved writer split, merged, compacted, or otherwise rewrote
 //! any blob on the cursor path, the stack is discarded and the walk
-//! seeks from the last emitted lower bound. This mirrors the
-//! upstream `fa_iter` invalidation/restart shape without exposing an
-//! unsafe "invalid iterator" state to callers.
+//! seeks from the last emitted lower bound. Callers never see an
+//! unsafe "invalid iterator" state.
 //!
 //! This is not MVCC: a long iterator may observe keys committed
 //! after it was created if they sort after the current cursor. The
@@ -28,7 +19,10 @@
 //! stale `(blob_guid, slot)` path and does not re-emit keys or
 //! rollups it has already returned.
 
-use std::sync::Arc;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use crate::api::atomic::RecordVersion;
 use crate::api::errors::{Error, Result};
@@ -36,12 +30,16 @@ use crate::concurrency::MaintenanceGate;
 use crate::layout::{BlobGuid, BlobNode, Leaf, NodeType, BLOB_MAX_INLINE, PREFIX_MAX_INLINE};
 use crate::store::{BlobFrameRef, BufferManager, CachedBlob};
 
+use smallvec::SmallVec;
+
 use super::cast;
 use super::readers::{
     leaf_extent, leaf_key_extent, ntype_of, read_leaf_key_ref, read_node16, read_node256,
     read_node4, read_node48, read_prefix,
 };
 use crate::engine::simd;
+
+type KeyBuf = SmallVec<[u8; 64]>;
 
 /// An entry yielded by [`RangeIter`].
 ///
@@ -92,10 +90,177 @@ pub enum KeyRangeEntry {
     CommonPrefix(Vec<u8>),
 }
 
+/// Borrowed key-only range entry passed to
+/// [`KeyRangeBuilder::visit`].
+///
+/// The byte slices are valid only for the duration of the callback.
+/// They point into the range cursor's reusable scratch buffer, not
+/// into the underlying blob frame.
+#[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
+pub enum KeyRangeEntryRef<'a> {
+    /// A leaf under the requested key range.
+    Key {
+        /// User-supplied key bytes (terminator byte stripped).
+        key: &'a [u8],
+        /// Current compare-and-set token for this live leaf.
+        version: RecordVersion,
+    },
+    /// Delimiter rollup prefix including the delimiter byte.
+    CommonPrefix(&'a [u8]),
+}
+
+const PREFIX_LIST_CACHE_SLOTS: usize = 256;
+const PREFIX_LIST_CACHE_MAX_LIMIT: usize = 256;
+
+/// Direct-mapped cache for short hot prefix/delimiter scans.
+#[derive(Debug)]
+pub(crate) struct PrefixListCache {
+    slots: Vec<Mutex<Option<PrefixListCacheEntry>>>,
+}
+
+#[derive(Debug)]
+struct PrefixListCacheEntry {
+    hash: u64,
+    epoch: u64,
+    delimiter: Option<u8>,
+    limit: usize,
+    prefix: Vec<u8>,
+    start_after: Option<Vec<u8>>,
+    entries: Arc<[CachedKeyRangeEntry]>,
+}
+
+#[derive(Debug, Clone)]
+enum CachedKeyRangeEntry {
+    Key {
+        key: Vec<u8>,
+        version: RecordVersion,
+    },
+    CommonPrefix(Vec<u8>),
+}
+
+impl CachedKeyRangeEntry {
+    fn from_ref(entry: KeyRangeEntryRef<'_>) -> Self {
+        match entry {
+            KeyRangeEntryRef::Key { key, version } => Self::Key {
+                key: key.to_vec(),
+                version,
+            },
+            KeyRangeEntryRef::CommonPrefix(prefix) => Self::CommonPrefix(prefix.to_vec()),
+        }
+    }
+
+    fn as_ref(&self) -> KeyRangeEntryRef<'_> {
+        match self {
+            Self::Key { key, version } => KeyRangeEntryRef::Key {
+                key,
+                version: *version,
+            },
+            Self::CommonPrefix(prefix) => KeyRangeEntryRef::CommonPrefix(prefix),
+        }
+    }
+}
+
+impl PrefixListCache {
+    pub(crate) fn new() -> Self {
+        Self {
+            slots: (0..PREFIX_LIST_CACHE_SLOTS)
+                .map(|_| Mutex::new(None))
+                .collect(),
+        }
+    }
+
+    fn visit<F>(
+        &self,
+        epoch: u64,
+        prefix: &[u8],
+        start_after: Option<&[u8]>,
+        delimiter: Option<u8>,
+        limit: usize,
+        mut visitor: F,
+    ) -> Result<Option<usize>>
+    where
+        F: FnMut(KeyRangeEntryRef<'_>) -> Result<()>,
+    {
+        if !Self::cacheable_limit(limit) {
+            return Ok(None);
+        }
+        let hash = cache_hash(prefix, start_after, delimiter, limit);
+        let entries = {
+            let guard = self.slots[slot_index(hash)].lock().unwrap();
+            let Some(entry) = guard.as_ref() else {
+                return Ok(None);
+            };
+            if entry.hash != hash
+                || entry.epoch != epoch
+                || entry.delimiter != delimiter
+                || entry.limit != limit
+                || entry.prefix != prefix
+                || entry.start_after.as_deref() != start_after
+            {
+                return Ok(None);
+            }
+            Arc::clone(&entry.entries)
+        };
+        for cached in entries.iter() {
+            visitor(cached.as_ref())?;
+        }
+        Ok(Some(entries.len()))
+    }
+
+    fn store(
+        &self,
+        epoch: u64,
+        prefix: &[u8],
+        start_after: Option<&[u8]>,
+        delimiter: Option<u8>,
+        limit: usize,
+        entries: Vec<CachedKeyRangeEntry>,
+    ) {
+        if !Self::cacheable_limit(limit) {
+            return;
+        }
+        let hash = cache_hash(prefix, start_after, delimiter, limit);
+        let mut guard = self.slots[slot_index(hash)].lock().unwrap();
+        *guard = Some(PrefixListCacheEntry {
+            hash,
+            epoch,
+            delimiter,
+            limit,
+            prefix: prefix.to_vec(),
+            start_after: start_after.map(<[u8]>::to_vec),
+            entries: entries.into(),
+        });
+    }
+
+    fn cacheable_limit(limit: usize) -> bool {
+        limit != 0 && limit <= PREFIX_LIST_CACHE_MAX_LIMIT
+    }
+}
+
+fn cache_hash(
+    prefix: &[u8],
+    start_after: Option<&[u8]>,
+    delimiter: Option<u8>,
+    limit: usize,
+) -> u64 {
+    let mut h = DefaultHasher::new();
+    prefix.hash(&mut h);
+    start_after.hash(&mut h);
+    delimiter.hash(&mut h);
+    limit.hash(&mut h);
+    h.finish()
+}
+
+fn slot_index(hash: u64) -> usize {
+    (hash as usize) & (PREFIX_LIST_CACHE_SLOTS - 1)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RangeProjection {
     Records,
     KeysOnly,
+    KeyRefs,
 }
 
 enum ProjectedRangeEntry {
@@ -129,15 +294,15 @@ pub struct RangeBuilder {
     root_pin: Arc<CachedBlob>,
     root_guid: BlobGuid,
     maintenance_gate: Arc<MaintenanceGate>,
-    prefix: Vec<u8>,
-    start_after: Option<Vec<u8>>,
+    prefix: KeyBuf,
+    start_after: Option<KeyBuf>,
     delimiter: Option<u8>,
 }
 
 impl RangeBuilder {
     /// Construct a builder anchored at `root_guid` of the BM-backed
     /// tree. Internal — user surface is [`crate::Tree::range`] /
-    /// [`crate::Tree::scan_prefix`]; both signature dependencies
+    /// [`crate::Tree::scan`]; both signature dependencies
     /// (`BufferManager`, `BlobGuid`) live in crate-private modules.
     pub(crate) fn new(
         bm: Arc<BufferManager>,
@@ -150,7 +315,7 @@ impl RangeBuilder {
             root_pin,
             root_guid,
             maintenance_gate,
-            prefix: Vec::new(),
+            prefix: KeyBuf::new(),
             start_after: None,
             delimiter: None,
         }
@@ -159,14 +324,15 @@ impl RangeBuilder {
     /// Restrict the scan to keys starting with `prefix`. Default:
     /// empty (the whole tree).
     pub fn prefix(mut self, prefix: &[u8]) -> Self {
-        self.prefix = prefix.to_vec();
+        self.prefix.clear();
+        self.prefix.extend_from_slice(prefix);
         self
     }
 
     /// Strict-greater-than lower bound. Default: none (start at
     /// the first matching leaf).
     pub fn start_after(mut self, key: &[u8]) -> Self {
-        self.start_after = Some(key.to_vec());
+        self.start_after = Some(KeyBuf::from_slice(key));
         self
     }
 
@@ -199,9 +365,12 @@ impl RangeBuilder {
             maintenance_gate: self.maintenance_gate,
             stack: Vec::with_capacity(8),
             curr_key: Vec::with_capacity(self.prefix.len().saturating_add(64)),
+            emit_buf: Vec::with_capacity(self.prefix.len().saturating_add(64)),
             cursor_floor: 0,
-            prefix: self.prefix,
-            lower_bound: self.start_after.map(LowerBound::Exclusive),
+            prefix: self.prefix.to_vec(),
+            lower_bound: self
+                .start_after
+                .map(|bound| LowerBound::exclusive(bound.to_vec())),
             delimiter: self.delimiter,
             projection,
             initialized: false,
@@ -217,12 +386,28 @@ impl RangeBuilder {
 #[must_use = "KeyRangeBuilder is lazy — call `.into_iter()` or use it in a `for` loop"]
 pub struct KeyRangeBuilder {
     inner: RangeBuilder,
+    prefix_list_cache: Option<Arc<PrefixListCache>>,
+    epoch: Option<Arc<AtomicU64>>,
 }
 
 impl KeyRangeBuilder {
     /// Wrap a record range builder with key-only projection.
     pub(crate) fn new(inner: RangeBuilder) -> Self {
-        Self { inner }
+        Self {
+            inner,
+            prefix_list_cache: None,
+            epoch: None,
+        }
+    }
+
+    pub(crate) fn with_prefix_list_cache(
+        mut self,
+        cache: Arc<PrefixListCache>,
+        epoch: Arc<AtomicU64>,
+    ) -> Self {
+        self.prefix_list_cache = Some(cache);
+        self.epoch = Some(epoch);
+        self
     }
 
     /// Restrict the scan to keys starting with `prefix`. Default:
@@ -246,6 +431,87 @@ impl KeyRangeBuilder {
     pub fn delimiter(mut self, byte: u8) -> Self {
         self.inner = self.inner.delimiter(byte);
         self
+    }
+
+    /// Visit key-only range entries with borrowed key bytes.
+    ///
+    /// This has the same ordering, prefix, start-after,
+    /// delimiter-rollup, and restart semantics as [`KeyRangeIter`],
+    /// but avoids allocating one `Vec<u8>` per emitted entry. The
+    /// slices passed to `visitor` are valid only for the duration
+    /// of that callback.
+    pub fn visit<F>(self, limit: usize, mut visitor: F) -> Result<usize>
+    where
+        F: FnMut(KeyRangeEntryRef<'_>) -> Result<()>,
+    {
+        if limit == 0 {
+            return Ok(0);
+        }
+
+        let mut builder = self;
+        let prefix = builder.inner.prefix.as_slice();
+        let start_after = builder.inner.start_after.as_deref();
+        let delimiter = builder.inner.delimiter;
+
+        if let (Some(cache), Some(epoch)) = (&builder.prefix_list_cache, &builder.epoch) {
+            let current_epoch = epoch.load(Ordering::Acquire);
+            if let Some(emitted) = cache.visit(
+                current_epoch,
+                prefix,
+                start_after,
+                delimiter,
+                limit,
+                &mut visitor,
+            )? {
+                return Ok(emitted);
+            }
+        }
+
+        let mut cached =
+            if builder.prefix_list_cache.is_some() && PrefixListCache::cacheable_limit(limit) {
+                Some(Vec::with_capacity(limit))
+            } else {
+                None
+            };
+        let cache_prefix = cached.as_ref().map(|_| builder.inner.prefix.clone());
+        let cache_start_after = cached
+            .as_ref()
+            .and_then(|_| builder.inner.start_after.clone());
+        let epoch_before = builder.epoch.as_ref().map(|e| e.load(Ordering::Acquire));
+        let maintenance_gate = Arc::clone(&builder.inner.maintenance_gate);
+        let _maintenance = maintenance_gate.enter_shared();
+        let mut iter = KeyRangeIter {
+            inner: builder
+                .inner
+                .into_iter_with_projection(RangeProjection::KeyRefs),
+        };
+        let emitted = iter.visit_key_entries_unlocked(limit, |entry| {
+            if let Some(cached) = cached.as_mut() {
+                cached.push(CachedKeyRangeEntry::from_ref(entry));
+            }
+            visitor(entry)
+        })?;
+        if let (Some(cache), Some(epoch), Some(epoch_before), Some(cached)) = (
+            builder.prefix_list_cache.take(),
+            builder.epoch.take(),
+            epoch_before,
+            cached,
+        ) {
+            let epoch_after = epoch.load(Ordering::Acquire);
+            if epoch_before == epoch_after {
+                cache.store(
+                    epoch_after,
+                    cache_prefix
+                        .as_deref()
+                        .expect("cached entries require a prefix clone"),
+                    cache_start_after.as_deref(),
+                    delimiter,
+                    limit,
+                    cached,
+                );
+            }
+        }
+        Ok(emitted)
     }
 }
 
@@ -286,6 +552,19 @@ impl KeyRangeIter {
             .next_projected_maybe_guarded(false)
             .map(|entry| entry.map(ProjectedRangeEntry::into_key))
     }
+
+    /// Visit key-only entries without entering `maintenance_gate`.
+    ///
+    /// Caller must hold the tree's shared maintenance guard for the
+    /// whole call. Entries borrow from the cursor's scratch buffer and
+    /// are invalid after the callback returns.
+    pub(crate) fn visit_key_entries_unlocked<F>(&mut self, limit: usize, visit: F) -> Result<usize>
+    where
+        F: FnMut(KeyRangeEntryRef<'_>) -> Result<()>,
+    {
+        self.inner.projection = RangeProjection::KeyRefs;
+        self.inner.visit_key_entries_unlocked(limit, visit)
+    }
 }
 
 /// Active iteration state — see [`RangeBuilder::into_iter`].
@@ -300,6 +579,8 @@ pub struct RangeIter {
     /// Bytes contributed to the current path by every live frame.
     /// On pop, the bytes the frame pushed are truncated.
     curr_key: Vec<u8>,
+    /// Reusable output buffer for callback-based key listing.
+    emit_buf: Vec<u8>,
     /// Depth of the root lower-bound cursor. The iterator stops
     /// once the cursor has exhausted the rooted search path.
     cursor_floor: usize,
@@ -372,6 +653,7 @@ fn project_range_leaf(
     lower_bound: Option<&LowerBound>,
     delimiter: Option<u8>,
     projection: RangeProjection,
+    emit_buf: &mut Vec<u8>,
 ) -> Result<LeafAction> {
     let body = frame
         .body_of_slot(slot)
@@ -386,7 +668,9 @@ fn project_range_leaf(
             let (key, value) = leaf_extent(frame, &leaf)?;
             (key, Some(value))
         }
-        RangeProjection::KeysOnly => (leaf_key_extent(frame, &leaf)?, None),
+        RangeProjection::KeysOnly | RangeProjection::KeyRefs => {
+            (leaf_key_extent(frame, &leaf)?, None)
+        }
     };
     let user_key = if stored_key.last() == Some(&0) {
         &stored_key[..stored_key.len() - 1]
@@ -406,9 +690,21 @@ fn project_range_leaf(
     if let Some(d) = delimiter {
         let rest = &user_key[prefix.len()..];
         if let Some(idx) = simd::find_byte(rest, d, 0) {
+            if matches!(projection, RangeProjection::KeyRefs) {
+                emit_buf.clear();
+                emit_buf.extend_from_slice(&user_key[..=prefix.len() + idx]);
+                return Ok(LeafAction::KeyRefCommonPrefix);
+            }
             let common: Vec<u8> = user_key[..=prefix.len() + idx].to_vec();
             return Ok(LeafAction::CommonPrefix(common));
         }
+    }
+    if matches!(projection, RangeProjection::KeyRefs) {
+        emit_buf.clear();
+        emit_buf.extend_from_slice(user_key);
+        return Ok(LeafAction::KeyRef {
+            version: RecordVersion::new(leaf.seq),
+        });
     }
     let key = user_key.to_vec();
     let version = RecordVersion::new(leaf.seq);
@@ -417,18 +713,6 @@ fn project_range_leaf(
         value: record_value.map(<[u8]>::to_vec),
         version,
     })
-}
-
-fn prefix_successor(prefix: &[u8]) -> Option<Vec<u8>> {
-    let mut out = prefix.to_vec();
-    for i in (0..out.len()).rev() {
-        if out[i] != u8::MAX {
-            out[i] += 1;
-            out.truncate(i + 1);
-            return Some(out);
-        }
-    }
-    None
 }
 
 fn key_at_or_past_prefix_successor(key: &[u8], prefix: &[u8]) -> bool {
@@ -446,26 +730,74 @@ fn key_at_or_past_prefix_successor(key: &[u8], prefix: &[u8]) -> bool {
     key.len() >= successor_len
 }
 
+fn concat_starts_with(left: &[u8], right: &[u8], prefix: &[u8]) -> bool {
+    if left.len().saturating_add(right.len()) < prefix.len() {
+        return false;
+    }
+    let mut i = 0usize;
+    while i < prefix.len() {
+        if concat_byte(left, right, i) != prefix[i] {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+fn concat_byte(left: &[u8], right: &[u8], idx: usize) -> u8 {
+    if idx < left.len() {
+        left[idx]
+    } else {
+        right[idx - left.len()]
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
-enum LowerBound {
-    Exclusive(Vec<u8>),
-    Inclusive(Vec<u8>),
+struct LowerBound {
+    key: Vec<u8>,
+    inclusive: bool,
 }
 
 impl LowerBound {
-    #[inline]
-    fn key(&self) -> &[u8] {
-        match self {
-            Self::Exclusive(bound) | Self::Inclusive(bound) => bound,
+    fn exclusive(key: Vec<u8>) -> Self {
+        Self {
+            key,
+            inclusive: false,
         }
     }
 
     #[inline]
+    fn key(&self) -> &[u8] {
+        &self.key
+    }
+
+    #[inline]
     fn allows(&self, key: &[u8]) -> bool {
-        match self {
-            Self::Exclusive(bound) => key > bound.as_slice(),
-            Self::Inclusive(bound) => key >= bound.as_slice(),
+        if self.inclusive {
+            key >= self.key.as_slice()
+        } else {
+            key > self.key.as_slice()
         }
+    }
+
+    fn set_exclusive(&mut self, key: &[u8]) {
+        self.key.clear();
+        self.key.extend_from_slice(key);
+        self.inclusive = false;
+    }
+
+    fn set_inclusive_successor(&mut self, key: &[u8]) -> bool {
+        self.key.clear();
+        self.key.extend_from_slice(key);
+        for i in (0..self.key.len()).rev() {
+            if self.key[i] != u8::MAX {
+                self.key[i] += 1;
+                self.key.truncate(i + 1);
+                self.inclusive = true;
+                return true;
+            }
+        }
+        false
     }
 }
 
@@ -477,6 +809,7 @@ enum InitResult {
 
 enum RangeAdvance {
     Entry(ProjectedRangeEntry),
+    KeyRef(KeyRefKind),
     Done,
     Restart,
 }
@@ -490,6 +823,16 @@ enum LeafAction {
         version: RecordVersion,
     },
     CommonPrefix(Vec<u8>),
+    KeyRef {
+        version: RecordVersion,
+    },
+    KeyRefCommonPrefix,
+}
+
+#[derive(Clone, Copy)]
+enum KeyRefKind {
+    Key { version: RecordVersion },
+    CommonPrefix,
 }
 
 #[derive(Clone, Copy)]
@@ -552,6 +895,9 @@ impl RangeIter {
                     self.restart_cursor();
                 }
                 Ok(RangeAdvance::Entry(entry)) => return Some(Ok(entry)),
+                Ok(RangeAdvance::KeyRef(_)) => {
+                    unreachable!("borrowed key entry emitted from public range iterator")
+                }
                 Err(e) => {
                     self.terminated = true;
                     return Some(Err(e));
@@ -571,6 +917,46 @@ impl RangeIter {
             }
         }
         self.advance_to_next_entry()
+    }
+
+    fn visit_key_entries_unlocked<F>(&mut self, limit: usize, mut visit: F) -> Result<usize>
+    where
+        F: FnMut(KeyRangeEntryRef<'_>) -> Result<()>,
+    {
+        let mut emitted = 0usize;
+        while emitted < limit {
+            let step = loop {
+                if self.terminated {
+                    return Ok(emitted);
+                }
+                match self.next_step()? {
+                    RangeAdvance::Restart => self.restart_cursor(),
+                    other => break other,
+                }
+            };
+            match step {
+                RangeAdvance::Done => {
+                    self.terminated = true;
+                    return Ok(emitted);
+                }
+                RangeAdvance::KeyRef(KeyRefKind::Key { version }) => {
+                    visit(KeyRangeEntryRef::Key {
+                        key: &self.emit_buf,
+                        version,
+                    })?;
+                    emitted += 1;
+                }
+                RangeAdvance::KeyRef(KeyRefKind::CommonPrefix) => {
+                    visit(KeyRangeEntryRef::CommonPrefix(&self.emit_buf))?;
+                    emitted += 1;
+                }
+                RangeAdvance::Entry(_) => {
+                    unreachable!("owned entry emitted from borrowed key projection")
+                }
+                RangeAdvance::Restart => unreachable!("restart handled by inner loop"),
+            }
+        }
+        Ok(emitted)
     }
 
     fn init_descent(&mut self) -> Result<InitResult> {
@@ -642,6 +1028,100 @@ impl RangeIter {
                 unreachable!("non-key seek source has no target bytes")
             }
         }
+    }
+
+    fn set_lower_bound_exclusive(&mut self, key: &[u8]) {
+        match self.lower_bound.as_mut() {
+            Some(bound) => bound.set_exclusive(key),
+            None => self.lower_bound = Some(LowerBound::exclusive(key.to_vec())),
+        }
+    }
+
+    fn set_lower_bound_to_emit_exclusive(&mut self) {
+        match self.lower_bound.as_mut() {
+            Some(bound) => bound.set_exclusive(&self.emit_buf),
+            None => self.lower_bound = Some(LowerBound::exclusive(self.emit_buf.clone())),
+        }
+    }
+
+    fn set_lower_bound_to_emit_successor(&mut self) -> bool {
+        if let Some(bound) = self.lower_bound.as_mut() {
+            bound.set_inclusive_successor(&self.emit_buf)
+        } else {
+            let mut bound = LowerBound::exclusive(Vec::new());
+            let ok = bound.set_inclusive_successor(&self.emit_buf);
+            if ok {
+                self.lower_bound = Some(bound);
+            }
+            ok
+        }
+    }
+
+    fn set_lower_bound_successor(&mut self, key: &[u8]) -> bool {
+        if let Some(bound) = self.lower_bound.as_mut() {
+            bound.set_inclusive_successor(key)
+        } else {
+            let mut bound = LowerBound::exclusive(Vec::new());
+            let ok = bound.set_inclusive_successor(key);
+            if ok {
+                self.lower_bound = Some(bound);
+            }
+            ok
+        }
+    }
+
+    fn common_prefix_advance_from_emit(&self) -> RangeAdvance {
+        match self.projection {
+            RangeProjection::Records => RangeAdvance::Entry(ProjectedRangeEntry::Record(
+                RangeEntry::CommonPrefix(self.emit_buf.clone()),
+            )),
+            RangeProjection::KeysOnly => RangeAdvance::Entry(ProjectedRangeEntry::Key(
+                KeyRangeEntry::CommonPrefix(self.emit_buf.clone()),
+            )),
+            RangeProjection::KeyRefs => RangeAdvance::KeyRef(KeyRefKind::CommonPrefix),
+        }
+    }
+
+    fn segment_has_rollup_candidate(&self, segment: &[u8]) -> bool {
+        self.segment_rollup_len(segment).is_some()
+    }
+
+    fn prepare_segment_rollup(&mut self, segment: &[u8]) -> bool {
+        let Some(common_len) = self.segment_rollup_len(segment) else {
+            return false;
+        };
+        self.emit_buf.clear();
+        if common_len <= self.curr_key.len() {
+            self.emit_buf
+                .extend_from_slice(&self.curr_key[..common_len]);
+        } else {
+            self.emit_buf.extend_from_slice(&self.curr_key);
+            self.emit_buf
+                .extend_from_slice(&segment[..common_len - self.curr_key.len()]);
+        }
+        self.lower_bound
+            .as_ref()
+            .is_none_or(|bound| bound.allows(&self.emit_buf))
+    }
+
+    fn segment_rollup_len(&self, segment: &[u8]) -> Option<usize> {
+        let delimiter = self.delimiter?;
+        let total_len = self.curr_key.len().checked_add(segment.len())?;
+        if total_len <= self.prefix.len() {
+            return None;
+        }
+        if !concat_starts_with(&self.curr_key, segment, &self.prefix) {
+            return None;
+        }
+        let mut i = self.prefix.len();
+        while i < total_len {
+            let byte = concat_byte(&self.curr_key, segment, i);
+            if byte == delimiter {
+                return Some(i + 1);
+            }
+            i += 1;
+        }
+        None
     }
 
     #[allow(clippy::too_many_lines)] // one cursor-state machine over every ART node kind
@@ -719,6 +1199,9 @@ impl RangeIter {
                             self.pop_frame();
                         }
                         SegmentRelation::Continue | SegmentRelation::Min => {
+                            if self.segment_has_rollup_candidate(p_bytes.as_slice()) {
+                                return Ok(InitResult::Ready);
+                            }
                             self.stack[idx].next = 1;
                             self.push_within_blob(
                                 top_pin,
@@ -765,6 +1248,9 @@ impl RangeIter {
                             self.pop_frame();
                         }
                         SegmentRelation::Continue | SegmentRelation::Min => {
+                            if self.segment_has_rollup_candidate(p_bytes.as_slice()) {
+                                return Ok(InitResult::Ready);
+                            }
                             self.stack[idx].next = 1;
                             self.push_in_other_blob(child_guid, p_bytes.as_slice())?;
                         }
@@ -867,6 +1353,7 @@ impl RangeIter {
                                 self.lower_bound.as_ref(),
                                 self.delimiter,
                                 self.projection,
+                                &mut self.emit_buf,
                             )?
                         };
                         match kv {
@@ -880,7 +1367,7 @@ impl RangeIter {
                                 if !self.path_is_still_valid() {
                                     return Ok(RangeAdvance::Restart);
                                 }
-                                self.lower_bound = Some(LowerBound::Exclusive(key.clone()));
+                                self.set_lower_bound_exclusive(&key);
                                 let entry = match self.projection {
                                     RangeProjection::Records => {
                                         ProjectedRangeEntry::Record(RangeEntry::Key {
@@ -894,6 +1381,11 @@ impl RangeIter {
                                             key,
                                             version,
                                         })
+                                    }
+                                    RangeProjection::KeyRefs => {
+                                        unreachable!(
+                                            "borrowed key projection uses LeafAction::KeyRef"
+                                        )
                                     }
                                 };
                                 return Ok(RangeAdvance::Entry(entry));
@@ -921,9 +1413,7 @@ impl RangeIter {
                                 {
                                     self.pop_frame();
                                 }
-                                if let Some(next) = prefix_successor(&common) {
-                                    self.lower_bound = Some(LowerBound::Inclusive(next));
-                                } else {
+                                if !self.set_lower_bound_successor(&common) {
                                     self.terminated = true;
                                 }
                                 let entry = match self.projection {
@@ -933,8 +1423,33 @@ impl RangeIter {
                                     RangeProjection::KeysOnly => ProjectedRangeEntry::Key(
                                         KeyRangeEntry::CommonPrefix(common),
                                     ),
+                                    RangeProjection::KeyRefs => unreachable!(
+                                        "borrowed key projection uses LeafAction::KeyRefCommonPrefix"
+                                    ),
                                 };
                                 return Ok(RangeAdvance::Entry(entry));
+                            }
+                            LeafAction::KeyRef { version } => {
+                                if !self.path_is_still_valid() {
+                                    return Ok(RangeAdvance::Restart);
+                                }
+                                self.set_lower_bound_to_emit_exclusive();
+                                return Ok(RangeAdvance::KeyRef(KeyRefKind::Key { version }));
+                            }
+                            LeafAction::KeyRefCommonPrefix => {
+                                if !self.path_is_still_valid() {
+                                    return Ok(RangeAdvance::Restart);
+                                }
+                                let common_len = self.emit_buf.len();
+                                while self.curr_key.len() > common_len
+                                    && self.stack.len() > self.cursor_floor
+                                {
+                                    self.pop_frame();
+                                }
+                                if !self.set_lower_bound_to_emit_successor() {
+                                    self.terminated = true;
+                                }
+                                return Ok(RangeAdvance::KeyRef(KeyRefKind::CommonPrefix));
                             }
                         }
                         // Tombstoned — fall through to pop_frame and
@@ -950,7 +1465,7 @@ impl RangeIter {
                     if self.stack[idx].next == 0 {
                         let top_pin = self.stack[idx].pin.clone();
                         let top_blob_guid = self.stack[idx].blob_guid;
-                        let (child_slot, child_ntype, p_bytes, version) = {
+                        let (child_slot, child_ntype, p_bytes, version, no_tombstones) = {
                             let top = &self.stack[idx];
                             let guard = top_pin.read();
                             let version = top_pin.content_version();
@@ -966,9 +1481,23 @@ impl RangeIter {
                                 ntype_of(frame, child_slot)?,
                                 InlinePrefix::from_slice(&p.bytes[..plen]),
                                 version,
+                                frame.header().tombstone_leaf_cnt == 0,
                             )
                         };
                         self.stack[idx].next = 1;
+                        if no_tombstones
+                            && !matches!(child_ntype, NodeType::Blob | NodeType::EmptyRoot)
+                            && self.prepare_segment_rollup(p_bytes.as_slice())
+                        {
+                            if !self.path_is_still_valid() {
+                                return Ok(RangeAdvance::Restart);
+                            }
+                            if !self.set_lower_bound_to_emit_successor() {
+                                self.terminated = true;
+                            }
+                            let entry = self.common_prefix_advance_from_emit();
+                            return Ok(entry);
+                        }
                         self.push_within_blob(
                             top_pin,
                             top_blob_guid,
@@ -1003,7 +1532,28 @@ impl RangeIter {
                             )
                         };
                         self.stack[idx].next = 1;
-                        self.push_in_other_blob(child_guid, p_bytes.as_slice())?;
+                        let child_pin = self.bm.pin(child_guid)?;
+                        let child_can_rollup = {
+                            let guard = child_pin.read();
+                            let frame = BlobFrameRef::wrap(guard.as_slice());
+                            let root_slot = frame.header().root_slot;
+                            frame.header().tombstone_leaf_cnt == 0
+                                && !matches!(
+                                    ntype_of(frame, root_slot)?,
+                                    NodeType::EmptyRoot | NodeType::Invalid
+                                )
+                        };
+                        if child_can_rollup && self.prepare_segment_rollup(p_bytes.as_slice()) {
+                            if !self.path_is_still_valid() {
+                                return Ok(RangeAdvance::Restart);
+                            }
+                            if !self.set_lower_bound_to_emit_successor() {
+                                self.terminated = true;
+                            }
+                            let entry = self.common_prefix_advance_from_emit();
+                            return Ok(entry);
+                        }
+                        self.push_pinned_other_blob(child_pin, child_guid, p_bytes.as_slice())?;
                     } else {
                         self.pop_frame();
                     }
@@ -1076,6 +1626,15 @@ impl RangeIter {
 
     fn push_in_other_blob(&mut self, child_guid: BlobGuid, prefix_bytes: &[u8]) -> Result<()> {
         let child_pin = self.bm.pin(child_guid)?;
+        self.push_pinned_other_blob(child_pin, child_guid, prefix_bytes)
+    }
+
+    fn push_pinned_other_blob(
+        &mut self,
+        child_pin: Arc<CachedBlob>,
+        child_guid: BlobGuid,
+        prefix_bytes: &[u8],
+    ) -> Result<()> {
         let (child_slot, child_ntype, child_version) = {
             let guard = child_pin.read();
             let version = child_pin.content_version();

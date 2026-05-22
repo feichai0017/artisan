@@ -315,7 +315,7 @@ instead of continuing through stale `(blob_guid, slot)` state.
 
 ## 7. Range iteration
 
-`Tree::range()` and `Tree::scan_prefix(p)` return a
+`Tree::range()` and `Tree::scan(p)` return a
 `RangeBuilder` → `RangeIter` yielding `RangeEntry::{Key,
 CommonPrefix}` items in lex order. `Key` entries carry key, value,
 and the live `RecordVersion` from the same leaf emit.

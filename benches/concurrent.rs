@@ -23,7 +23,7 @@ use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use holt::{KeyRangeEntry, Tree, TreeConfig, WalCommit};
+use holt::{Tree, TreeConfig, WalCommit};
 use rand::{rngs::StdRng, RngCore, SeedableRng};
 use rocksdb::{Options, WriteBatch, WriteOptions, DB};
 use tempfile::TempDir;
@@ -473,15 +473,13 @@ fn preload_rocksdb(db: &DB, workload: Workload, n_keys: usize) {
 
 fn holt_list_dir(tree: &Tree, prefix: &[u8], delim: u8, take: usize) -> usize {
     let mut seen = 0usize;
-    for entry in tree.scan_keys(prefix).delimiter(delim) {
-        match entry.expect("holt list_dir") {
-            KeyRangeEntry::Key { .. } | KeyRangeEntry::CommonPrefix(_) => seen += 1,
-            _ => unreachable!("KeyRangeEntry got a new variant"),
-        }
-        if seen >= take {
-            break;
-        }
-    }
+    tree.scan_keys(prefix)
+        .delimiter(delim)
+        .visit(take, |_| {
+            seen += 1;
+            Ok(())
+        })
+        .expect("holt list_dir");
     seen
 }
 

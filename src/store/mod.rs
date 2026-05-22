@@ -11,11 +11,9 @@
 //!   the store layer.
 
 mod blob_frame;
-pub mod blob_store;
-// `pub(crate)` so walkers/checkpoint code can name cache-internal
-// guard types and `STRUCTURAL_SEQ` without exposing store internals
-// through the crate API.
-pub(crate) mod buffer_manager;
+pub(crate) mod blob_store;
+mod buffer_manager;
 
 pub use blob_frame::{AllocError, BlobFrame, BlobFrameRef, FreeError};
+pub(crate) use buffer_manager::{BlobWriteGuard, WriteThroughEntry, STRUCTURAL_SEQ};
 pub use buffer_manager::{BufferManager, CachedBlob};

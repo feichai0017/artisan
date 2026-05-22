@@ -282,10 +282,10 @@ proptest! {
         prop_assert_eq!(&actual, &expected);
     }
 
-    /// `Tree::scan_prefix(p)` must match the BTreeMap-oracle's
+    /// `Tree::scan(p)` must match the BTreeMap-oracle's
     /// prefix range.
     #[test]
-    fn scan_prefix_matches_oracle(
+    fn scan_matches_oracle(
         ops in vec(op_strategy(), 1..=100),
         prefix in prop::collection::vec(prop::sample::select(vec![b'a', b'b', b'/', b'0']), 0..=3),
     ) {
@@ -295,7 +295,7 @@ proptest! {
         let oracle_map = apply(&tree, &ops);
         let oracle: BTreeMap<Vec<u8>, Vec<u8>> = oracle_map.into_iter().collect();
 
-        let actual = collect_kv(tree.scan_prefix(&prefix));
+        let actual = collect_kv(tree.scan(&prefix));
         let expected: Vec<(Vec<u8>, Vec<u8>)> = oracle
             .iter()
             .filter(|(k, _)| k.starts_with(&prefix))

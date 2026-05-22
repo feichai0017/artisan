@@ -45,7 +45,7 @@ eviction) under a W2D-strict protocol, adaptive tick-based
 eviction, observability (`Tree::stats`, structured `tracing`,
 Prometheus text-format renderer behind the `metrics` feature,
 silent-pin reads so scrapes don't pollute cache counters),
-diagnostics (`Tree::scan_prefix`, range-iter tombstone fix,
+diagnostics (`Tree::scan`, range-iter tombstone fix,
 structured `Error::NodeCorrupt`), PGO docs, `cargo deny check`
 in CI, scale-curve + p95/p99 contention benches.
 

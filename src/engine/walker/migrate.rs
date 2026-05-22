@@ -263,7 +263,7 @@ pub fn is_mergeable(
 /// op's WAL seq so the W2D protocol can pair the manifest delete
 /// with a real WAL record. Internal callers (compact, the
 /// checkpoint round's merge pass) pass
-/// [`crate::store::buffer_manager::STRUCTURAL_SEQ`] — the merge
+/// [`crate::store::STRUCTURAL_SEQ`] — the merge
 /// has no WAL record and shouldn't pin the trim watermark.
 pub fn merge_blob(
     bm: &BufferManager,

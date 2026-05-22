@@ -27,7 +27,7 @@ use crossbeam_channel::{Receiver, Sender};
 use std::sync::Arc;
 
 use crate::api::errors::Result;
-use crate::store::buffer_manager::WriteThroughEntry;
+use crate::store::WriteThroughEntry;
 
 use super::Shared;
 

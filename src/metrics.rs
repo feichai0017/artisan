@@ -79,7 +79,7 @@
 
 use std::fmt::Write;
 
-use crate::api::stats::TreeStats;
+use crate::TreeStats;
 
 /// Render `stats` as a Prometheus text-format payload.
 ///
@@ -410,7 +410,7 @@ fn metric_f64(out: &mut String, name: &str, help: &str, ty: &str, value: f64) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::stats::{CheckpointerStats, JournalStats, RouteCacheStats, TreeStats};
+    use crate::{CheckpointerStats, JournalStats, RouteCacheStats, TreeStats};
 
     fn stats_fixture(with_journal: bool, with_checkpointer: bool) -> TreeStats {
         TreeStats {

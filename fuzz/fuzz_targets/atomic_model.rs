@@ -287,7 +287,7 @@ fn assert_prefix_matches_model(tree: &Tree, model: &BTreeMap<Vec<u8>, Vec<u8>>, 
         .map(|(key, value)| (key.clone(), value.clone()))
         .collect();
     let got: Vec<_> = tree
-        .scan_prefix(&prefix)
+        .scan(&prefix)
         .into_iter()
         .map(|entry| match entry.unwrap() {
             RangeEntry::Key {

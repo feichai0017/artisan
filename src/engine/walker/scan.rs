@@ -2,7 +2,7 @@
 //! starting root, in BFS order, by scanning each blob's tree shape
 //! for [`NodeType::Blob`] crossings.
 //!
-//! Used by [`crate::api::Tree::stats`] and [`crate::api::Tree::compact`]
+//! Used by [`crate::Tree::stats`] and [`crate::Tree::compact`]
 //! to fan out across the whole on-disk tree without each caller
 //! having to reimplement cross-blob descent.
 

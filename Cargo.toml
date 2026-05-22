@@ -36,6 +36,10 @@ dashmap = "6"
 # ≈10 GB/s on Apple Silicon, dropping per-record overhead from
 # ~110 ns to ~20 ns.
 crc32fast = { version = "1.4", default-features = false }
+# Inline storage for short range prefixes/start markers. Keeps
+# `scan_keys(prefix).visit(...)` allocation-free on the common
+# metadata path while still spilling for unusually long prefixes.
+smallvec = "1"
 # Structured event emission on `spillover` / `merge_blob` /
 # `compact_blob` / WAL flush / checkpoint round. Optional so
 # users who don't run a `tracing` subscriber don't pay any

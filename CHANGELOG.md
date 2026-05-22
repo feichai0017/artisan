@@ -9,6 +9,16 @@ fine-grained per-commit history is in `git log`.
 
 ## [Unreleased]
 
+### Changed
+
+- Renamed `Tree::scan_prefix(prefix)` to `Tree::scan(prefix)`.
+  The old name is not kept as a compatibility alias; use
+  `Tree::range().prefix(prefix)` when the explicit builder form is
+  clearer.
+- Narrowed the supported public import surface to crate-root
+  re-exports (`holt::{Tree, TreeBuilder, RangeEntry, ...}`); the
+  internal `api` module is no longer public.
+
 ## [0.3.1] — 2026-05-23
 
 ### Added
@@ -442,7 +452,7 @@ metadata-native mixes and delimiter directory rollup.
 - **`BlobGuid` now re-exported at the crate root** for custom
   `BlobStore` implementations.
 - **`RangeBuilder::new` is `pub(crate)`** — use `Tree::range()` /
-  `Tree::scan_prefix()`.
+  `Tree::scan()`.
 - **`TreeConfig::checkpoint_byte_interval` field +
   `TreeBuilder::checkpoint_byte_interval` method removed.** The
   field was reserved and never read.
@@ -511,7 +521,7 @@ metadata-native mixes and delimiter directory rollup.
   `TreeBuilder::checkpoint(CheckpointConfig::default()
   .enabled(true))`. `Drop` runs one final synchronous round on
   the calling thread.
-- **`Tree::scan_prefix(p)`** — one-line wrapper for
+- **`Tree::scan(p)`** — one-line wrapper for
   `tree.range().prefix(p)`.
 - **`Tree::stats` extended** with `bm_dirty_count`,
   `bm_pending_delete_count`, `bm_cache_hits` / `bm_cache_misses`,

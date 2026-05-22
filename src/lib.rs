@@ -25,7 +25,7 @@
 //! let tree = TreeBuilder::new("/var/lib/myapp/meta.holt").open()?;
 //! tree.put(b"img/01.jpg", b"rgb_data")?;
 //! let v: Vec<u8> = tree.get(b"img/01.jpg")?.unwrap();
-//! for entry in tree.scan_prefix(b"img/").into_iter().take(10) {
+//! for entry in tree.scan(b"img/").into_iter().take(10) {
 //!     if let RangeEntry::Key { key, value, .. } = entry? {
 //!         println!("{key:?} -> {value:?}");
 //!     }
@@ -35,17 +35,15 @@
 //!
 //! ## Module map
 //!
-//! Public modules (the supported, SemVer-committed import surface):
+//! The supported import surface is the flat crate root:
+//! [`Tree`], [`TreeBuilder`], [`AtomicBatch`], [`Record`],
+//! [`RecordVersion`], range iterator types, stats snapshots, and
+//! the optional [`metrics`] renderer.
 //!
-//! - [`api`] — high-level [`Tree`] + [`AtomicBatch`] +
-//!   [`Record`] / [`RecordVersion`] + [`TreeBuilder`], plus the curated
-//!   [`api::stats`] module.
-//!
-//! Everything else is `pub(crate)`. The user surface is
-//! deliberately narrow so the on-disk format, WAL record codec,
-//! and buffer-manager internals are free to change in minor
-//! releases without breaking downstream code. Only the
-//! crate-root re-exports below are SemVer-stable.
+//! All implementation modules are crate-private. This keeps the
+//! on-disk format, WAL codec, walker, and buffer-manager internals
+//! free to change in minor releases without breaking downstream
+//! code.
 //!
 //! Internal modules (`pub(crate)`, not part of the SemVer surface):
 //!
@@ -60,8 +58,7 @@
 //!   users who want to plug in a custom store.
 //! - `engine` — recursive walker (insert / lookup / erase /
 //!   scan / rename / compact). Record and key-only range iterator
-//!   types are re-exported at the crate root; stats live in
-//!   [`api::stats`].
+//!   types and stats snapshots are re-exported at the crate root.
 //! - `concurrency` — `HybridLatch` 3-mode lock plus the
 //!   tree-wide maintenance gate.
 //! - `checkpoint` — 3-thread background checkpointer. Users opt
@@ -132,7 +129,7 @@ compile_error!(
      see ROADMAP.md."
 );
 
-pub mod api;
+mod api;
 
 pub(crate) mod checkpoint;
 pub(crate) mod concurrency;
@@ -148,10 +145,8 @@ pub mod metrics;
 
 // -- Top-level re-exports -----------------------------------------
 //
-// The flat `holt::*` surface — every name a user reaches for via
-// `use holt::X` lives here. Module-pathed access (e.g.
-// `holt::api::stats::TreeStats`) still works for users who prefer
-// it.
+// The flat `holt::*` surface — every supported public name a user
+// reaches for via `use holt::X` lives here.
 
 // Core handle + configuration.
 pub use api::builder::TreeBuilder;
@@ -161,7 +156,8 @@ pub use api::tree::Tree;
 
 // Range-scan iterator surface.
 pub use engine::{
-    KeyRangeBuilder, KeyRangeEntry, KeyRangeIter, RangeBuilder, RangeEntry, RangeIter,
+    KeyRangeBuilder, KeyRangeEntry, KeyRangeEntryRef, KeyRangeIter, RangeBuilder, RangeEntry,
+    RangeIter,
 };
 
 // Stats snapshots returned by `Tree::stats`.

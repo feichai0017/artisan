@@ -1449,7 +1449,7 @@ fn atomic_assert_version_observes_staged_updates() {
 // Tree::range
 // ----------------------------------------------------------------
 
-use holt::{KeyRangeEntry, RangeEntry};
+use holt::{KeyRangeEntry, KeyRangeEntryRef, RangeEntry};
 
 fn collect_keys(iter: impl IntoIterator<Item = Result<RangeEntry, holt::Error>>) -> Vec<Vec<u8>> {
     iter.into_iter()
@@ -1471,6 +1471,22 @@ fn collect_key_range(
             _ => panic!("KeyRangeEntry got a new variant"),
         })
         .collect()
+}
+
+fn collect_key_entry_refs(tree: &Tree, prefix: &[u8], delimiter: u8, limit: usize) -> Vec<Vec<u8>> {
+    let mut out = Vec::new();
+    tree.scan_keys(prefix)
+        .delimiter(delimiter)
+        .visit(limit, |entry| {
+            match entry {
+                KeyRangeEntryRef::Key { key, .. } => out.push(key.to_vec()),
+                KeyRangeEntryRef::CommonPrefix(prefix) => out.push(prefix.to_vec()),
+                _ => panic!("KeyRangeEntryRef got a new variant"),
+            }
+            Ok(())
+        })
+        .unwrap();
+    out
 }
 
 #[test]
@@ -1522,7 +1538,7 @@ fn range_key_entries_expose_live_versions() {
     let b = tree.get_record(b"img/b").unwrap().unwrap();
 
     let got: Vec<_> = tree
-        .scan_prefix(b"img/")
+        .scan(b"img/")
         .into_iter()
         .map(|r| match r.unwrap() {
             RangeEntry::Key {
@@ -1601,6 +1617,129 @@ fn range_keys_supports_start_after_and_delimiter_rollup() {
             b"img/sub/".to_vec(),
         ],
     );
+}
+
+#[test]
+fn key_range_builder_visit_matches_key_range_iterator_order() {
+    let tree = Tree::open(TreeConfig::memory()).unwrap();
+    for k in [
+        &b"img/01.jpg"[..],
+        b"img/02.jpg",
+        b"img/other/x.jpg",
+        b"img/sub/a.jpg",
+        b"img/sub/b.jpg",
+        b"video/1.mp4",
+    ] {
+        tree.put(k, b"value").unwrap();
+    }
+
+    let iter = collect_key_range(tree.scan_keys(b"img/").delimiter(b'/'));
+    let visitor = collect_key_entry_refs(&tree, b"img/", b'/', usize::MAX);
+    assert_eq!(visitor, iter);
+}
+
+#[test]
+fn key_range_builder_visit_supports_start_after() {
+    let tree = Tree::open(TreeConfig::memory()).unwrap();
+    for k in [b"a/0".as_slice(), b"a/1", b"a/2", b"a/sub/0"] {
+        tree.put(k, b"value").unwrap();
+    }
+
+    let mut got = Vec::new();
+    tree.scan_keys(b"a/")
+        .start_after(b"a/0")
+        .delimiter(b'/')
+        .visit(8, |entry| {
+            match entry {
+                KeyRangeEntryRef::Key { key, .. } => got.push(key.to_vec()),
+                KeyRangeEntryRef::CommonPrefix(prefix) => got.push(prefix.to_vec()),
+                _ => panic!("KeyRangeEntryRef got a new variant"),
+            }
+            Ok(())
+        })
+        .unwrap();
+
+    assert_eq!(
+        got,
+        vec![b"a/1".to_vec(), b"a/2".to_vec(), b"a/sub/".to_vec()]
+    );
+}
+
+#[test]
+fn key_range_builder_visit_honors_limit() {
+    let tree = Tree::open(TreeConfig::memory()).unwrap();
+    for i in 0..8u32 {
+        tree.put(format!("bucket-{i:02}/file").as_bytes(), b"value")
+            .unwrap();
+    }
+
+    let got = collect_key_entry_refs(&tree, b"bucket-", b'/', 3);
+    assert_eq!(
+        got,
+        vec![
+            b"bucket-00/".to_vec(),
+            b"bucket-01/".to_vec(),
+            b"bucket-02/".to_vec(),
+        ],
+    );
+}
+
+#[test]
+fn key_range_builder_visit_does_not_emit_fully_tombstoned_rollup() {
+    let tree = Tree::open(TreeConfig::memory()).unwrap();
+    tree.put(b"bucket-00/file", b"value").unwrap();
+    tree.put(b"bucket-01/file", b"value").unwrap();
+    assert!(tree.delete(b"bucket-00/file").unwrap());
+
+    let got = collect_key_entry_refs(&tree, b"bucket-", b'/', usize::MAX);
+    assert_eq!(got, vec![b"bucket-01/".to_vec()]);
+}
+
+#[test]
+fn key_range_builder_visit_cache_is_invalidated_by_writes() {
+    let tree = Tree::open(TreeConfig::memory()).unwrap();
+    tree.put(b"bucket-00/file", b"value").unwrap();
+
+    let first = collect_key_entry_refs(&tree, b"bucket-", b'/', 8);
+    assert_eq!(first, vec![b"bucket-00/".to_vec()]);
+
+    tree.put(b"bucket-01/file", b"value").unwrap();
+    let second = collect_key_entry_refs(&tree, b"bucket-", b'/', 8);
+    assert_eq!(second, vec![b"bucket-00/".to_vec(), b"bucket-01/".to_vec()]);
+}
+
+#[test]
+fn key_range_builder_visit_cache_includes_start_after() {
+    let tree = Tree::open(TreeConfig::memory()).unwrap();
+    for i in 0..3u32 {
+        tree.put(format!("bucket-{i:02}/file").as_bytes(), b"value")
+            .unwrap();
+    }
+
+    let all = collect_key_entry_refs(&tree, b"bucket-", b'/', 8);
+    assert_eq!(
+        all,
+        vec![
+            b"bucket-00/".to_vec(),
+            b"bucket-01/".to_vec(),
+            b"bucket-02/".to_vec(),
+        ]
+    );
+
+    let mut after = Vec::new();
+    tree.scan_keys(b"bucket-")
+        .start_after(b"bucket-00/file")
+        .delimiter(b'/')
+        .visit(8, |entry| {
+            match entry {
+                KeyRangeEntryRef::Key { key, .. } => after.push(key.to_vec()),
+                KeyRangeEntryRef::CommonPrefix(prefix) => after.push(prefix.to_vec()),
+                _ => panic!("KeyRangeEntryRef got a new variant"),
+            }
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(after, vec![b"bucket-01/".to_vec(), b"bucket-02/".to_vec()]);
 }
 
 #[test]

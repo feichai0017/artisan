@@ -580,15 +580,13 @@ fn holt_list_records(tree: &Tree, prefix: &[u8], take: usize) -> usize {
 
 fn holt_list_dir(tree: &Tree, prefix: &[u8], delim: u8, take: usize) -> usize {
     let mut seen = 0usize;
-    for entry in tree.scan_keys(prefix).delimiter(delim) {
-        match entry.expect("holt list_dir") {
-            KeyRangeEntry::Key { .. } | KeyRangeEntry::CommonPrefix(_) => seen += 1,
-            _ => unreachable!("KeyRangeEntry got a new variant"),
-        }
-        if seen >= take {
-            break;
-        }
-    }
+    tree.scan_keys(prefix)
+        .delimiter(delim)
+        .visit(take, |_| {
+            seen += 1;
+            Ok(())
+        })
+        .expect("holt list_dir");
     seen
 }
 

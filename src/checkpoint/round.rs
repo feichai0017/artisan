@@ -47,7 +47,7 @@ use crate::api::errors::{Error, Result};
 use crate::engine;
 use crate::layout::BlobGuid;
 use crate::store::blob_store::BlobStore;
-use crate::store::buffer_manager::WriteThroughEntry;
+use crate::store::WriteThroughEntry;
 
 use super::io::IoTask;
 use super::Shared;
@@ -443,7 +443,7 @@ pub(super) fn run_round(shared: &Arc<Shared>) -> Result<()> {
 /// the round's own `IoTask::FlushBatchAndSync`, which runs
 /// strictly after step 2's WAL flush.
 fn run_merge_pass(shared: &Arc<Shared>) -> Result<u64> {
-    use crate::store::buffer_manager::STRUCTURAL_SEQ;
+    use crate::store::STRUCTURAL_SEQ;
 
     let parents = shared.bm.pop_merge_candidates(256);
     let mut merged_total = 0u64;

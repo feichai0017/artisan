@@ -1358,15 +1358,13 @@ fn holt_list_plain(tree: &Tree, prefix: &[u8], take: usize) -> usize {
 
 fn holt_list_dir(tree: &Tree, prefix: &[u8], delim: u8, take: usize) -> usize {
     let mut seen = 0;
-    for entry in tree.range().prefix(prefix).delimiter(delim) {
-        match entry.unwrap() {
-            RangeEntry::CommonPrefix(_) | RangeEntry::Key { .. } => seen += 1,
-            _ => unreachable!("RangeEntry got a new variant"),
-        }
-        if seen >= take {
-            break;
-        }
-    }
+    tree.scan_keys(prefix)
+        .delimiter(delim)
+        .visit(take, |_| {
+            seen += 1;
+            Ok(())
+        })
+        .unwrap();
     seen
 }
 

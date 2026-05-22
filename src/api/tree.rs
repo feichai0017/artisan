@@ -10,36 +10,6 @@
 //! `'d'` byte in this example). The terminator is virtual during
 //! descent and is materialised only when a new leaf key is written.
 //!
-//! ## Concurrency model
-//!
-//! Tree owns an `Arc<BufferManager>`. The BM keeps each cached
-//! blob behind a `HybridLatch` (LeanStore-style 3-mode latch)
-//! wrapping an `UnsafeCell<AlignedBlobBuf>`:
-//!
-//! - **Reads** (`get`) take the shared maintenance gate, then walk
-//!   every blob in **optimistic** mode. The walker snapshots the
-//!   latch version, reads the buffer, then validates; on a torn
-//!   read it restarts from the root. Readers never block writers
-//!   and writers never block readers; only structural maintenance
-//!   (`compact` / merge) takes short exclusive maintenance windows
-//!   only while folding cross-blob edges.
-//! - **Writes** (`put` / `delete`) take **exclusive** mode on
-//!   each blob they touch. Persistent trees additionally enter a
-//!   short commit-publish critical section so checkpoint snapshots
-//!   never clone bytes that lack an admitted WAL record. Durable
-//!   fsync waiting happens after that section through the journal
-//!   group-commit worker.
-//! - **Structural maintenance** (`compact` and background merge)
-//!   takes a narrow tree-wide maintenance gate only around
-//!   merge/delete of cross-blob edges. Blob-local compaction runs
-//!   under per-blob latches on the shared side. Normal reads and
-//!   writers take the shared side while they may cross `BlobNode`
-//!   boundaries; blob-local access still relies on per-blob
-//!   optimistic validation.
-//! - **`rename`** is multi-step (lookup probe + erase + insert)
-//!   and must be atomic across all three. It takes the
-//!   `rename_lock` (a `Mutex<()>` scoped to rename only) to
-//!   prevent racing renames from interleaving.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -61,8 +31,7 @@ use crate::journal::reader::replay;
 use crate::journal::wal_op::WalOp;
 use crate::layout::{BlobGuid, DATA_AREA_START, PAGE_SIZE};
 use crate::store::blob_store::{BlobStore, FileBlobStore, MemoryBlobStore};
-use crate::store::buffer_manager::WriteThroughEntry;
-use crate::store::{BlobFrame, BlobFrameRef, BufferManager, CachedBlob};
+use crate::store::{BlobFrame, BlobFrameRef, BufferManager, CachedBlob, WriteThroughEntry};
 
 use super::atomic::{AtomicBatch, BatchOp, Record, RecordVersion};
 
@@ -105,7 +74,7 @@ fn blob_fill_per_mille(space_used: u32, blob_data_capacity: u64) -> u32 {
 ///   each blob's latch version, read the bytes, then `validate()`.
 ///   Restarts from the root on a torn read. Never blocks foreground
 ///   writers and never block each other.
-/// - **Range reads** (`range`, `scan_prefix`, `range_keys`,
+/// - **Range reads** (`range`, `scan`, `range_keys`,
 ///   `scan_keys`) use a versioned cursor. Each cursor frame
 ///   records the blob content version it was built from; if an
 ///   interleaved writer changes a frame, the iterator discards its
@@ -176,6 +145,10 @@ pub struct Tree {
     /// Group-commit WAL worker — `Some` for persistent trees,
     /// `None` for memory trees.
     journal: Option<Arc<Journal>>,
+    /// Direct-mapped cache for short hot key-only prefix scans.
+    /// Conservatively invalidated by `next_seq`, so every write
+    /// makes old entries miss.
+    prefix_list_cache: Arc<engine::PrefixListCache>,
     /// Background checkpointer handle. `Some` iff
     /// `cfg.checkpoint.enabled`. Shared via `Arc` so the thread
     /// shuts down on the **last** `Tree` clone's drop, not the
@@ -378,6 +351,7 @@ impl Tree {
             next_seq: Arc::new(AtomicU64::new(next_seq)),
             commit_gate,
             journal,
+            prefix_list_cache: Arc::new(engine::PrefixListCache::new()),
             checkpointer,
         })
     }
@@ -1347,7 +1321,7 @@ impl Tree {
     /// Returns a [`RangeBuilder`] already anchored to `prefix`;
     /// chain additional filters (`start_after`, `delimiter`)
     /// before iterating.
-    pub fn scan_prefix(&self, prefix: &[u8]) -> RangeBuilder {
+    pub fn scan(&self, prefix: &[u8]) -> RangeBuilder {
         self.range().prefix(prefix)
     }
 
@@ -1359,14 +1333,16 @@ impl Tree {
     /// value bytes. Use it for metadata listing paths that only
     /// need names and compare-and-set versions.
     pub fn range_keys(&self) -> KeyRangeBuilder {
-        KeyRangeBuilder::new(self.range())
+        KeyRangeBuilder::new(self.range()).with_prefix_list_cache(
+            Arc::clone(&self.prefix_list_cache),
+            Arc::clone(&self.next_seq),
+        )
     }
 
     /// Shorthand for `tree.range_keys().prefix(p)`.
     ///
-    /// This is the fast path for filesystem `readdir` and
-    /// object-store `ListObjects` style workloads where values are
-    /// not needed for every emitted key.
+    /// This is the fast path for prefix/delimiter scans where
+    /// values are not needed for every emitted key.
     pub fn scan_keys(&self, prefix: &[u8]) -> KeyRangeBuilder {
         self.range_keys().prefix(prefix)
     }
@@ -1947,7 +1923,7 @@ impl Tree {
     }
 
     fn compact_candidate_blob(&self, guid: BlobGuid) -> Result<()> {
-        use crate::store::buffer_manager::STRUCTURAL_SEQ;
+        use crate::store::STRUCTURAL_SEQ;
 
         let _maintenance = self.maintenance_gate.enter_shared();
         if !self.store.has_blob(guid)? {
@@ -1988,7 +1964,7 @@ impl Tree {
     }
 
     fn merge_candidate_parent(&self, guid: BlobGuid) -> Result<()> {
-        use crate::store::buffer_manager::STRUCTURAL_SEQ;
+        use crate::store::STRUCTURAL_SEQ;
 
         let _maintenance = self.maintenance_gate.enter_exclusive();
         if !self.store.has_blob(guid)? {

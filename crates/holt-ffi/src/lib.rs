@@ -460,7 +460,7 @@ pub unsafe extern "C" fn holt_tree_scan_records(
         let delimiter = delimiter_from_raw(delimiter)?;
         let out = unsafe { out_mut(out, "iterator") }?;
 
-        let mut builder = tree.tree.scan_prefix(prefix);
+        let mut builder = tree.tree.scan(prefix);
         if let Some(start_after) = start_after {
             builder = builder.start_after(start_after);
         }

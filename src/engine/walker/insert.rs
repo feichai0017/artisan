@@ -18,7 +18,7 @@ use super::writers::{
 use super::SearchKey;
 use super::MAX_SPILLOVER_ATTEMPTS;
 use crate::engine::RouteCache;
-use crate::store::buffer_manager::BlobWriteGuard;
+use crate::store::BlobWriteGuard;
 use crate::store::{BlobFrame, BlobFrameRef, BufferManager, CachedBlob};
 
 // ---------- public entry points ----------
