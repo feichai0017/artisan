@@ -1,0 +1,19 @@
+[package]
+name = "holt-ffi"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+description = "C ABI wrapper for the holt metadata storage engine."
+license = "MIT"
+publish = false
+
+[lib]
+name = "holt_ffi"
+crate-type = ["rlib", "cdylib", "staticlib"]
+
+[dependencies]
+holt = { path = "../.." }
+
+[dev-dependencies]
+tempfile = "3"
+

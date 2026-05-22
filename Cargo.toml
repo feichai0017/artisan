@@ -13,6 +13,10 @@ documentation = "https://docs.rs/holt"
 keywords = ["art", "radix-tree", "metadata", "storage", "embedded"]
 categories = ["database-implementations", "data-structures", "filesystem"]
 
+[workspace]
+members = [".", "crates/holt-ffi"]
+exclude = ["fuzz"]
+
 [dependencies]
 # Bounded MPSC + `select!` between a timer and a stop-channel —
 # used by the background checkpointer threads (planner / I/O /
