@@ -3,10 +3,10 @@
 //! `WalWriter` owns the file format and append/truncate mechanics.
 //! This module owns concurrency: foreground writers enqueue fully
 //! encoded WAL records, then wait outside the tree's commit-publish
-//! critical section when `sync_data` durability is required.
-//! `WalCommit::Write` appends directly and drains to the OS page
-//! cache on the caller path; sync callers share one `sync_data`
-//! when they arrive inside the short group window.
+//! critical section when their selected WAL boundary requires an
+//! acknowledgement. `WalCommit::Write` and `WalCommit::Sync` both
+//! use the worker so concurrent foreground writers share append
+//! batches instead of contending on the WAL writer mutex.
 
 use crossbeam_channel::{bounded, Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::collections::VecDeque;
@@ -52,10 +52,10 @@ struct AppendRequest {
 
 /// Completion handle for one acknowledged journal append.
 ///
-/// `WalCommit::Sync` appends return this handle and wait for the
-/// journal worker to reach the `sync_data` boundary. `Enqueue`
-/// and `Write` complete their acknowledgement boundary before
-/// `Journal::submit` returns.
+/// `WalCommit::Write` waits until its batch has been drained to
+/// the OS page cache. `WalCommit::Sync` waits until its batch has
+/// reached the `sync_data` durability boundary. `Enqueue` returns
+/// without an acknowledgement handle.
 pub(crate) struct JournalAck {
     rx: AckRx,
 }
@@ -70,12 +70,11 @@ impl JournalAck {
 
 /// WAL append coordinator.
 ///
-/// `Enqueue` uses the background worker; `Write` takes the direct
-/// writer mutex and drains to the OS page cache in the caller;
-/// `Sync` uses the background worker so concurrent fsync waiters
-/// can share one `sync_data`.
+/// All WAL records are serialized by the background worker. `Write`
+/// waiters share append/drain batches; `Sync` waiters additionally
+/// share one `sync_data` when they arrive inside the short group
+/// window.
 pub(crate) struct Journal {
-    writer: Arc<Mutex<WalWriter>>,
     tx: Sender<JournalCommand>,
     handle: Mutex<Option<JoinHandle<()>>>,
     appends: Arc<AtomicU64>,
@@ -122,7 +121,6 @@ impl Journal {
             })
             .map_err(|_| Error::Internal("OS rejected thread spawn for holt-journal"))?;
         Ok(Self {
-            writer,
             tx,
             handle: Mutex::new(Some(handle)),
             appends: Arc::new(AtomicU64::new(0)),
@@ -137,15 +135,6 @@ impl Journal {
 
     /// Submit one fully encoded WAL record.
     pub(crate) fn submit(&self, bytes: Vec<u8>, commit: WalCommit) -> Result<Option<JournalAck>> {
-        if matches!(commit, WalCommit::Write) {
-            let seq = self.next_work.fetch_add(1, Ordering::AcqRel) + 1;
-            self.append_write_direct(&bytes)?;
-            self.appends.fetch_add(1, Ordering::Relaxed);
-            self.batches.fetch_add(1, Ordering::Relaxed);
-            self.wal_work.fetch_max(seq, Ordering::Release);
-            return Ok(None);
-        }
-
         let needs_ack = !matches!(commit, WalCommit::Enqueue);
         let (ack, rx) = if needs_ack {
             let (ack, rx) = bounded(1);
@@ -165,15 +154,6 @@ impl Journal {
         self.appends.fetch_add(1, Ordering::Relaxed);
         self.wal_work.fetch_max(seq, Ordering::Release);
         Ok(rx.map(|rx| JournalAck { rx }))
-    }
-
-    fn append_write_direct(&self, bytes: &[u8]) -> Result<()> {
-        let mut writer = self
-            .writer
-            .lock()
-            .map_err(|_| Error::Internal("journal writer mutex poisoned"))?;
-        writer.append_encoded(bytes)?;
-        writer.drain_to_os()
     }
 
     /// Drain every append submitted before this call and force the
@@ -491,8 +471,11 @@ mod tests {
         let path = dir.path().join("journal.wal");
         let journal = Journal::open_or_create(&path, 0).unwrap();
 
-        let ack = journal.submit(vec![1, 3, 5, 7], WalCommit::Write).unwrap();
-        assert!(ack.is_none(), "write-ack append completes in submit");
+        let ack = journal
+            .submit(vec![1, 3, 5, 7], WalCommit::Write)
+            .unwrap()
+            .expect("write-ack append returns an ack");
+        ack.wait().unwrap();
 
         assert!(std::fs::metadata(&path).unwrap().len() > FILE_HEADER_SIZE as u64);
         assert!(journal.needs_flush());

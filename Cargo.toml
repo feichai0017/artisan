@@ -113,3 +113,8 @@ path = "benches/main.rs"
 name = "stress"
 harness = false
 path = "benches/stress.rs"
+
+[[bench]]
+name = "concurrent"
+harness = false
+path = "benches/concurrent.rs"

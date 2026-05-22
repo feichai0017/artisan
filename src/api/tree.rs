@@ -1335,6 +1335,7 @@ impl Tree {
     pub fn range(&self) -> RangeBuilder {
         RangeBuilder::new(
             Arc::clone(&self.store),
+            Arc::clone(&self.root_pin),
             self.root_guid,
             Arc::clone(&self.maintenance_gate),
         )

@@ -225,8 +225,8 @@ pub struct JournalStats {
     /// mutation paths.
     pub appends: u64,
     /// Number of append batches processed by the journal worker.
-    /// Under concurrent `WalCommit::Sync` writers this should be
-    /// lower than [`Self::appends`].
+    /// Under concurrent `WalCommit::Write` / `WalCommit::Sync`
+    /// writers this should be lower than [`Self::appends`].
     pub batches: u64,
     /// Number of `sync_data` calls issued by the journal worker,
     /// including explicit checkpoint flush barriers.

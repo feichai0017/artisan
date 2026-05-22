@@ -126,6 +126,7 @@ impl ProjectedRangeEntry {
 #[must_use = "RangeBuilder is lazy — call `.into_iter()` or use it in a `for` loop"]
 pub struct RangeBuilder {
     bm: Arc<BufferManager>,
+    root_pin: Arc<CachedBlob>,
     root_guid: BlobGuid,
     maintenance_gate: Arc<MaintenanceGate>,
     prefix: Vec<u8>,
@@ -140,11 +141,13 @@ impl RangeBuilder {
     /// (`BufferManager`, `BlobGuid`) live in crate-private modules.
     pub(crate) fn new(
         bm: Arc<BufferManager>,
+        root_pin: Arc<CachedBlob>,
         root_guid: BlobGuid,
         maintenance_gate: Arc<MaintenanceGate>,
     ) -> Self {
         Self {
             bm,
+            root_pin,
             root_guid,
             maintenance_gate,
             prefix: Vec::new(),
@@ -191,15 +194,15 @@ impl RangeBuilder {
     fn into_iter_with_projection(self, projection: RangeProjection) -> RangeIter {
         RangeIter {
             bm: self.bm,
+            root_pin: self.root_pin,
             root_guid: self.root_guid,
             maintenance_gate: self.maintenance_gate,
-            stack: Vec::with_capacity(32),
+            stack: Vec::with_capacity(8),
             curr_key: Vec::with_capacity(self.prefix.len().saturating_add(64)),
             cursor_floor: 0,
             prefix: self.prefix,
             lower_bound: self.start_after.map(LowerBound::Exclusive),
             delimiter: self.delimiter,
-            last_common_prefix: None,
             projection,
             initialized: false,
             terminated: false,
@@ -288,6 +291,7 @@ impl KeyRangeIter {
 /// Active iteration state — see [`RangeBuilder::into_iter`].
 pub struct RangeIter {
     bm: Arc<BufferManager>,
+    root_pin: Arc<CachedBlob>,
     root_guid: BlobGuid,
     maintenance_gate: Arc<MaintenanceGate>,
     /// Descent stack. Empty = no init done (if `!initialized`) or
@@ -308,9 +312,6 @@ pub struct RangeIter {
     lower_bound: Option<LowerBound>,
     /// Delimiter byte applied to bytes past `prefix`.
     delimiter: Option<u8>,
-    /// Most recent `CommonPrefix` emission, used to dedup further
-    /// leaves under the same rollup.
-    last_common_prefix: Option<Vec<u8>>,
     projection: RangeProjection,
     initialized: bool,
     terminated: bool,
@@ -370,7 +371,6 @@ fn project_range_leaf(
     prefix: &[u8],
     lower_bound: Option<&LowerBound>,
     delimiter: Option<u8>,
-    last_common_prefix: Option<&[u8]>,
     projection: RangeProjection,
 ) -> Result<LeafAction> {
     let body = frame
@@ -407,9 +407,6 @@ fn project_range_leaf(
         let rest = &user_key[prefix.len()..];
         if let Some(idx) = simd::find_byte(rest, d, 0) {
             let common: Vec<u8> = user_key[..=prefix.len() + idx].to_vec();
-            if last_common_prefix == Some(common.as_slice()) {
-                return Ok(LeafAction::Skip);
-            }
             return Ok(LeafAction::CommonPrefix(common));
         }
     }
@@ -432,6 +429,21 @@ fn prefix_successor(prefix: &[u8]) -> Option<Vec<u8>> {
         }
     }
     None
+}
+
+fn key_at_or_past_prefix_successor(key: &[u8], prefix: &[u8]) -> bool {
+    let Some(pos) = prefix.iter().rposition(|&b| b != u8::MAX) else {
+        return false;
+    };
+    let successor_len = pos + 1;
+    let limit = key.len().min(successor_len);
+    for i in 0..limit {
+        let successor_byte = if i == pos { prefix[i] + 1 } else { prefix[i] };
+        if key[i] != successor_byte {
+            return key[i] > successor_byte;
+        }
+    }
+    key.len() >= successor_len
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -480,10 +492,12 @@ enum LeafAction {
     CommonPrefix(Vec<u8>),
 }
 
+#[derive(Clone, Copy)]
 enum SeekStart {
     None,
     Empty,
-    Key(Vec<u8>),
+    Prefix,
+    LowerBound,
 }
 
 enum SeekRelation {
@@ -566,7 +580,7 @@ impl RangeIter {
         }
 
         // Seed the stack with the root blob's root slot.
-        let root_pin = self.bm.pin(self.root_guid)?;
+        let root_pin = Arc::clone(&self.root_pin);
         let (root_slot, root_ntype, root_version) = {
             let guard = root_pin.read();
             let version = root_pin.content_version();
@@ -592,7 +606,7 @@ impl RangeIter {
         match seek_start {
             SeekStart::None => Ok(InitResult::Ready),
             SeekStart::Empty => unreachable!("handled before root pin"),
-            SeekStart::Key(target) => self.seek_to_lower_bound(&target),
+            SeekStart::Prefix | SeekStart::LowerBound => self.seek_to_lower_bound(seek_start),
         }
     }
 
@@ -601,25 +615,37 @@ impl RangeIter {
             if self.prefix.is_empty() {
                 return SeekStart::None;
             }
-            return SeekStart::Key(self.prefix.clone());
+            return SeekStart::Prefix;
         };
         let bound_key = bound.key();
         if self.prefix.is_empty() {
-            return SeekStart::Key(bound_key.to_vec());
+            return SeekStart::LowerBound;
         }
         if bound_key < self.prefix.as_slice() {
-            return SeekStart::Key(self.prefix.clone());
+            return SeekStart::Prefix;
         }
-        if let Some(upper) = prefix_successor(&self.prefix) {
-            if bound_key >= upper.as_slice() {
-                return SeekStart::Empty;
+        if key_at_or_past_prefix_successor(bound_key, &self.prefix) {
+            return SeekStart::Empty;
+        }
+        SeekStart::LowerBound
+    }
+
+    fn seek_target(&self, source: SeekStart) -> &[u8] {
+        match source {
+            SeekStart::Prefix => self.prefix.as_slice(),
+            SeekStart::LowerBound => self
+                .lower_bound
+                .as_ref()
+                .expect("lower-bound seek source has a lower bound")
+                .key(),
+            SeekStart::None | SeekStart::Empty => {
+                unreachable!("non-key seek source has no target bytes")
             }
         }
-        SeekStart::Key(bound_key.to_vec())
     }
 
     #[allow(clippy::too_many_lines)] // one cursor-state machine over every ART node kind
-    fn seek_to_lower_bound(&mut self, target: &[u8]) -> Result<InitResult> {
+    fn seek_to_lower_bound(&mut self, source: SeekStart) -> Result<InitResult> {
         loop {
             if self.stack.len() < self.cursor_floor {
                 self.stack.clear();
@@ -646,7 +672,7 @@ impl RangeIter {
                             } else {
                                 stored_key
                             };
-                            user_key >= target
+                            user_key >= self.seek_target(source)
                         };
                         if is_candidate {
                             return Ok(InitResult::Ready);
@@ -683,7 +709,11 @@ impl RangeIter {
                             version,
                         )
                     };
-                    match segment_seek_relation(&self.curr_key, p_bytes.as_slice(), target) {
+                    let relation = {
+                        let target = self.seek_target(source);
+                        segment_seek_relation(&self.curr_key, p_bytes.as_slice(), target)
+                    };
+                    match relation {
                         SegmentRelation::Skip => {
                             self.stack[idx].next = 1;
                             self.pop_frame();
@@ -710,7 +740,8 @@ impl RangeIter {
                     let (child_guid, p_bytes) = {
                         let top = &self.stack[idx];
                         let guard = top.pin.read();
-                        if top.pin.content_version() != top.version {
+                        let version = top.pin.content_version();
+                        if version != top.version {
                             return Ok(InitResult::Restart);
                         }
                         let frame = BlobFrameRef::wrap(guard.as_slice());
@@ -724,7 +755,11 @@ impl RangeIter {
                             InlinePrefix::from_slice(&b.bytes[..plen]),
                         )
                     };
-                    match segment_seek_relation(&self.curr_key, p_bytes.as_slice(), target) {
+                    let relation = {
+                        let target = self.seek_target(source);
+                        segment_seek_relation(&self.curr_key, p_bytes.as_slice(), target)
+                    };
+                    match relation {
                         SegmentRelation::Skip => {
                             self.stack[idx].next = 1;
                             self.pop_frame();
@@ -737,15 +772,19 @@ impl RangeIter {
                 }
                 NodeType::Node4 | NodeType::Node16 | NodeType::Node48 | NodeType::Node256 => {
                     let idx = self.stack.len() - 1;
-                    let relation = path_seek_relation(&self.curr_key, target);
-                    let min_byte = match relation {
-                        SeekRelation::Skip => {
-                            self.pop_frame();
-                            continue;
-                        }
-                        SeekRelation::Min => None,
-                        SeekRelation::Seeking => Some(target[self.curr_key.len()]),
+                    let (relation, min_byte) = {
+                        let target = self.seek_target(source);
+                        let relation = path_seek_relation(&self.curr_key, target);
+                        let min_byte = match relation {
+                            SeekRelation::Seeking => Some(target[self.curr_key.len()]),
+                            SeekRelation::Skip | SeekRelation::Min => None,
+                        };
+                        (relation, min_byte)
                     };
+                    if matches!(relation, SeekRelation::Skip) {
+                        self.pop_frame();
+                        continue;
+                    }
                     let top_pin = self.stack[idx].pin.clone();
                     let top_blob_guid = self.stack[idx].blob_guid;
                     let result = {
@@ -827,7 +866,6 @@ impl RangeIter {
                                 &self.prefix,
                                 self.lower_bound.as_ref(),
                                 self.delimiter,
-                                self.last_common_prefix.as_deref(),
                                 self.projection,
                             )?
                         };
@@ -843,7 +881,6 @@ impl RangeIter {
                                     return Ok(RangeAdvance::Restart);
                                 }
                                 self.lower_bound = Some(LowerBound::Exclusive(key.clone()));
-                                self.last_common_prefix = None;
                                 let entry = match self.projection {
                                     RangeProjection::Records => {
                                         ProjectedRangeEntry::Record(RangeEntry::Key {
@@ -865,7 +902,6 @@ impl RangeIter {
                                 if !self.path_is_still_valid() {
                                     return Ok(RangeAdvance::Restart);
                                 }
-                                self.last_common_prefix = Some(common.clone());
                                 // Fast-forward past `common`'s subtree.
                                 // Ascend the descent stack while
                                 // `curr_key` still extends into the
@@ -951,7 +987,8 @@ impl RangeIter {
                         let (child_guid, p_bytes) = {
                             let top = &self.stack[idx];
                             let guard = top.pin.read();
-                            if top.pin.content_version() != top.version {
+                            let version = top.pin.content_version();
+                            if version != top.version {
                                 return Ok(RangeAdvance::Restart);
                             }
                             let frame = BlobFrameRef::wrap(guard.as_slice());
@@ -1070,7 +1107,6 @@ impl RangeIter {
         self.stack.clear();
         self.curr_key.clear();
         self.cursor_floor = 0;
-        self.last_common_prefix = None;
         self.initialized = false;
     }
 

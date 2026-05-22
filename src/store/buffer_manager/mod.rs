@@ -126,7 +126,7 @@
 mod cached_blob;
 mod mutation;
 
-use std::collections::HashMap;
+use std::collections::{hash_map::Entry, HashMap};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -184,6 +184,7 @@ pub struct BufferManager {
     /// one short critical section with no global dirty mutex on the
     /// persistent write hot path.
     mutation: [Mutex<MutationState>; BOOKKEEPING_SHARDS],
+    pending_delete_total: AtomicUsize,
     /// Rotating shard cursors for advisory maintenance queues.
     /// Without this, a fixed shard-0-first drain can starve later
     /// shards when online maintenance has a small per-call budget.
@@ -239,6 +240,7 @@ impl BufferManager {
             capacity: capacity.max(1),
             cache: DashMap::new(),
             mutation: std::array::from_fn(|_| Mutex::new(MutationState::default())),
+            pending_delete_total: AtomicUsize::new(0),
             compact_candidate_cursor: AtomicUsize::new(0),
             merge_candidate_cursor: AtomicUsize::new(0),
             compact_candidate_total: AtomicUsize::new(0),
@@ -465,6 +467,9 @@ impl BufferManager {
     }
 
     fn is_pending_delete(&self, guid: BlobGuid) -> bool {
+        if self.pending_delete_total.load(Ordering::Acquire) == 0 {
+            return false;
+        }
         self.mutation_shard(guid)
             .lock()
             .unwrap()
@@ -882,11 +887,16 @@ impl BufferManager {
     /// be truncated.
     pub fn mark_for_delete(&self, guid: BlobGuid, seq: u64) {
         let mut state = self.mutation_shard(guid).lock().unwrap();
-        state
-            .pending_deletes
-            .entry(guid)
-            .and_modify(|cur| *cur = (*cur).min(seq))
-            .or_insert(seq);
+        match state.pending_deletes.entry(guid) {
+            Entry::Occupied(mut entry) => {
+                let cur = entry.get_mut();
+                *cur = (*cur).min(seq);
+            }
+            Entry::Vacant(entry) => {
+                entry.insert(seq);
+                self.pending_delete_total.fetch_add(1, Ordering::AcqRel);
+            }
+        }
         state.remove_dirty(&guid);
         let removed = state.remove_maintenance_candidates(&guid);
         drop(state);
@@ -906,7 +916,12 @@ impl BufferManager {
         let mut out = HashMap::new();
         for shard in &self.mutation {
             let mut state = shard.lock().unwrap();
-            out.extend(std::mem::take(&mut state.pending_deletes));
+            let pending = std::mem::take(&mut state.pending_deletes);
+            let count = pending.len();
+            if count != 0 {
+                self.pending_delete_total.fetch_sub(count, Ordering::AcqRel);
+            }
+            out.extend(pending);
         }
         out
     }
@@ -919,11 +934,16 @@ impl BufferManager {
         }
         for (g, t) in entries {
             let mut state = self.mutation_shard(g).lock().unwrap();
-            state
-                .pending_deletes
-                .entry(g)
-                .and_modify(|cur| *cur = (*cur).min(t))
-                .or_insert(t);
+            match state.pending_deletes.entry(g) {
+                Entry::Occupied(mut entry) => {
+                    let cur = entry.get_mut();
+                    *cur = (*cur).min(t);
+                }
+                Entry::Vacant(entry) => {
+                    entry.insert(t);
+                    self.pending_delete_total.fetch_add(1, Ordering::AcqRel);
+                }
+            }
         }
     }
 
@@ -932,10 +952,7 @@ impl BufferManager {
     /// "WAL records are all redundant" invariant.
     #[must_use]
     pub fn pending_delete_count(&self) -> usize {
-        self.mutation
-            .iter()
-            .map(|shard| shard.lock().unwrap().pending_deletes.len())
-            .sum()
+        self.pending_delete_total.load(Ordering::Acquire)
     }
 
     // ---------- online-maintenance candidates ----------
@@ -1506,6 +1523,27 @@ mod tests {
         bm.restore_dirty(restore);
         assert_eq!(bm.dirty_count(), 0);
         assert_eq!(bm.pending_delete_count(), 1);
+    }
+
+    #[test]
+    fn pending_delete_count_tracks_snapshot_and_restore() {
+        let inner: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
+        let bm = BufferManager::new(inner, 4);
+        let guid = [0x55; 16];
+
+        bm.mark_for_delete(guid, 20);
+        bm.mark_for_delete(guid, 10);
+        assert_eq!(bm.pending_delete_count(), 1);
+
+        let pending = bm.snapshot_pending_deletes();
+        assert_eq!(pending.get(&guid), Some(&10));
+        assert_eq!(bm.pending_delete_count(), 0);
+
+        bm.restore_pending_deletes(pending);
+        assert_eq!(bm.pending_delete_count(), 1);
+        let pending = bm.snapshot_pending_deletes();
+        assert_eq!(pending.get(&guid), Some(&10));
+        assert_eq!(bm.pending_delete_count(), 0);
     }
 
     #[test]

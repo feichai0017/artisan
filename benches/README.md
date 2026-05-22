@@ -142,6 +142,34 @@ with `synchronous = OFF`. This is the fair persistent hot path:
 WAL bytes are written before the operation returns, but power-loss
 durability is not forced per operation.
 
+## Concurrent Harness
+
+`benches/concurrent.rs` measures multi-thread throughput for one
+shared file-backed engine. It currently compares Holt and RocksDB;
+SQLite is intentionally excluded from the main table because WAL
+mode still serializes writers, so it is a different concurrency
+model.
+
+```sh
+HOLT_CONCURRENT_N=2000000 \
+HOLT_CONCURRENT_OPS_PER_THREAD=100000 \
+HOLT_CONCURRENT_THREADS=1,2,4,8 \
+HOLT_CONCURRENT_OPS=get,put,mixed90,mixed50,list_dir \
+cargo bench --bench concurrent -- objstore
+
+HOLT_CONCURRENT_N=2000000 \
+HOLT_CONCURRENT_OPS_PER_THREAD=100000 \
+HOLT_CONCURRENT_THREADS=1,2,4,8 \
+HOLT_CONCURRENT_OPS=get,put,mixed90,mixed50,list_dir \
+cargo bench --bench concurrent -- fs
+```
+
+Profile: warm-service, file-backed persistent engines with WAL
+enabled and no per-op fsync. Reported throughput is wall-clock
+multi-thread throughput; sampled latency is approximate and exists
+to expose tail regressions, not to replace a production latency
+study.
+
 ## Methodology — apples-to-apples
 
 Two comparison modes, each with all three engines tuned to the
