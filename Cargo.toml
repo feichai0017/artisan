@@ -15,7 +15,7 @@ categories = ["database-implementations", "data-structures", "filesystem"]
 
 [workspace]
 members = [".", "crates/holt-ffi"]
-exclude = ["fuzz"]
+exclude = ["fuzz", "verified"]
 
 [dependencies]
 # Bounded MPSC + `select!` between a timer and a stop-channel —
