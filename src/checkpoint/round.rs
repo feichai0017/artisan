@@ -15,21 +15,15 @@
 //! 2. **Flush WAL** through the journal worker so every record that
 //!    mirrors a snapshotted seq is durable before we drop it.
 //! 3. **Clone snapshotted bytes** while still holding the same
-//!    commit-publish gate, then submit one
-//!    `IoTask::FlushBatchAndSync`.
-//! 4. **Collect completion** — wait for the one-shot completion.
-//!    On write failure, restore the whole dirty snapshot via
-//!    `bm.restore_dirty` because a store batch may have written
-//!    an arbitrary prefix. On sync failure, keep dirty retirement
-//!    decisions but leave pending deletes / WAL truncation blocked.
-//! 5. **Pre-delete Sync** — normally completed inside
-//!    `FlushBatchAndSync`; rounds with no dirty blob batch still
-//!    send one standalone `IoTask::Sync`.
-//! 6. **Truncate WAL** — only when (a) no `Flush` failed AND (b)
-//!    `bm.dirty_count() == 0` checked under the commit-publish
-//!    gate. The interlock with the writer-side dirty/journal
-//!    publish order ensures we never drop a record whose effect
-//!    isn't already in store.
+//!    commit-publish gate, then enqueue one checkpoint epoch to
+//!    the I/O worker.
+//! 4. **Retire completed epochs** on later planner turns in FIFO
+//!    order. This is the truncate watermark: a later epoch may not
+//!    advance WAL trimming before every older epoch is known to
+//!    have landed or restored.
+//! 5. **Truncate WAL** only when the pipeline is empty and
+//!    `bm.dirty_count() == 0 && bm.pending_delete_count() == 0`
+//!    under the commit-publish gate.
 //!
 //! This function is called from two places:
 //!
@@ -39,8 +33,8 @@
 //!   thread, after the planner has joined and writers are
 //!   guaranteed to be gone).
 
-use crossbeam_channel::bounded;
-use std::collections::HashMap;
+use crossbeam_channel::{bounded, Receiver, TryRecvError};
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
 use crate::api::errors::{Error, Result};
@@ -49,16 +43,133 @@ use crate::layout::BlobGuid;
 use crate::store::blob_store::BlobStore;
 use crate::store::WriteThroughEntry;
 
-use super::io::IoTask;
+use super::io::{CheckpointEpoch, CheckpointEpochReport, IoTask};
 use super::Shared;
 
-// The round is intentionally a single linear function so the 6
-// phases stay readable as one story. Splitting it into helpers
-// would hide the interlock between WAL flush / per-blob commit /
-// dirty restore / truncate gate.
+pub(super) struct Pipeline {
+    in_flight: VecDeque<PendingEpoch>,
+    max_in_flight: usize,
+}
+
+struct PendingEpoch {
+    rx: Receiver<CheckpointEpochReport>,
+    snap: HashMap<BlobGuid, u64>,
+    pending: HashMap<BlobGuid, u64>,
+}
+
+impl Pipeline {
+    pub(super) fn new(max_in_flight: usize) -> Self {
+        Self {
+            in_flight: VecDeque::new(),
+            max_in_flight: max_in_flight.max(1),
+        }
+    }
+
+    pub(super) fn has_room(&self) -> bool {
+        self.in_flight.len() < self.max_in_flight
+    }
+
+    pub(super) fn is_empty(&self) -> bool {
+        self.in_flight.is_empty()
+    }
+
+    pub(super) fn reap_ready(&mut self, shared: &Arc<Shared>) -> Result<()> {
+        loop {
+            let Some(front) = self.in_flight.front() else {
+                break;
+            };
+            match front.rx.try_recv() {
+                Ok(report) => {
+                    self.in_flight.pop_front().expect("front exists");
+                    finish_epoch(shared, report)?;
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    let pending = self.in_flight.pop_front().expect("front exists");
+                    restore_unreported_epoch(shared, pending);
+                    return Err(Error::Internal(
+                        "checkpoint: I/O worker dropped epoch completion",
+                    ));
+                }
+            }
+        }
+        self.maybe_truncate(shared)
+    }
+
+    fn wait_for_room(&mut self, shared: &Arc<Shared>) -> Result<()> {
+        if self.has_room() {
+            return Ok(());
+        }
+        self.wait_one(shared)
+    }
+
+    pub(super) fn drain(&mut self, shared: &Arc<Shared>) -> Result<()> {
+        let mut first_err = None;
+        while !self.in_flight.is_empty() {
+            if let Err(e) = self.wait_one(shared) {
+                first_err.get_or_insert(e);
+            }
+        }
+        if let Some(e) = first_err {
+            return Err(e);
+        }
+        self.maybe_truncate(shared)
+    }
+
+    fn wait_one(&mut self, shared: &Arc<Shared>) -> Result<()> {
+        let Some(pending) = self.in_flight.pop_front() else {
+            return Ok(());
+        };
+        if let Ok(report) = pending.rx.recv() {
+            finish_epoch(shared, report)
+        } else {
+            restore_unreported_epoch(shared, pending);
+            Err(Error::Internal(
+                "checkpoint: I/O worker dropped epoch completion",
+            ))
+        }
+    }
+
+    fn push(&mut self, pending: PendingEpoch) {
+        debug_assert!(self.has_room());
+        self.in_flight.push_back(pending);
+    }
+
+    fn maybe_truncate(&self, shared: &Arc<Shared>) -> Result<()> {
+        if !self.in_flight.is_empty() {
+            return Ok(());
+        }
+        let Some(journal) = &shared.journal else {
+            return Ok(());
+        };
+        if !journal.needs_checkpoint() {
+            return Ok(());
+        }
+        let _commit = shared.commit_gate.enter_checkpoint();
+        if shared.bm.dirty_count() == 0 && shared.bm.pending_delete_count() == 0 {
+            journal.truncate()?;
+            use std::sync::atomic::Ordering;
+            shared.truncates.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(())
+    }
+}
+
+pub(super) fn run_round_sync(shared: &Arc<Shared>) -> Result<()> {
+    let mut pipeline = Pipeline::new(1);
+    run_round(shared, &mut pipeline)?;
+    pipeline.drain(shared)
+}
+
+// The round is intentionally a single linear submission function:
+// it maps "what is durable enough to enqueue" without hiding the
+// WAL flush / dirty snapshot / byte clone interlock.
 #[allow(clippy::too_many_lines)]
-pub(super) fn run_round(shared: &Arc<Shared>) -> Result<()> {
+pub(super) fn run_round(shared: &Arc<Shared>, pipeline: &mut Pipeline) -> Result<()> {
     use std::sync::atomic::Ordering;
+
+    pipeline.reap_ready(shared)?;
+    pipeline.wait_for_room(shared)?;
 
     shared.rounds_attempted.fetch_add(1, Ordering::Relaxed);
 
@@ -112,12 +223,8 @@ pub(super) fn run_round(shared: &Arc<Shared>) -> Result<()> {
         let mut snap_bytes = Vec::with_capacity(snap.len());
         for (guid, seq) in &snap {
             let Some(bytes) = shared.bm.snapshot_bytes(*guid) else {
-                let mut failed = HashMap::new();
-                for (g, t) in &snap {
-                    failed.entry(*g).or_insert(*t);
-                }
                 shared.bm.restore_pending_deletes(pending);
-                shared.bm.restore_dirty(failed);
+                shared.bm.restore_dirty(snap.clone());
                 return Err(Error::Internal(
                     "checkpoint: dirty entry lost cache image — invariant I1 violated",
                 ));
@@ -131,12 +238,8 @@ pub(super) fn run_round(shared: &Arc<Shared>) -> Result<()> {
         let mut snap_bytes = Vec::with_capacity(snap.len());
         for (guid, seq) in &snap {
             let Some(bytes) = shared.bm.snapshot_bytes(*guid) else {
-                let mut failed = HashMap::new();
-                for (g, t) in &snap {
-                    failed.entry(*g).or_insert(*t);
-                }
                 shared.bm.restore_pending_deletes(pending);
-                shared.bm.restore_dirty(failed);
+                shared.bm.restore_dirty(snap.clone());
                 return Err(Error::Internal(
                     "checkpoint: dirty entry lost cache image — invariant I1 violated",
                 ));
@@ -159,259 +262,58 @@ pub(super) fn run_round(shared: &Arc<Shared>) -> Result<()> {
     // Sync, so there is still durable work even when dirty/pending
     // are both empty. A WAL-only round can skip store Sync but
     // must still retry truncate.
-    if snap.is_empty() && merged == 0 && pending.is_empty() && !shared.bm.needs_flush() {
-        if let Some(journal) = &shared.journal {
-            if journal.needs_checkpoint() {
-                let _commit = shared.commit_gate.enter_checkpoint();
-                if shared.bm.dirty_count() == 0 && shared.bm.pending_delete_count() == 0 {
-                    journal.truncate()?;
-                    shared.truncates.fetch_add(1, Ordering::Relaxed);
-                }
-            }
-        }
+    let needs_store_flush = pipeline.in_flight.is_empty() && shared.bm.needs_flush();
+    if snap.is_empty() && merged == 0 && pending.is_empty() && !needs_store_flush {
+        pipeline.maybe_truncate(shared)?;
         shared.rounds_succeeded.fetch_add(1, Ordering::Relaxed);
         #[cfg(feature = "tracing")]
         tracing::trace!(target: "holt::checkpoint", "round skipped — nothing dirty");
         return Ok(());
     }
 
-    // 3. Submit one batched Flush+Sync task. The snapshot bytes
-    // were already cloned under the commit-publish gate above.
-    let mut failed: HashMap<BlobGuid, u64> = HashMap::new();
-    let mut pre_delete_sync_result: Option<Result<()>> = None;
-
-    if !snap_bytes.is_empty() {
-        let mut entries = Vec::with_capacity(snap_bytes.len());
-        let mut expected = Vec::with_capacity(snap_bytes.len());
-        for (guid, seq, bytes) in snap_bytes {
-            expected.push((guid, seq));
-            entries.push(WriteThroughEntry {
-                guid,
-                bytes,
-                expected_seq: seq,
-            });
-        }
-        let (tx, rx) = bounded(1);
-        let task = IoTask::FlushBatchAndSync {
-            entries,
-            on_done: tx,
-        };
-        if shared.io_tx.send(task).is_err() {
-            // I/O thread is gone (Drop is mid-sequence on another
-            // path) — restore EVERYTHING we drained at step 1 so
-            // the next round retries. The whole `pending` snapshot
-            // is restored because phase 6 won't run.
-            for (g, t) in &snap {
-                failed.entry(*g).or_insert(*t);
-            }
-            shared.bm.restore_pending_deletes(pending);
-            shared.bm.restore_dirty(failed);
-            return Err(Error::Internal(
-                "checkpoint: I/O worker channel closed mid-round",
-            ));
-        }
-
-        // 4. Collect batch completion. On write error, restore the
-        // whole snapshot: `BlobStore::write_blobs` may have landed
-        // any prefix, and retrying all entries is the only
-        // portable recovery shape. The worker always attempts the
-        // pre-delete Sync after the write attempt, preserving the
-        // old two-task failure semantics while removing one
-        // channel round trip on the success path.
-        match rx.recv() {
-            Ok(report) => {
-                match report.write_result {
-                    Ok(()) => {
-                        shared
-                            .blobs_flushed
-                            .fetch_add(expected.len() as u64, Ordering::Relaxed);
-                    }
-                    Err(e) => {
-                        eprintln!(
-                            "holt: checkpoint flush batch failed ({} blobs): {e}",
-                            expected.len()
-                        );
-                        for (guid, seq) in expected {
-                            failed.insert(guid, seq);
-                        }
-                    }
-                }
-                pre_delete_sync_result = Some(report.sync_result);
-            }
-            Err(_) => {
-                // Sender dropped before sending — I/O thread died.
-                for (guid, seq) in expected {
-                    failed.insert(guid, seq);
-                }
-            }
-        }
-    }
-
-    let had_dirty_failure = !failed.is_empty();
-    if had_dirty_failure {
-        shared.bm.restore_dirty(failed.clone());
-    }
-
-    // 5. Pre-delete Sync — a successful FlushBatchAndSync write
-    //    half retired dirty entries via write-through CAS; we
-    //    must still fsync so those bytes are stable on disk before
-    //    phase 6 mutates the manifest. Each early-return path
-    //    restores `pending` because phase 6 won't run.
-    if let Some(sync_result) = pre_delete_sync_result {
-        if let Err(e) = sync_result {
-            eprintln!("holt: checkpoint store Sync failed: {e}");
-            shared.bm.restore_pending_deletes(pending);
-            return Err(e);
-        }
-    } else {
-        let (sync_tx, sync_rx) = bounded(1);
-        if shared
-            .io_tx
-            .send(IoTask::Sync { on_done: sync_tx })
-            .is_err()
-        {
-            shared.bm.restore_pending_deletes(pending);
-            return Err(Error::Internal(
-                "checkpoint: I/O worker channel closed before Sync",
-            ));
-        }
-        match sync_rx.recv() {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => {
-                eprintln!("holt: checkpoint store Sync failed: {e}");
-                shared.bm.restore_pending_deletes(pending);
-                return Err(e);
-            }
-            Err(_) => {
-                shared.bm.restore_pending_deletes(pending);
-                return Err(Error::Internal(
-                    "checkpoint: I/O worker dropped Sync completion",
-                ));
-            }
-        }
-    }
-
-    // 5.5. Abort-on-dirty-failure gate. A failed parent write must
-    //      NOT propagate to a manifest delete of its dependent
-    //      child — that would orphan the parent's `BlobNode`
-    //      pointer (parent on-disk still points to the child;
-    //      manifest no longer has the child; WAL replay's walker
-    //      descent would fail to read the deleted child). Restore
-    //      `pending` and bail; the next round retries the parent
-    //      write and only then processes its child's deletion.
-    if had_dirty_failure {
-        shared.bm.restore_pending_deletes(pending);
+    // 3. Hand the whole epoch to the I/O worker. The planner has
+    // already snapshotted durable intent under the commit-publish
+    // gate; the worker can now drive data writes, store sync, pending
+    // manifest deletes, and trailing sync without holding up writers
+    // or future snapshot rounds.
+    let entries: Vec<_> = snap_bytes
+        .into_iter()
+        .map(|(guid, seq, bytes)| WriteThroughEntry {
+            guid,
+            bytes,
+            expected_seq: seq,
+        })
+        .collect();
+    let pending_for_recovery = pending.clone();
+    let (tx, rx) = bounded(1);
+    let epoch = CheckpointEpoch { entries, pending };
+    if shared
+        .io_tx
+        .send(IoTask::CommitEpoch { epoch, on_done: tx })
+        .is_err()
+    {
+        shared.bm.restore_pending_deletes(pending_for_recovery);
+        shared.bm.restore_dirty(snap);
         return Err(Error::Internal(
-            "checkpoint: dirty write failed — pending deletes deferred to next round",
+            "checkpoint: I/O worker channel closed mid-round",
         ));
     }
-
-    // 6. Apply pending deletes — `pending` was already drained in
-    //    step 1 under the commit-publish gate, so the writer-side
-    //    WAL records covering each unlink op are durable on disk
-    //    (via the step-2 journal flush). Phase 5 has fsync'd the
-    //    per-blob writes that the manifest delete is allowed to
-    //    follow. Safe to mutate the manifest now; the trailing
-    //    re-Sync at step 7 persists it.
-    let pending_count = pending.len();
-    let mut pending_failed: HashMap<BlobGuid, u64> = HashMap::new();
-    for (guid, seq) in &pending {
-        if let Err(e) = shared.bm.execute_pending_delete(*guid) {
-            eprintln!(
-                "holt: checkpoint deferred delete failed for blob {:02x?} (seq={seq}): {e}",
-                &guid[..4]
-            );
-            pending_failed.insert(*guid, *seq);
-        }
-    }
-    if !pending_failed.is_empty() {
-        shared.bm.restore_pending_deletes(pending_failed.clone());
-    }
-
-    // 7. Re-Sync iff we actually deleted anything — the manifest
-    //    mutation at step 6 is in-memory until `store.flush`
-    //    rewrites the manifest file. Skip the syscall when the
-    //    pending set was empty.
-    let applied_deletes = pending_count - pending_failed.len();
-    // Helper: on Sync failure here the manifest deletions we
-    // already applied at step 6 are stuck in-memory. We can't
-    // re-`execute_pending_delete` them (the slot is already
-    // gone from the manifest map and the call is idempotent),
-    // but we MUST keep them in the pending-delete set so the
-    // truncate gate stays closed and the next round retries the
-    // Sync. Re-registering with the same seq is idempotent
-    // (min-merge in `restore_pending_deletes`).
-    let restore_applied = || -> HashMap<BlobGuid, u64> {
-        pending
-            .iter()
-            .filter(|(g, _)| !pending_failed.contains_key(*g))
-            .map(|(g, s)| (*g, *s))
-            .collect()
-    };
-    if applied_deletes > 0 {
-        let (sync_tx2, sync_rx2) = bounded(1);
-        if shared
-            .io_tx
-            .send(IoTask::Sync { on_done: sync_tx2 })
-            .is_err()
-        {
-            shared.bm.restore_pending_deletes(restore_applied());
-            return Err(Error::Internal(
-                "checkpoint: I/O worker channel closed before Sync (deletes)",
-            ));
-        }
-        match sync_rx2.recv() {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => {
-                eprintln!("holt: checkpoint store Sync (deletes) failed: {e}");
-                shared.bm.restore_pending_deletes(restore_applied());
-                return Err(e);
-            }
-            Err(_) => {
-                shared.bm.restore_pending_deletes(restore_applied());
-                return Err(Error::Internal(
-                    "checkpoint: I/O worker dropped Sync (deletes) completion",
-                ));
-            }
-        }
-    }
-
-    // 8. Truncate WAL atomically iff every snapshot landed AND no
-    //    racing writer has re-dirtied (under commit-gate check), AND
-    //    no deferred deletes are still queued. The pending-delete
-    //    gate is essential: a queued delete means a WAL record
-    //    "this blob is unlinked" hasn't yet propagated to the
-    //    manifest, so truncating would orphan the unlink.
-    if failed.is_empty() && pending_failed.is_empty() {
-        if let Some(journal) = &shared.journal {
-            let _commit = shared.commit_gate.enter_checkpoint();
-            if shared.bm.dirty_count() == 0 && shared.bm.pending_delete_count() == 0 {
-                journal.truncate()?;
-                shared.truncates.fetch_add(1, Ordering::Relaxed);
-            }
-        }
-    }
-
-    shared.rounds_succeeded.fetch_add(1, Ordering::Relaxed);
+    pipeline.push(PendingEpoch {
+        rx,
+        snap,
+        pending: pending_for_recovery,
+    });
 
     #[cfg(feature = "tracing")]
     {
         let elapsed = round_start.elapsed();
-        let truncated = failed.is_empty()
-            && pending_failed.is_empty()
-            && shared.journal.is_some()
-            && shared.bm.dirty_count() == 0
-            && shared.bm.pending_delete_count() == 0;
         tracing::info!(
             target: "holt::checkpoint",
             dirty_snapshot = snap_count,
-            blobs_flushed = snap_count - failed.len(),
-            blobs_failed = failed.len(),
-            blobs_deleted = applied_deletes,
             merged = merged,
-            truncated_wal = truncated,
+            in_flight = pipeline.in_flight.len(),
             elapsed_us = elapsed.as_micros() as u64,
-            "round complete",
+            "round submitted",
         );
     }
 
@@ -421,8 +323,8 @@ pub(super) fn run_round(shared: &Arc<Shared>) -> Result<()> {
 /// Candidate-driven merge pass — fold mergeable `BlobNode`
 /// children back into their parents. Stages the mutations via the
 /// unified `mark_dirty` + `mark_for_delete` protocol so the round's
-/// later phases (WAL flush → FlushBatchAndSync → pending
-/// deletes → re-Sync → truncate) handle persistence under W2D.
+/// later checkpoint epoch (WAL flush → data writes → store sync →
+/// pending deletes → re-Sync → truncate) handles persistence under W2D.
 /// Takes the exclusive maintenance gate around one parent at a
 /// time so no foreground writer is lock-coupling through the child
 /// edge being folded and queued for delete. Foreground spillovers
@@ -439,9 +341,9 @@ pub(super) fn run_round(shared: &Arc<Shared>) -> Result<()> {
 /// `bm.delete_blob` would mutate the manifest in-memory which a
 /// later `store.flush` could persist while the corresponding
 /// user WAL records still hadn't reached disk. Staging through
-/// dirty / pending-delete avoids both: the only flush path is
-/// the round's own `IoTask::FlushBatchAndSync`, which runs
-/// strictly after step 2's WAL flush.
+/// dirty / pending-delete avoids both: the only flush path is the
+/// round's checkpoint epoch, which runs strictly after step 2's
+/// WAL flush.
 fn run_merge_pass(shared: &Arc<Shared>) -> Result<u64> {
     use crate::store::STRUCTURAL_SEQ;
 
@@ -477,4 +379,29 @@ fn run_merge_pass(shared: &Arc<Shared>) -> Result<u64> {
     }
     shared.bm.note_merges(merged_total);
     Ok(merged_total)
+}
+
+fn finish_epoch(shared: &Arc<Shared>, report: CheckpointEpochReport) -> Result<()> {
+    use std::sync::atomic::Ordering;
+
+    shared
+        .blobs_flushed
+        .fetch_add(report.dirty_flushed as u64, Ordering::Relaxed);
+    let dirty_total = report.dirty_total;
+    let dirty_flushed = report.dirty_flushed;
+    let pending_total = report.pending_total;
+    let applied_deletes = report.applied_deletes;
+    if let Err(e) = report.result {
+        eprintln!(
+            "holt: checkpoint epoch failed (dirty={dirty_flushed}/{dirty_total}, pending deleted={applied_deletes}/{pending_total}): {e}",
+        );
+        return Err(e);
+    }
+    shared.rounds_succeeded.fetch_add(1, Ordering::Relaxed);
+    Ok(())
+}
+
+fn restore_unreported_epoch(shared: &Arc<Shared>, pending: PendingEpoch) {
+    shared.bm.restore_pending_deletes(pending.pending);
+    shared.bm.restore_dirty(pending.snap);
 }

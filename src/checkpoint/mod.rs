@@ -9,17 +9,17 @@
 //! │   park_timeout(idle_interval)                            │
 //! │     ├─ run_merge_pass                                    │
 //! │     ├─ snapshot_dirty + journal.flush                    │
-//! │     ├─ submit IoTask::FlushBatchAndSync for dirty blobs  │
-//! │     ├─ wait completion                                   │
-//! │     └─ journal.truncate iff dirty_count == 0             │
+//! │     ├─ submit one CheckpointEpoch                        │
+//! │     ├─ reap completed epochs in FIFO order               │
+//! │     └─ journal.truncate iff pipeline empty + clean BM     │
 //! └────────┬─────────────────────────────────────────────────┘
 //!          │ IoTask (bounded crossbeam channel)
 //!          ▼
 //! ┌──────────────────────────────────────────────────────────┐
 //! │ io_thread (I/O executor)                                 │
-//! │   recv IoTask -> store.write_blob / store.flush      │
+//! │   recv IoTask -> write batch / sync / pending deletes     │
 //! │                                                          │
-//! │   ── Unix:  pread/pwritev through FileBlobStore      │
+//! │   ── Unix:  pread/pwritev through FileBlobStore           │
 //! │   ── Linux: io_uring fixed-file/fixed-buffer fast path   │
 //! └──────────────────────────────────────────────────────────┘
 //!
@@ -47,9 +47,9 @@
 //!
 //! Three threads (rather than a single one) buy:
 //!
-//! 1. **Planner doesn't block on I/O** — once the queue has
-//!    capacity, the planner can prepare the next merge / snapshot
-//!    while previous tasks are still on the wire.
+//! 1. **Writers don't sit behind checkpoint I/O** — the planner
+//!    snapshots dirty state, flushes WAL, clones bytes, then releases
+//!    the commit gate while epoch I/O continues in the worker.
 //! 2. **io_uring fit** — the I/O thread is the natural home for
 //!    the SQE submit + CQE poll loop on the Linux fast path.
 //! 3. **Eviction is decoupled** — runs on its own cadence
@@ -362,7 +362,7 @@ impl Drop for Checkpointer {
         //    The planner is joined, writers are gone (last Tree
         //    clone is dropping). I/O thread is still alive
         //    serving the round's submissions.
-        if let Err(e) = round::run_round(&self.shared) {
+        if let Err(e) = round::run_round_sync(&self.shared) {
             eprintln!("holt: final checkpoint round during shutdown failed: {e}");
         }
 
@@ -384,26 +384,53 @@ impl Drop for Checkpointer {
 // ---------- checkpoint_thread main loop ----------
 
 fn checkpoint_main(shared: &Arc<Shared>) {
+    let mut pipeline = round::Pipeline::new(shared.cfg.io_queue_capacity);
     loop {
         if shared.checkpoint_stop.load(Ordering::Acquire) {
             break;
         }
-        thread::park_timeout(shared.cfg.idle_interval);
+        if let Err(e) = pipeline.reap_ready(shared) {
+            eprintln!("holt: checkpoint epoch failed: {e}");
+        }
+        let has_pressure = shared.bm.dirty_count() >= shared.cfg.dirty_blob_threshold.max(1)
+            || shared.bm.pending_delete_count() != 0;
+        if !has_pressure {
+            if !pipeline.is_empty() {
+                thread::park_timeout(shared.cfg.idle_interval.min(Duration::from_millis(1)));
+                continue;
+            }
+            thread::park_timeout(shared.cfg.idle_interval);
+        }
         if shared.checkpoint_stop.load(Ordering::Acquire) {
             break;
         }
-        if let Err(e) = round::run_round(shared) {
-            // Round failed; restored dirty entries (where
-            // applicable) are still in the map for the next try.
-            eprintln!("holt: checkpoint round failed: {e}");
+        loop {
+            if let Err(e) = round::run_round(shared, &mut pipeline) {
+                // Round failed; restored dirty entries (where
+                // applicable) are still in the map for the next try.
+                eprintln!("holt: checkpoint round failed: {e}");
+                break;
+            }
+            if !pipeline.has_room()
+                || shared.bm.dirty_count() < shared.cfg.dirty_blob_threshold.max(1)
+                || shared.checkpoint_stop.load(Ordering::Acquire)
+            {
+                break;
+            }
         }
+    }
+    if let Err(e) = pipeline.drain(shared) {
+        eprintln!("holt: checkpoint pipeline drain during shutdown failed: {e}");
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::blob_store::{BlobStore, MemoryBlobStore};
+    use crate::api::errors::Result;
+    use crate::layout::BlobGuid;
+    use crate::store::blob_store::{AlignedBlobBuf, BlobStore, MemoryBlobStore};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
     use std::time::Instant;
 
     fn make_bm() -> Arc<BufferManager> {
@@ -416,6 +443,66 @@ mod tests {
 
     fn commit_gate() -> Arc<CommitGate> {
         Arc::new(CommitGate::new())
+    }
+
+    struct BlockingBatchStore {
+        inner: MemoryBlobStore,
+        release: AtomicBool,
+        started: AtomicUsize,
+    }
+
+    impl BlockingBatchStore {
+        fn new() -> Self {
+            Self {
+                inner: MemoryBlobStore::new(),
+                release: AtomicBool::new(false),
+                started: AtomicUsize::new(0),
+            }
+        }
+
+        fn release(&self) {
+            self.release.store(true, AtomicOrdering::Release);
+        }
+
+        fn started(&self) -> usize {
+            self.started.load(AtomicOrdering::Acquire)
+        }
+    }
+
+    impl BlobStore for BlockingBatchStore {
+        fn read_blob(&self, guid: BlobGuid, dst: &mut AlignedBlobBuf) -> Result<()> {
+            self.inner.read_blob(guid, dst)
+        }
+
+        fn write_blob(&self, guid: BlobGuid, src: &AlignedBlobBuf) -> Result<()> {
+            self.inner.write_blob(guid, src)
+        }
+
+        fn write_blobs_with_data_sync(&self, writes: &[(BlobGuid, &AlignedBlobBuf)]) -> Result<()> {
+            if !writes.is_empty() {
+                self.started.fetch_add(1, AtomicOrdering::AcqRel);
+                while !self.release.load(AtomicOrdering::Acquire) {
+                    thread::sleep(Duration::from_millis(1));
+                }
+            }
+            self.inner.write_blobs_with_data_sync(writes)
+        }
+
+        fn delete_blob(&self, guid: BlobGuid) -> Result<()> {
+            self.inner.delete_blob(guid)
+        }
+
+        fn list_blobs(&self) -> Result<Vec<BlobGuid>> {
+            self.inner.list_blobs()
+        }
+
+        fn flush(&self) -> Result<()> {
+            self.inner.flush()
+        }
+
+        fn needs_flush(&self) -> bool {
+            self.inner.needs_flush()
+        }
     }
 
     /// Tests that don't construct a real Tree skip the merge pass —
@@ -515,6 +602,71 @@ mod tests {
             );
             thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    #[test]
+    fn planner_queues_second_epoch_while_first_io_is_blocked() {
+        let store = Arc::new(BlockingBatchStore::new());
+        let bm = Arc::new(BufferManager::new(store.clone(), 8));
+        let scratch = crate::store::blob_store::AlignedBlobBuf::zeroed();
+        bm.write_blob([0x21; 16], &scratch).unwrap();
+        bm.write_blob([0x22; 16], &scratch).unwrap();
+        let _pin1 = bm.pin([0x21; 16]).unwrap();
+        let _pin2 = bm.pin([0x22; 16]).unwrap();
+        bm.mark_dirty([0x21; 16], 1);
+
+        let mut cfg = no_merge_cfg();
+        cfg.idle_interval = Duration::from_millis(10);
+        cfg.dirty_blob_threshold = 1;
+        cfg.io_queue_capacity = 2;
+        let ck = Checkpointer::spawn(
+            Arc::clone(&bm),
+            None,
+            maintenance_gate(),
+            commit_gate(),
+            cfg,
+        )
+        .expect("spawn");
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while store.started() == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "first checkpoint epoch never entered store write"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        bm.mark_dirty([0x22; 16], 2);
+        ck.wake();
+
+        let mut queued_second = false;
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            if ck.rounds_attempted() >= 2 {
+                queued_second = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        store.release();
+        assert!(
+            queued_second,
+            "planner did not submit a second epoch while first I/O was blocked"
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if bm.dirty_count() == 0 && ck.blobs_flushed() >= 2 {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "queued checkpoint epochs did not drain"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        drop(ck);
     }
 
     #[test]
