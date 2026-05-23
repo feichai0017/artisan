@@ -1865,8 +1865,13 @@ impl Tree {
         let compact_guids = self
             .store
             .pop_compaction_candidates(ONLINE_COMPACT_BLOB_BUDGET);
+        let mut compacted_any = false;
         for guid in compact_guids {
-            self.compact_candidate_blob(guid)?;
+            compacted_any |= self.compact_candidate_blob(guid)?;
+        }
+
+        if compacted_any && self.store.merge_candidate_count() == 0 {
+            self.seed_maintenance_candidates()?;
         }
 
         let merge_guids = self.store.pop_merge_candidates(ONLINE_MERGE_PARENT_BUDGET);
@@ -1894,12 +1899,12 @@ impl Tree {
         Ok(())
     }
 
-    fn compact_candidate_blob(&self, guid: BlobGuid) -> Result<()> {
+    fn compact_candidate_blob(&self, guid: BlobGuid) -> Result<bool> {
         use crate::store::STRUCTURAL_SEQ;
 
         let _maintenance = self.maintenance_gate.enter_shared();
         if !self.store.has_blob(guid)? {
-            return Ok(());
+            return Ok(false);
         }
         let pin = self.store.pin(guid)?;
         let needs_compaction = {
@@ -1907,7 +1912,7 @@ impl Tree {
             engine::blob_needs_compaction(BlobFrameRef::wrap(guard.as_slice()))
         };
         if !needs_compaction {
-            return Ok(());
+            return Ok(false);
         }
 
         let _commit = self
@@ -1932,7 +1937,7 @@ impl Tree {
             self.store.mark_dirty(guid, STRUCTURAL_SEQ);
         }
         drop(pin);
-        Ok(())
+        Ok(compacted)
     }
 
     fn merge_candidate_parent(&self, guid: BlobGuid) -> Result<()> {
