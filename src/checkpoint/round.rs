@@ -74,10 +74,7 @@ impl Pipeline {
     }
 
     pub(super) fn reap_ready(&mut self, shared: &Arc<Shared>) -> Result<()> {
-        loop {
-            let Some(front) = self.in_flight.front() else {
-                break;
-            };
+        while let Some(front) = self.in_flight.front() {
             match front.rx.try_recv() {
                 Ok(report) => {
                     self.in_flight.pop_front().expect("front exists");
