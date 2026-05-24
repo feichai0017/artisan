@@ -59,8 +59,9 @@ pub struct RouteCacheStats {
     pub learns: u64,
     /// Cumulative capacity replacements after the route cache filled.
     pub evictions: u64,
-    /// Cumulative entries invalidated because the root blob version
-    /// changed under the cache.
+    /// Cumulative stale route probes caused by root-version
+    /// changes. Stale entries are refreshed by the next successful
+    /// learn or replaced by capacity pressure.
     pub invalidations: u64,
 }
 

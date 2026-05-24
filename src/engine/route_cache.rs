@@ -102,7 +102,7 @@ impl RouteCache {
     /// root blob version the caller is currently holding stable.
     #[must_use]
     pub(crate) fn lookup(&self, key: SearchKey<'_>, root_version: u64) -> Option<RouteHit> {
-        let mut stale_prefix = None;
+        let mut stale = false;
         {
             let entries = self.entries.read().unwrap();
 
@@ -121,31 +121,16 @@ impl RouteCache {
                                 child_depth: entry.child_depth,
                             });
                         }
-                        stale_prefix = Some(prefix.to_vec());
-                        break;
+                        stale = true;
                     }
                 }
             }
         }
-        if let Some(prefix) = stale_prefix {
-            self.remove_stale_prefix(&prefix, root_version);
+        if stale {
+            self.invalidations.fetch_add(1, Ordering::Relaxed);
         }
         self.misses.fetch_add(1, Ordering::Relaxed);
         None
-    }
-
-    fn remove_stale_prefix(&self, prefix: &[u8], root_version: u64) {
-        let mut entries = self.entries.write().unwrap();
-        let Some(entry) = entries.map.get(prefix) else {
-            return;
-        };
-        if entry.root_version == root_version {
-            return;
-        }
-        entries.map.remove(prefix);
-        entries.order.retain(|known| known.as_slice() != prefix);
-        rebuild_prefix_lengths(&mut entries);
-        self.invalidations.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Learn a root crossing just observed under a stable root read
@@ -304,7 +289,7 @@ mod tests {
             .unwrap();
         assert_eq!(hit.child_guid, [9; 16]);
         let stats = cache.stats();
-        assert_eq!(stats.entries, 1);
+        assert_eq!(stats.entries, 2);
         assert_eq!(stats.invalidations, 1);
     }
 
@@ -375,7 +360,7 @@ mod tests {
     }
 
     #[test]
-    fn stats_count_stale_route_invalidations() {
+    fn stats_count_stale_route_version_mismatches() {
         let cache = RouteCache::new();
         cache.learn(SearchKey::user(b"bucket-00/path/file"), 1, CHILD, 15);
         assert!(cache
@@ -383,7 +368,30 @@ mod tests {
             .is_none());
 
         let stats = cache.stats();
-        assert_eq!(stats.entries, 0);
+        assert_eq!(stats.entries, 1);
         assert_eq!(stats.invalidations, 1);
+    }
+
+    #[test]
+    fn stale_longer_route_does_not_mask_valid_shorter_route() {
+        let cache = RouteCache::new();
+        cache.learn(
+            SearchKey::user(b"bucket-00/path/deeper/file"),
+            1,
+            [1; 16],
+            21,
+        );
+        cache.learn(SearchKey::user(b"bucket-00/path/file"), 2, CHILD, 15);
+
+        let hit = cache
+            .lookup(SearchKey::user(b"bucket-00/path/deeper/other"), 2)
+            .unwrap();
+        assert_eq!(hit.child_guid, CHILD);
+        assert_eq!(hit.child_depth, 15);
+
+        let stats = cache.stats();
+        assert_eq!(stats.entries, 2);
+        assert_eq!(stats.hits, 1);
+        assert_eq!(stats.invalidations, 0);
     }
 }

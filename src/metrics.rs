@@ -348,7 +348,7 @@ pub fn render_prometheus(stats: &TreeStats) -> String {
     metric(
         &mut out,
         "holt_route_cache_invalidations_total",
-        "Cumulative root route-cache entries invalidated by root-version changes.",
+        "Cumulative root route-cache stale probes after root-version changes.",
         "counter",
         stats.route_cache.invalidations,
     );
