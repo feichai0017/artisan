@@ -1,0 +1,158 @@
+name: Nightly Validation
+
+on:
+  schedule:
+    # Keep durability validation out of the normal PR path while still
+    # exercising it regularly on main.
+    - cron: "17 18 * * *"
+  workflow_dispatch:
+    inputs:
+      soak_seconds:
+        description: "Duration for each soak phase"
+        required: false
+        default: "600"
+      fuzz_seconds:
+        description: "Duration for the libFuzzer campaign"
+        required: false
+        default: "180"
+      run_verus:
+        description: "Run the Verus model check"
+        required: false
+        type: boolean
+        default: false
+      verus_url:
+        description: "Optional .tar.gz or .zip archive URL containing a verus binary"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  SOAK_SECONDS: ${{ inputs.soak_seconds || '600' }}
+  FUZZ_SECONDS: ${{ inputs.fuzz_seconds || '180' }}
+
+jobs:
+  fault-matrix:
+    name: checkpoint and WAL fault matrix
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: checkpoint failpoints
+        run: cargo test --test checkpoint_failpoint --all-features --locked -- --nocapture
+
+      - name: WAL integration
+        run: cargo test --test wal_tree_integration --all-features --locked -- --nocapture
+
+  soak-normal:
+    name: normal soak
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: holt-soak normal
+        run: |
+          cargo run --manifest-path tools/soak/Cargo.toml --locked -- \
+            --mode normal \
+            --dir target/holt-soak-nightly \
+            --reset \
+            --duration-secs "$SOAK_SECONDS" \
+            --keys 1000000 \
+            --ops 2000000 \
+            --threads 8 \
+            --buffer-pool 128 \
+            --wal-sync false
+
+  soak-crash:
+    name: crash soak
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: holt-soak crash
+        run: |
+          cargo run --manifest-path tools/soak/Cargo.toml --locked -- \
+            --mode crash \
+            --dir target/holt-soak-crash-nightly \
+            --reset \
+            --duration-secs "$SOAK_SECONDS" \
+            --keys 100000 \
+            --ops 1000000 \
+            --buffer-pool 64 \
+            --wal-sync true \
+            --kill-min-ms 50 \
+            --kill-max-ms 2000
+
+  fuzz-long:
+    name: fuzz campaign
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: dtolnay/rust-toolchain@nightly
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: install cargo-fuzz
+        run: cargo +stable install cargo-fuzz --locked
+
+      - name: cargo fuzz run atomic_model
+        run: cargo +nightly fuzz run atomic_model -- -max_total_time="$FUZZ_SECONDS"
+
+  verified-model:
+    name: Verus model
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_verus }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Verus from URL
+        if: ${{ inputs.verus_url != '' }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/verus"
+          curl -L "${{ inputs.verus_url }}" -o "$RUNNER_TEMP/verus/archive"
+          if file "$RUNNER_TEMP/verus/archive" | grep -qi zip; then
+            unzip -q "$RUNNER_TEMP/verus/archive" -d "$RUNNER_TEMP/verus"
+          else
+            tar -xf "$RUNNER_TEMP/verus/archive" -C "$RUNNER_TEMP/verus"
+          fi
+          bin=$(find "$RUNNER_TEMP/verus" -type f -name verus -perm -111 | head -n1)
+          if [ -z "$bin" ]; then
+            echo "No executable verus binary found in archive"
+            exit 1
+          fi
+          echo "VERUS=$bin" >> "$GITHUB_ENV"
+
+      - name: Run Verus model
+        run: |
+          if [ -z "${VERUS:-}" ] && command -v verus >/dev/null 2>&1; then
+            VERUS=$(command -v verus)
+            export VERUS
+          fi
+          if [ -z "${VERUS:-}" ]; then
+            echo "Set verus_url or run this job on a runner with verus in PATH."
+            exit 1
+          fi
+          ./verified/verify.sh

@@ -310,6 +310,15 @@ checkpoint debt, dirty/pending-delete counts, and reopen WAL replay
 time. The caller owns the HTTP endpoint; Holt only renders the
 Prometheus text payload.
 
+The GitHub workflows are split by cost:
+
+- normal CI runs unit/integration/property tests, a bounded fuzz smoke,
+  coverage, and a short soak smoke;
+- nightly validation runs checkpoint/WAL fault tests, longer normal and
+  crash soak campaigns, and a time-bounded fuzz campaign;
+- Verus is available as a manual `Nightly Validation` option because
+  hosted runners do not ship a Verus binary.
+
 See [`examples/`](examples/) for full programs:
 [`basic_kv`](examples/basic_kv.rs),
 [`filesystem_meta`](examples/filesystem_meta.rs),

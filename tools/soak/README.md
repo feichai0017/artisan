@@ -51,3 +51,21 @@ cargo run --manifest-path tools/soak/Cargo.toml --locked -- \
 The tool emits JSON lines with cache, WAL, checkpoint, route-cache, and
 reopen-replay counters. CI runs only a short `normal` smoke; longer
 normal/crash campaigns belong in nightly or release-gate runs.
+
+## Validation Tiers
+
+- PR CI: build the harness and run a short `normal` smoke so API or
+  stats drift is caught quickly.
+- Nightly: run `normal`, `crash`, checkpoint failpoints, WAL integration,
+  and a longer fuzz campaign from `.github/workflows/nightly.yml`.
+- Release gate: run `normal` for several hours on the target platform,
+  then run `crash` with `wal_sync=true`; keep the JSON output so replay
+  time, cache misses, WAL debt, and checkpoint debt can be compared
+  across releases.
+
+The crash verifier intentionally checks only acknowledged operations.
+The child writes a key, Holt returns success, then the child appends that
+key to `soak-ack.log` and fsyncs the ack log. After `SIGKILL`, the parent
+reopens Holt and verifies every acknowledged key is present. Operations
+that died before the ack log fsync are not part of the durability
+contract.

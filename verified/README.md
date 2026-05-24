@@ -15,6 +15,11 @@ Run it with a local Verus binary:
 VERUS=/path/to/verus ./verified/verify.sh
 ```
 
+The normal CI path does not install Verus. To check this model in
+GitHub Actions, run the `Nightly Validation` workflow manually with
+`run_verus=true` and either provide `verus_url` or use a runner where
+`verus` is already in `PATH`.
+
 The current model covers:
 
 - ART inner-node capacity and live-child invariants;
