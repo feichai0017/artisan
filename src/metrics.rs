@@ -66,15 +66,32 @@
 //! | `holt_route_cache_invalidations_total`  | counter | `TreeStats::route_cache.invalidations` |
 //! | `holt_bm_route_resident_count`          | gauge   | `TreeStats::bm_route_resident_count`   |
 //! | `holt_bm_route_resident_demotions_total`| counter | `TreeStats::bm_route_resident_demotions` |
+//! | `holt_bm_cache_evictions_total`         | counter | `TreeStats::bm_cache_evictions`        |
+//! | `holt_bm_eviction_skips_protected_total`| counter | `TreeStats::bm_eviction_skips_protected` |
+//! | `holt_bm_eviction_skips_route_resident_total` | counter | `TreeStats::bm_eviction_skips_route_resident` |
+//! | `holt_bm_admission_protects_total`      | counter | `TreeStats::bm_admission_protects`     |
+//! | `holt_open_wal_replay_records_total`    | counter | `OpenStats::wal_replay_records`        |
+//! | `holt_open_wal_replay_bytes`            | gauge   | `OpenStats::wal_replay_bytes`          |
+//! | `holt_open_wal_replay_duration_seconds` | gauge   | `OpenStats::wal_replay_micros`         |
+//! | `holt_open_wal_torn_tail`               | gauge   | `OpenStats::wal_torn_tail`             |
 //! | `holt_journal_appends_total`             | counter | `JournalStats::appends`                |
 //! | `holt_journal_batches_total`             | counter | `JournalStats::batches`                |
 //! | `holt_journal_syncs_total`               | counter | `JournalStats::syncs`                  |
+//! | `holt_journal_wal_work`                  | gauge   | `JournalStats::wal_work`               |
+//! | `holt_journal_durable_work`              | gauge   | `JournalStats::durable_work`           |
+//! | `holt_journal_checkpointed_work`         | gauge   | `JournalStats::checkpointed_work`      |
+//! | `holt_journal_pending_work`              | gauge   | `JournalStats::pending_work`           |
+//! | `holt_journal_checkpoint_debt`           | gauge   | `JournalStats::checkpoint_debt`        |
 //! | `holt_checkpoint_rounds_attempted_total`| counter | `CheckpointerStats::rounds_attempted`  |
 //! | `holt_checkpoint_rounds_succeeded_total`| counter | `CheckpointerStats::rounds_succeeded`  |
+//! | `holt_checkpoint_rounds_failed_total`   | counter | `CheckpointerStats::rounds_failed`     |
 //! | `holt_checkpoint_blobs_flushed_total`   | counter | `CheckpointerStats::blobs_flushed`     |
 //! | `holt_checkpoint_merges_total`          | counter | `CheckpointerStats::merges_total`      |
 //! | `holt_checkpoint_truncates_total`       | counter | `CheckpointerStats::truncates`         |
 //! | `holt_checkpoint_evictions_total`       | counter | `CheckpointerStats::evictions`         |
+//! | `holt_checkpoint_last_dirty_count`      | gauge   | `CheckpointerStats::last_dirty_count`  |
+//! | `holt_checkpoint_last_pending_delete_count` | gauge | `CheckpointerStats::last_pending_delete_count` |
+//! | `holt_checkpoint_last_round_duration_seconds` | gauge | `CheckpointerStats::last_round_micros` |
 //!
 //! `JournalStats` and `CheckpointerStats` lines are emitted only
 //! when the corresponding worker exists. The journal worker exists
@@ -312,6 +329,34 @@ pub fn render_prometheus(stats: &TreeStats) -> String {
     );
     metric(
         &mut out,
+        "holt_bm_cache_evictions_total",
+        "Clean cache entries evicted by inline overflow or background sweep.",
+        "counter",
+        stats.bm_cache_evictions,
+    );
+    metric(
+        &mut out,
+        "holt_bm_eviction_skips_protected_total",
+        "Eviction candidates skipped because dirty or pending state protected them.",
+        "counter",
+        stats.bm_eviction_skips_protected,
+    );
+    metric(
+        &mut out,
+        "holt_bm_eviction_skips_route_resident_total",
+        "Eviction candidates skipped because they are route-resident anchors.",
+        "counter",
+        stats.bm_eviction_skips_route_resident,
+    );
+    metric(
+        &mut out,
+        "holt_bm_admission_protects_total",
+        "Cache overflows where TinyLFU protected a hotter resident victim.",
+        "counter",
+        stats.bm_admission_protects,
+    );
+    metric(
+        &mut out,
         "holt_route_cache_entries",
         "Number of root route-cache entries currently resident.",
         "gauge",
@@ -353,6 +398,35 @@ pub fn render_prometheus(stats: &TreeStats) -> String {
         stats.route_cache.invalidations,
     );
 
+    metric(
+        &mut out,
+        "holt_open_wal_replay_records_total",
+        "WAL records scanned during tree open.",
+        "counter",
+        stats.open.wal_replay_records,
+    );
+    metric(
+        &mut out,
+        "holt_open_wal_replay_bytes",
+        "Bytes scanned from the WAL during tree open.",
+        "gauge",
+        stats.open.wal_replay_bytes,
+    );
+    metric_f64(
+        &mut out,
+        "holt_open_wal_replay_duration_seconds",
+        "Wall-clock time spent replaying WAL during tree open.",
+        "gauge",
+        micros_to_seconds(stats.open.wal_replay_micros),
+    );
+    metric(
+        &mut out,
+        "holt_open_wal_torn_tail",
+        "1 if tree open stopped at a torn WAL tail; otherwise 0.",
+        "gauge",
+        u64::from(stats.open.wal_torn_tail),
+    );
+
     if let Some(journal) = &stats.journal {
         metric(
             &mut out,
@@ -375,6 +449,41 @@ pub fn render_prometheus(stats: &TreeStats) -> String {
             "counter",
             journal.syncs,
         );
+        metric(
+            &mut out,
+            "holt_journal_wal_work",
+            "Highest WAL work id published by append paths.",
+            "gauge",
+            journal.wal_work,
+        );
+        metric(
+            &mut out,
+            "holt_journal_durable_work",
+            "Highest WAL work id known durable.",
+            "gauge",
+            journal.durable_work,
+        );
+        metric(
+            &mut out,
+            "holt_journal_checkpointed_work",
+            "Highest WAL work id made redundant by checkpoint.",
+            "gauge",
+            journal.checkpointed_work,
+        );
+        metric(
+            &mut out,
+            "holt_journal_pending_work",
+            "WAL work accepted but not yet known durable.",
+            "gauge",
+            journal.pending_work,
+        );
+        metric(
+            &mut out,
+            "holt_journal_checkpoint_debt",
+            "WAL work not yet made redundant by checkpoint.",
+            "gauge",
+            journal.checkpoint_debt,
+        );
     }
 
     if let Some(ck) = &stats.checkpointer {
@@ -391,6 +500,13 @@ pub fn render_prometheus(stats: &TreeStats) -> String {
             "Background checkpoint rounds that completed without error.",
             "counter",
             ck.rounds_succeeded,
+        );
+        metric(
+            &mut out,
+            "holt_checkpoint_rounds_failed_total",
+            "Checkpoint rounds or submitted epochs that failed and were restored.",
+            "counter",
+            ck.rounds_failed,
         );
         metric(
             &mut out,
@@ -420,8 +536,34 @@ pub fn render_prometheus(stats: &TreeStats) -> String {
             "counter",
             ck.evictions,
         );
+        metric(
+            &mut out,
+            "holt_checkpoint_last_dirty_count",
+            "Dirty blobs observed by the most recent planner round.",
+            "gauge",
+            ck.last_dirty_count as u64,
+        );
+        metric(
+            &mut out,
+            "holt_checkpoint_last_pending_delete_count",
+            "Pending deletes observed by the most recent planner round.",
+            "gauge",
+            ck.last_pending_delete_count as u64,
+        );
+        metric_f64(
+            &mut out,
+            "holt_checkpoint_last_round_duration_seconds",
+            "Wall-clock time spent in the most recent planner round.",
+            "gauge",
+            micros_to_seconds(ck.last_round_micros),
+        );
     }
     out
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn micros_to_seconds(micros: u64) -> f64 {
+    micros as f64 / 1_000_000.0
 }
 
 #[inline]
@@ -442,7 +584,7 @@ fn metric_f64(out: &mut String, name: &str, help: &str, ty: &str, value: f64) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{CheckpointerStats, JournalStats, RouteCacheStats, TreeStats};
+    use crate::{CheckpointerStats, JournalStats, OpenStats, RouteCacheStats, TreeStats};
 
     fn stats_fixture(with_journal: bool, with_checkpointer: bool) -> TreeStats {
         TreeStats {
@@ -474,6 +616,10 @@ mod tests {
             bm_merges: 1,
             bm_route_resident_count: 3,
             bm_route_resident_demotions: 4,
+            bm_cache_evictions: 12,
+            bm_eviction_skips_protected: 13,
+            bm_eviction_skips_route_resident: 14,
+            bm_admission_protects: 15,
             route_cache: RouteCacheStats {
                 entries: 6,
                 hits: 70,
@@ -482,18 +628,33 @@ mod tests {
                 evictions: 2,
                 invalidations: 1,
             },
+            open: OpenStats {
+                wal_replay_records: 21,
+                wal_replay_bytes: 4096,
+                wal_replay_micros: 12_500,
+                wal_torn_tail: true,
+            },
             journal: with_journal.then_some(JournalStats {
                 appends: 20,
                 batches: 5,
                 syncs: 4,
+                wal_work: 30,
+                durable_work: 28,
+                checkpointed_work: 24,
+                pending_work: 2,
+                checkpoint_debt: 6,
             }),
             checkpointer: with_checkpointer.then_some(CheckpointerStats {
                 rounds_attempted: 11,
                 rounds_succeeded: 10,
+                rounds_failed: 1,
                 blobs_flushed: 30,
                 merges_total: 4,
                 truncates: 8,
                 evictions: 17,
+                last_dirty_count: 18,
+                last_pending_delete_count: 19,
+                last_round_micros: 20_000,
             }),
         }
     }
@@ -517,6 +678,14 @@ mod tests {
         assert!(out.contains("holt_route_cache_learns_total 9\n"));
         assert!(out.contains("holt_route_cache_evictions_total 2\n"));
         assert!(out.contains("holt_route_cache_invalidations_total 1\n"));
+        assert!(out.contains("holt_bm_cache_evictions_total 12\n"));
+        assert!(out.contains("holt_bm_eviction_skips_protected_total 13\n"));
+        assert!(out.contains("holt_bm_eviction_skips_route_resident_total 14\n"));
+        assert!(out.contains("holt_bm_admission_protects_total 15\n"));
+        assert!(out.contains("holt_open_wal_replay_records_total 21\n"));
+        assert!(out.contains("holt_open_wal_replay_bytes 4096\n"));
+        assert!(out.contains("holt_open_wal_replay_duration_seconds 0.012500\n"));
+        assert!(out.contains("holt_open_wal_torn_tail 1\n"));
         // ...non-monotonic gauges (sum-over-reachable-blobs) drop it.
         assert!(out.contains("# TYPE holt_slots gauge\n"));
         assert!(out.contains("holt_slots 42\n"));
@@ -547,14 +716,23 @@ mod tests {
         assert!(out.contains("holt_journal_appends_total 20\n"));
         assert!(out.contains("holt_journal_batches_total 5\n"));
         assert!(out.contains("holt_journal_syncs_total 4\n"));
+        assert!(out.contains("holt_journal_wal_work 30\n"));
+        assert!(out.contains("holt_journal_durable_work 28\n"));
+        assert!(out.contains("holt_journal_checkpointed_work 24\n"));
+        assert!(out.contains("holt_journal_pending_work 2\n"));
+        assert!(out.contains("holt_journal_checkpoint_debt 6\n"));
     }
 
     #[test]
     fn renders_checkpoint_block_when_present() {
         let out = render_prometheus(&stats_fixture(false, true));
         assert!(out.contains("holt_checkpoint_rounds_attempted_total 11\n"));
+        assert!(out.contains("holt_checkpoint_rounds_failed_total 1\n"));
         assert!(out.contains("holt_checkpoint_blobs_flushed_total 30\n"));
         assert!(out.contains("holt_checkpoint_evictions_total 17\n"));
+        assert!(out.contains("holt_checkpoint_last_dirty_count 18\n"));
+        assert!(out.contains("holt_checkpoint_last_pending_delete_count 19\n"));
+        assert!(out.contains("holt_checkpoint_last_round_duration_seconds 0.020000\n"));
     }
 
     #[test]

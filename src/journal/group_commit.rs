@@ -229,10 +229,18 @@ impl Journal {
     }
 
     pub(crate) fn stats(&self) -> JournalStats {
+        let wal_work = self.wal_work.load(Ordering::Acquire);
+        let durable_work = self.durable_work.load(Ordering::Acquire);
+        let checkpointed_work = self.checkpointed_work.load(Ordering::Acquire);
         JournalStats {
             appends: self.appends.load(Ordering::Relaxed),
             batches: self.batches.load(Ordering::Relaxed),
             syncs: self.syncs.load(Ordering::Relaxed),
+            wal_work,
+            durable_work,
+            checkpointed_work,
+            pending_work: wal_work.saturating_sub(durable_work),
+            checkpoint_debt: wal_work.saturating_sub(checkpointed_work),
         }
     }
 }
@@ -252,6 +260,11 @@ pub(crate) struct JournalStats {
     pub(crate) appends: u64,
     pub(crate) batches: u64,
     pub(crate) syncs: u64,
+    pub(crate) wal_work: u64,
+    pub(crate) durable_work: u64,
+    pub(crate) checkpointed_work: u64,
+    pub(crate) pending_work: u64,
+    pub(crate) checkpoint_debt: u64,
 }
 
 fn recv_control_ack(rx: AckRx, closed_msg: &'static str) -> Result<()> {

@@ -162,7 +162,9 @@ pub use engine::{
 };
 
 // Stats snapshots returned by `Tree::stats`.
-pub use api::stats::{BlobStats, CheckpointerStats, JournalStats, RouteCacheStats, TreeStats};
+pub use api::stats::{
+    BlobStats, CheckpointerStats, JournalStats, OpenStats, RouteCacheStats, TreeStats,
+};
 
 // Single-record atomic batches.
 pub use api::atomic::{AtomicBatch, Record, RecordVersion};

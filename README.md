@@ -275,6 +275,41 @@ Disk-truth advances at:
 tree.checkpoint()?;   // flush WAL + write through + truncate
 ```
 
+### Validation and observability
+
+Holt has four validation layers:
+
+- Unit and integration tests cover WAL replay, checkpoint recovery,
+  range/view semantics, conditional atomic batches, and checkpoint
+  failpoints.
+- Property tests compare random operation streams against an oracle.
+- `fuzz/` contains a `cargo-fuzz` target for the atomic/WAL/range
+  model.
+- `verified/` contains Verus specs for ART node shape, grow/shrink,
+  prefix split, delimiter rollup bounds, virtual terminators, and leaf
+  alignment.
+
+Long lifecycle campaigns live in the explicit soak tool:
+
+```sh
+cargo run --manifest-path tools/soak/Cargo.toml --locked -- \
+  --mode normal --dir target/holt-soak --reset \
+  --duration-secs 3600 --keys 10000000 --ops 10000000 \
+  --threads 8 --buffer-pool 256 --wal-sync false
+
+cargo run --manifest-path tools/soak/Cargo.toml --locked -- \
+  --mode crash --dir target/holt-soak-crash --reset \
+  --duration-secs 21600 --keys 100000 --ops 1000000 \
+  --buffer-pool 64 --wal-sync true \
+  --kill-min-ms 100 --kill-max-ms 5000
+```
+
+With the `metrics` feature, `holt::metrics::render_prometheus` exposes
+cache hit/miss, eviction/admission, route-cache, WAL work/debt,
+checkpoint debt, dirty/pending-delete counts, and reopen WAL replay
+time. The caller owns the HTTP endpoint; Holt only renders the
+Prometheus text payload.
+
 See [`examples/`](examples/) for full programs:
 [`basic_kv`](examples/basic_kv.rs),
 [`filesystem_meta`](examples/filesystem_meta.rs),

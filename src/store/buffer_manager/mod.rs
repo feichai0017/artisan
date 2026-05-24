@@ -234,6 +234,10 @@ pub struct BufferManager {
     spillover_count: AtomicU64,
     merge_count: AtomicU64,
     route_resident_demotions: AtomicU64,
+    cache_evictions: AtomicU64,
+    eviction_skips_protected: AtomicU64,
+    eviction_skips_route_resident: AtomicU64,
+    admission_protects: AtomicU64,
 }
 
 fn route_resident_budget(capacity: usize) -> usize {
@@ -287,6 +291,10 @@ impl BufferManager {
             spillover_count: AtomicU64::new(0),
             merge_count: AtomicU64::new(0),
             route_resident_demotions: AtomicU64::new(0),
+            cache_evictions: AtomicU64::new(0),
+            eviction_skips_protected: AtomicU64::new(0),
+            eviction_skips_route_resident: AtomicU64::new(0),
+            admission_protects: AtomicU64::new(0),
         }
     }
 
@@ -311,6 +319,22 @@ impl BufferManager {
 
     pub(crate) fn route_resident_demotions(&self) -> u64 {
         self.route_resident_demotions.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn cache_evictions(&self) -> u64 {
+        self.cache_evictions.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn eviction_skips_protected(&self) -> u64 {
+        self.eviction_skips_protected.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn eviction_skips_route_resident(&self) -> u64 {
+        self.eviction_skips_route_resident.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn admission_protects(&self) -> u64 {
+        self.admission_protects.load(Ordering::Relaxed)
     }
 
     pub(crate) fn mark_route_resident(&self, guid: BlobGuid) {
@@ -383,11 +407,15 @@ impl BufferManager {
     /// Returns `true` if an entry was actually evicted.
     pub(crate) fn try_evict_cold(&self, guid: BlobGuid) -> bool {
         if self.is_route_resident(guid) {
+            self.eviction_skips_route_resident
+                .fetch_add(1, Ordering::Relaxed);
             return false;
         }
         {
             let state = self.mutation_shard(guid).lock().unwrap();
             if state.is_protected_or_pending(&guid) {
+                self.eviction_skips_protected
+                    .fetch_add(1, Ordering::Relaxed);
                 return false;
             }
         }
@@ -395,18 +423,30 @@ impl BufferManager {
         // shard lock. `strong_count == 1` means only the shard's
         // slot holds the `Arc` (the snapshot's clone was dropped
         // by the caller; see `eviction::run_scan`).
-        self.cache
+        let removed = self
+            .cache
             .remove_if(&guid, |_, entry| {
                 if self.is_route_resident(guid) {
+                    self.eviction_skips_route_resident
+                        .fetch_add(1, Ordering::Relaxed);
                     return false;
                 }
                 if Arc::strong_count(entry) > 1 {
                     return false;
                 }
                 let state = self.mutation_shard(guid).lock().unwrap();
-                !state.is_protected_or_pending(&guid)
+                let removable = !state.is_protected_or_pending(&guid);
+                if !removable {
+                    self.eviction_skips_protected
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                removable
             })
-            .is_some()
+            .is_some();
+        if removed {
+            self.cache_evictions.fetch_add(1, Ordering::Relaxed);
+        }
+        removed
     }
 
     /// Current number of cached blobs.
@@ -709,7 +749,14 @@ impl BufferManager {
                 continue;
             }
             let guid = *kv.key();
-            if protected_snap.contains(&guid) || self.is_route_resident(guid) {
+            if protected_snap.contains(&guid) {
+                self.eviction_skips_protected
+                    .fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+            if self.is_route_resident(guid) {
+                self.eviction_skips_route_resident
+                    .fetch_add(1, Ordering::Relaxed);
                 continue;
             }
             let tick = kv.value().last_touched.load(Ordering::Relaxed);
@@ -733,6 +780,7 @@ impl BufferManager {
             (candidate, victim)
         {
             if victim_guid != candidate_guid && victim_freq > candidate_freq {
+                self.admission_protects.fetch_add(1, Ordering::Relaxed);
                 return false;
             }
         }
@@ -741,19 +789,30 @@ impl BufferManager {
             // under the shard lock — guards against a pin acquired
             // (or a fresh dirty / pending-delete mark) between our
             // scan and the remove.
-            return self
+            let removed = self
                 .cache
                 .remove_if(&guid, |_, e| {
                     if self.is_route_resident(guid) {
+                        self.eviction_skips_route_resident
+                            .fetch_add(1, Ordering::Relaxed);
                         return false;
                     }
                     if Arc::strong_count(e) > 1 {
                         return false;
                     }
                     let state = self.mutation_shard(guid).lock().unwrap();
-                    !state.is_protected_or_pending(&guid)
+                    let removable = !state.is_protected_or_pending(&guid);
+                    if !removable {
+                        self.eviction_skips_protected
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                    removable
                 })
                 .is_some();
+            if removed {
+                self.cache_evictions.fetch_add(1, Ordering::Relaxed);
+            }
+            return removed;
         }
         false
     }

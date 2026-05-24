@@ -17,6 +17,7 @@ use std::sync::{Arc, Mutex};
 
 use super::config::{Storage, TreeConfig};
 use super::errors::{Error, Result};
+use super::stats::OpenStats;
 use super::stats::{BlobStats, CheckpointerStats, JournalStats, RouteCacheStats, TreeStats};
 use super::view::View;
 use crate::concurrency::{CommitGate, MaintenanceGate};
@@ -159,6 +160,8 @@ pub struct Tree {
     /// shuts down on the **last** `Tree` clone's drop, not the
     /// first. Exposed to `Tree::stats` for counter readout.
     checkpointer: Option<Arc<crate::checkpoint::Checkpointer>>,
+    /// Reopen-time recovery telemetry captured once at open.
+    open_stats: OpenStats,
 }
 
 impl std::fmt::Debug for Tree {
@@ -300,12 +303,21 @@ impl Tree {
         // blob lags the WAL between the last `Tree::checkpoint`
         // and now, so the WAL is the source of truth for any op
         // committed via `memory_flush_on_write = true`.
+        let mut open_stats = OpenStats::default();
         let (journal, next_seq) = if attach_wal {
             match cfg.wal_path() {
                 None => (None, 1u64),
                 Some(path) => {
                     let next_seq = if path.exists() {
-                        replay_wal(&path, &bm, root_guid)?
+                        let start = std::time::Instant::now();
+                        let (next_seq, replay_stats) = replay_wal(&path, &bm, root_guid)?;
+                        open_stats.wal_replay_micros = start.elapsed().as_micros() as u64;
+                        open_stats.wal_replay_records = replay_stats.records_seen;
+                        open_stats.wal_torn_tail = replay_stats.torn_tail_at.is_some();
+                        if let Ok(meta) = std::fs::metadata(&path) {
+                            open_stats.wal_replay_bytes = meta.len();
+                        }
+                        next_seq
                     } else {
                         1
                     };
@@ -354,6 +366,7 @@ impl Tree {
             journal,
             prefix_list_cache: Arc::new(engine::PrefixListCache::new()),
             checkpointer,
+            open_stats,
         })
     }
 
@@ -1721,6 +1734,10 @@ impl Tree {
         let bm_merges = self.store.merge_count();
         let bm_route_resident_count = self.store.route_resident_count();
         let bm_route_resident_demotions = self.store.route_resident_demotions();
+        let bm_cache_evictions = self.store.cache_evictions();
+        let bm_eviction_skips_protected = self.store.eviction_skips_protected();
+        let bm_eviction_skips_route_resident = self.store.eviction_skips_route_resident();
+        let bm_admission_protects = self.store.admission_protects();
         let route = self.route_cache.stats();
         let route_cache = RouteCacheStats {
             entries: route.entries,
@@ -1736,15 +1753,24 @@ impl Tree {
                 appends: s.appends,
                 batches: s.batches,
                 syncs: s.syncs,
+                wal_work: s.wal_work,
+                durable_work: s.durable_work,
+                checkpointed_work: s.checkpointed_work,
+                pending_work: s.pending_work,
+                checkpoint_debt: s.checkpoint_debt,
             }
         });
         let checkpointer = self.checkpointer.as_ref().map(|ck| CheckpointerStats {
             rounds_attempted: ck.rounds_attempted(),
             rounds_succeeded: ck.rounds_succeeded(),
+            rounds_failed: ck.rounds_failed(),
             blobs_flushed: ck.blobs_flushed(),
             merges_total: ck.merges_total(),
             truncates: ck.truncates(),
             evictions: ck.evictions(),
+            last_dirty_count: ck.last_dirty_count(),
+            last_pending_delete_count: ck.last_pending_delete_count(),
+            last_round_micros: ck.last_round_micros(),
         });
         Ok(TreeStats {
             blob_count: aggregate.blobs.len() as u32,
@@ -1775,7 +1801,12 @@ impl Tree {
             bm_merges,
             bm_route_resident_count,
             bm_route_resident_demotions,
+            bm_cache_evictions,
+            bm_eviction_skips_protected,
+            bm_eviction_skips_route_resident,
+            bm_admission_protects,
             route_cache,
+            open: self.open_stats,
             journal,
             checkpointer,
         })
@@ -2053,7 +2084,11 @@ impl Tree {
 /// a `Tree::open` → `Tree::checkpoint` immediately after replay
 /// could find an empty dirty set, write nothing to store, then
 /// truncate the WAL — silently losing every replayed record.
-fn replay_wal(path: &std::path::Path, bm: &Arc<BufferManager>, root_guid: BlobGuid) -> Result<u64> {
+fn replay_wal(
+    path: &std::path::Path,
+    bm: &Arc<BufferManager>,
+    root_guid: BlobGuid,
+) -> Result<(u64, crate::journal::reader::ReplayStats)> {
     // Pin the root once for the entire replay loop; saves a
     // BM-Mutex per op (replays can be thousands of ops on a
     // dirty WAL).
@@ -2128,7 +2163,7 @@ fn replay_wal(path: &std::path::Path, bm: &Arc<BufferManager>, root_guid: BlobGu
     // After commit, the blob image is durable; we still want the
     // next allocated seq to be strictly greater than anything
     // ever seen in the log.
-    Ok(stats.highest_seq.unwrap_or(0) + 1)
+    Ok((stats.highest_seq.unwrap_or(0) + 1, stats))
 }
 
 #[cfg(test)]

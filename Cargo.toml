@@ -16,7 +16,7 @@ categories = ["database-implementations", "data-structures", "filesystem"]
 
 [workspace]
 members = [".", "crates/holt-ffi"]
-exclude = ["benches", "fuzz", "verified"]
+exclude = ["benches", "fuzz", "tools/soak", "verified"]
 
 [dependencies]
 # Bounded channels for the background checkpointer threads.

@@ -75,12 +75,47 @@ jobs:
       - name: cargo fmt --check
         run: cargo fmt --all --check
 
+      - name: cargo fmt --check (soak tool)
+        run: cargo fmt --manifest-path tools/soak/Cargo.toml --check
+
       # Clippy on tests + examples too, not just the library. The
       # crate opts into `clippy::pedantic` and has a vetted set of
       # `#![allow]`s in `src/lib.rs` for the unhelpful ones; any
       # new warning fails the build.
       - name: cargo clippy
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+
+      - name: cargo clippy (soak tool)
+        run: cargo clippy --manifest-path tools/soak/Cargo.toml --locked -- -D warnings
+
+  # --------------------------------------------------------------
+  # Soak smoke — keeps the long-running validation harness building
+  # and exercises the deterministic reopen verifier without turning
+  # normal CI into an hours-long durability campaign. Full normal /
+  # crash / fault campaigns stay manual or nightly.
+  # --------------------------------------------------------------
+  soak-smoke:
+    name: soak smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: holt-soak normal smoke
+        run: |
+          cargo run --manifest-path tools/soak/Cargo.toml --locked -- \
+            --mode normal \
+            --dir target/holt-soak-ci \
+            --reset \
+            --duration-secs 2 \
+            --keys 1000 \
+            --ops 4000 \
+            --threads 2 \
+            --buffer-pool 16 \
+            --wal-sync false
 
   # --------------------------------------------------------------
   # Fuzz smoke — short libFuzzer run over the storage-engine model

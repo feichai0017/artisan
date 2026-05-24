@@ -36,6 +36,7 @@
 use crossbeam_channel::{bounded, Receiver, TryRecvError};
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
+use std::time::Instant;
 
 use crate::api::errors::{Error, Result};
 use crate::engine;
@@ -84,6 +85,9 @@ impl Pipeline {
                 Err(TryRecvError::Disconnected) => {
                     let pending = self.in_flight.pop_front().expect("front exists");
                     restore_unreported_epoch(shared, pending);
+                    shared
+                        .rounds_failed
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     return Err(Error::Internal(
                         "checkpoint: I/O worker dropped epoch completion",
                     ));
@@ -121,6 +125,9 @@ impl Pipeline {
             finish_epoch(shared, report)
         } else {
             restore_unreported_epoch(shared, pending);
+            shared
+                .rounds_failed
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             Err(Error::Internal(
                 "checkpoint: I/O worker dropped epoch completion",
             ))
@@ -169,6 +176,7 @@ pub(super) fn run_round(shared: &Arc<Shared>, pipeline: &mut Pipeline) -> Result
     pipeline.wait_for_room(shared)?;
 
     shared.rounds_attempted.fetch_add(1, Ordering::Relaxed);
+    let round_start = Instant::now();
 
     // 0. Optional candidate-driven merge pass.
     let merged = if shared.cfg.auto_merge {
@@ -183,9 +191,6 @@ pub(super) fn run_round(shared: &Arc<Shared>, pipeline: &mut Pipeline) -> Result
         0
     };
     shared.merges_total.fetch_add(merged, Ordering::Relaxed);
-
-    #[cfg(feature = "tracing")]
-    let round_start = std::time::Instant::now();
 
     // 1+2. Snapshot dirty + pending-deletes + cloned bytes + WAL
     // watermark under the same commit-publish gate used by
@@ -218,6 +223,10 @@ pub(super) fn run_round(shared: &Arc<Shared>, pipeline: &mut Pipeline) -> Result
             let Some(bytes) = shared.bm.snapshot_bytes(*guid) else {
                 shared.bm.restore_pending_deletes(pending);
                 shared.bm.restore_dirty(snap.clone());
+                shared.rounds_failed.fetch_add(1, Ordering::Relaxed);
+                shared
+                    .last_round_micros
+                    .store(round_start.elapsed().as_micros() as u64, Ordering::Relaxed);
                 return Err(Error::Internal(
                     "checkpoint: dirty entry lost cache image — invariant I1 violated",
                 ));
@@ -233,6 +242,10 @@ pub(super) fn run_round(shared: &Arc<Shared>, pipeline: &mut Pipeline) -> Result
             let Some(bytes) = shared.bm.snapshot_bytes(*guid) else {
                 shared.bm.restore_pending_deletes(pending);
                 shared.bm.restore_dirty(snap.clone());
+                shared.rounds_failed.fetch_add(1, Ordering::Relaxed);
+                shared
+                    .last_round_micros
+                    .store(round_start.elapsed().as_micros() as u64, Ordering::Relaxed);
                 return Err(Error::Internal(
                     "checkpoint: dirty entry lost cache image — invariant I1 violated",
                 ));
@@ -251,11 +264,19 @@ pub(super) fn run_round(shared: &Arc<Shared>, pipeline: &mut Pipeline) -> Result
         if let Err(e) = journal.flush_up_to(up_to) {
             shared.bm.restore_pending_deletes(pending);
             shared.bm.restore_dirty(snap);
+            shared.rounds_failed.fetch_add(1, Ordering::Relaxed);
+            shared
+                .last_round_micros
+                .store(round_start.elapsed().as_micros() as u64, Ordering::Relaxed);
             return Err(e);
         }
     }
     let snap_count = snap.len();
+    let pending_count = pending.len();
     shared.last_dirty_count.store(snap_count, Ordering::Relaxed);
+    shared
+        .last_pending_delete_count
+        .store(pending_count, Ordering::Relaxed);
 
     // Early-skip only when nothing at all needs attention. A
     // pending deferred-delete from a previous round (e.g. one
@@ -272,6 +293,9 @@ pub(super) fn run_round(shared: &Arc<Shared>, pipeline: &mut Pipeline) -> Result
     if snap.is_empty() && merged == 0 && pending.is_empty() && !needs_store_flush {
         pipeline.maybe_truncate(shared)?;
         shared.rounds_succeeded.fetch_add(1, Ordering::Relaxed);
+        shared
+            .last_round_micros
+            .store(round_start.elapsed().as_micros() as u64, Ordering::Relaxed);
         #[cfg(feature = "tracing")]
         tracing::trace!(target: "holt::checkpoint", "round skipped — nothing dirty");
         return Ok(());
@@ -300,6 +324,10 @@ pub(super) fn run_round(shared: &Arc<Shared>, pipeline: &mut Pipeline) -> Result
     {
         shared.bm.restore_pending_deletes(pending_for_recovery);
         shared.bm.restore_dirty(snap);
+        shared.rounds_failed.fetch_add(1, Ordering::Relaxed);
+        shared
+            .last_round_micros
+            .store(round_start.elapsed().as_micros() as u64, Ordering::Relaxed);
         return Err(Error::Internal(
             "checkpoint: I/O worker channel closed mid-round",
         ));
@@ -323,6 +351,9 @@ pub(super) fn run_round(shared: &Arc<Shared>, pipeline: &mut Pipeline) -> Result
         );
     }
 
+    shared
+        .last_round_micros
+        .store(round_start.elapsed().as_micros() as u64, Ordering::Relaxed);
     Ok(())
 }
 
@@ -398,6 +429,7 @@ fn finish_epoch(shared: &Arc<Shared>, report: CheckpointEpochReport) -> Result<(
     let pending_total = report.pending_total;
     let applied_deletes = report.applied_deletes;
     if let Err(e) = report.result {
+        shared.rounds_failed.fetch_add(1, Ordering::Relaxed);
         eprintln!(
             "holt: checkpoint epoch failed (dirty={dirty_flushed}/{dirty_total}, pending deleted={applied_deletes}/{pending_total}): {e}",
         );

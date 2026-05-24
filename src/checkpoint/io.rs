@@ -346,11 +346,14 @@ mod tests {
             eviction_stop: AtomicBool::new(false),
             rounds_attempted: AtomicU64::new(0),
             rounds_succeeded: AtomicU64::new(0),
+            rounds_failed: AtomicU64::new(0),
             blobs_flushed: AtomicU64::new(0),
             merges_total: AtomicU64::new(0),
             truncates: AtomicU64::new(0),
             evictions: AtomicU64::new(0),
             last_dirty_count: AtomicUsize::new(0),
+            last_pending_delete_count: AtomicUsize::new(0),
+            last_round_micros: AtomicU64::new(0),
         })
     }
 

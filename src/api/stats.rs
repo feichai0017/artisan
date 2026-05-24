@@ -163,8 +163,22 @@ pub struct TreeStats {
     /// its memory budget filled. This is a tier demotion counter,
     /// not a cache eviction counter.
     pub bm_route_resident_demotions: u64,
+    /// Clean cache entries evicted by inline overflow or the
+    /// background eviction sweep.
+    pub bm_cache_evictions: u64,
+    /// Eviction candidates skipped because dirty / flushing /
+    /// pending-delete bookkeeping protected them.
+    pub bm_eviction_skips_protected: u64,
+    /// Eviction candidates skipped because they are route-resident
+    /// anchor blobs.
+    pub bm_eviction_skips_route_resident: u64,
+    /// Cache overflows where TinyLFU kept a hotter resident victim
+    /// instead of evicting it for a one-hit point-miss candidate.
+    pub bm_admission_protects: u64,
     /// Root route-cache counters for large path-shaped trees.
     pub route_cache: RouteCacheStats,
+    /// WAL replay telemetry captured during `Tree::open`.
+    pub open: OpenStats,
     /// WAL/journal worker counters, or `None` for memory trees and
     /// caller-supplied stores opened without holt's WAL.
     pub journal: Option<JournalStats>,
@@ -242,6 +256,32 @@ pub struct JournalStats {
     /// Number of `sync_data` calls issued by WAL flush paths,
     /// including explicit checkpoint barriers.
     pub syncs: u64,
+    /// Highest WAL work id published by append paths.
+    pub wal_work: u64,
+    /// Highest WAL work id known to have passed the WAL durability
+    /// boundary.
+    pub durable_work: u64,
+    /// Highest WAL work id made redundant by a completed checkpoint
+    /// truncate.
+    pub checkpointed_work: u64,
+    /// WAL work accepted by foreground writers but not yet known
+    /// durable.
+    pub pending_work: u64,
+    /// WAL work not yet made redundant by checkpoint.
+    pub checkpoint_debt: u64,
+}
+
+/// Reopen-time recovery telemetry captured while opening a tree.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct OpenStats {
+    /// WAL records scanned during reopen.
+    pub wal_replay_records: u64,
+    /// Bytes scanned from the WAL during reopen.
+    pub wal_replay_bytes: u64,
+    /// Wall-clock time spent replaying the WAL, in microseconds.
+    pub wal_replay_micros: u64,
+    /// Non-zero iff reopen stopped at a torn WAL tail.
+    pub wal_torn_tail: bool,
 }
 
 /// Snapshot of the background checkpointer's accumulated
@@ -258,6 +298,9 @@ pub struct CheckpointerStats {
     /// round can still have done no flush work — see
     /// [`Self::blobs_flushed`] for actual durability progress.
     pub rounds_succeeded: u64,
+    /// Rounds or submitted epochs that failed and restored their
+    /// dirty / pending-delete state for retry.
+    pub rounds_failed: u64,
     /// Cumulative number of blob commits the I/O thread has
     /// processed across all rounds.
     pub blobs_flushed: u64,
@@ -271,4 +314,12 @@ pub struct CheckpointerStats {
     /// Cache entries the eviction thread has dropped because
     /// they were cold + non-dirty + held only by the cache.
     pub evictions: u64,
+    /// Dirty blobs observed by the most recent planner round.
+    pub last_dirty_count: usize,
+    /// Pending deletes observed by the most recent planner round.
+    pub last_pending_delete_count: usize,
+    /// Wall-clock time spent in the most recent planner round, in
+    /// microseconds. I/O completion may happen later in the I/O
+    /// thread.
+    pub last_round_micros: u64,
 }

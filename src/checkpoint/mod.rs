@@ -196,11 +196,14 @@ pub(super) struct Shared {
     // accessors.
     pub(super) rounds_attempted: AtomicU64,
     pub(super) rounds_succeeded: AtomicU64,
+    pub(super) rounds_failed: AtomicU64,
     pub(super) blobs_flushed: AtomicU64,
     pub(super) merges_total: AtomicU64,
     pub(super) truncates: AtomicU64,
     pub(super) evictions: AtomicU64,
     pub(super) last_dirty_count: AtomicUsize,
+    pub(super) last_pending_delete_count: AtomicUsize,
+    pub(super) last_round_micros: AtomicU64,
 }
 
 // ---------- handle ----------
@@ -242,11 +245,14 @@ impl Checkpointer {
             eviction_stop: AtomicBool::new(false),
             rounds_attempted: AtomicU64::new(0),
             rounds_succeeded: AtomicU64::new(0),
+            rounds_failed: AtomicU64::new(0),
             blobs_flushed: AtomicU64::new(0),
             merges_total: AtomicU64::new(0),
             truncates: AtomicU64::new(0),
             evictions: AtomicU64::new(0),
             last_dirty_count: AtomicUsize::new(0),
+            last_pending_delete_count: AtomicUsize::new(0),
+            last_round_micros: AtomicU64::new(0),
         });
 
         let io_handle = {
@@ -305,6 +311,12 @@ impl Checkpointer {
         self.shared.rounds_succeeded.load(Ordering::Relaxed)
     }
 
+    /// Number of failed rounds or failed submitted epochs.
+    #[must_use]
+    pub(crate) fn rounds_failed(&self) -> u64 {
+        self.shared.rounds_failed.load(Ordering::Relaxed)
+    }
+
     /// Total blobs flushed across all rounds.
     #[must_use]
     pub(crate) fn blobs_flushed(&self) -> u64 {
@@ -327,6 +339,26 @@ impl Checkpointer {
     #[must_use]
     pub(crate) fn evictions(&self) -> u64 {
         self.shared.evictions.load(Ordering::Relaxed)
+    }
+
+    /// Dirty blobs observed by the most recent planner round.
+    #[must_use]
+    pub(crate) fn last_dirty_count(&self) -> usize {
+        self.shared.last_dirty_count.load(Ordering::Relaxed)
+    }
+
+    /// Pending deletes observed by the most recent planner round.
+    #[must_use]
+    pub(crate) fn last_pending_delete_count(&self) -> usize {
+        self.shared
+            .last_pending_delete_count
+            .load(Ordering::Relaxed)
+    }
+
+    /// Wall-clock time spent in the most recent planner round.
+    #[must_use]
+    pub(crate) fn last_round_micros(&self) -> u64 {
+        self.shared.last_round_micros.load(Ordering::Relaxed)
     }
 }
 

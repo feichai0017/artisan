@@ -1,0 +1,482 @@
+use std::env;
+use std::fs::{self, OpenOptions};
+use std::io::{BufRead, BufReader, Write};
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::thread;
+use std::time::{Duration, Instant};
+
+use holt::{CheckpointConfig, KeyRangeEntryRef, Tree, TreeConfig};
+
+type DynError = Box<dyn std::error::Error + Send + Sync + 'static>;
+type Result<T> = std::result::Result<T, DynError>;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Mode {
+    Normal,
+    Crash,
+    Child,
+}
+
+#[derive(Debug)]
+struct Config {
+    mode: Mode,
+    dir: PathBuf,
+    duration: Duration,
+    keys: usize,
+    ops: usize,
+    threads: usize,
+    buffer_pool: usize,
+    wal_sync: bool,
+    reset: bool,
+    seed: u64,
+    kill_min: Duration,
+    kill_max: Duration,
+}
+
+impl Config {
+    fn parse() -> Result<Self> {
+        let mut cfg = Self {
+            mode: Mode::Normal,
+            dir: PathBuf::from("target/holt-soak"),
+            duration: Duration::from_secs(60),
+            keys: 100_000,
+            ops: 1_000_000,
+            threads: 4,
+            buffer_pool: 256,
+            wal_sync: false,
+            reset: false,
+            seed: 0xD15E_A5ED_500A_0001,
+            kill_min: Duration::from_millis(100),
+            kill_max: Duration::from_millis(2_000),
+        };
+
+        let mut args = env::args().skip(1);
+        while let Some(arg) = args.next() {
+            match arg.as_str() {
+                "--mode" => {
+                    cfg.mode = match take(&mut args, "--mode")?.as_str() {
+                        "normal" => Mode::Normal,
+                        "crash" => Mode::Crash,
+                        "child" | "crash-child" => Mode::Child,
+                        other => return Err(format!("unknown --mode `{other}`").into()),
+                    };
+                }
+                "--dir" => cfg.dir = PathBuf::from(take(&mut args, "--dir")?),
+                "--duration-secs" => {
+                    cfg.duration =
+                        Duration::from_secs(parse_u64(&take(&mut args, "--duration-secs")?)?)
+                }
+                "--keys" => cfg.keys = parse_usize(&take(&mut args, "--keys")?)?,
+                "--ops" => cfg.ops = parse_usize(&take(&mut args, "--ops")?)?,
+                "--threads" => cfg.threads = parse_usize(&take(&mut args, "--threads")?)?.max(1),
+                "--buffer-pool" => {
+                    cfg.buffer_pool = parse_usize(&take(&mut args, "--buffer-pool")?)?.max(1)
+                }
+                "--wal-sync" => cfg.wal_sync = parse_bool(&take(&mut args, "--wal-sync")?)?,
+                "--reset" => cfg.reset = true,
+                "--seed" => cfg.seed = parse_u64(&take(&mut args, "--seed")?)?,
+                "--kill-min-ms" => {
+                    cfg.kill_min =
+                        Duration::from_millis(parse_u64(&take(&mut args, "--kill-min-ms")?)?)
+                }
+                "--kill-max-ms" => {
+                    cfg.kill_max =
+                        Duration::from_millis(parse_u64(&take(&mut args, "--kill-max-ms")?)?)
+                }
+                "-h" | "--help" => {
+                    print_help();
+                    std::process::exit(0);
+                }
+                other => return Err(format!("unknown argument `{other}`").into()),
+            }
+        }
+        if cfg.keys == 0 {
+            return Err("--keys must be greater than zero".into());
+        }
+        if cfg.kill_max < cfg.kill_min {
+            return Err("--kill-max-ms must be >= --kill-min-ms".into());
+        }
+        Ok(cfg)
+    }
+}
+
+fn main() {
+    if let Err(e) = run() {
+        eprintln!("holt-soak: {e}");
+        std::process::exit(1);
+    }
+}
+
+fn run() -> Result<()> {
+    let cfg = Config::parse()?;
+    match cfg.mode {
+        Mode::Normal => run_normal(&cfg),
+        Mode::Crash => run_crash_parent(&cfg),
+        Mode::Child => run_crash_child(&cfg),
+    }
+}
+
+fn run_normal(cfg: &Config) -> Result<()> {
+    prepare_dir(cfg)?;
+    let tree = Arc::new(open_tree(cfg)?);
+    let oracle = Arc::new((0..cfg.keys).map(|_| AtomicU64::new(0)).collect::<Vec<_>>());
+    let deadline = Instant::now() + cfg.duration;
+    let ops_per_thread = cfg.ops.div_ceil(cfg.threads);
+    let mut handles = Vec::with_capacity(cfg.threads);
+
+    for tid in 0..cfg.threads {
+        let tree = Arc::clone(&tree);
+        let oracle = Arc::clone(&oracle);
+        let cfg = cfg.clone_for_thread();
+        handles.push(thread::spawn(move || -> Result<u64> {
+            let mut rng = Rng::new(cfg.seed ^ ((tid as u64) << 32) ^ 0x9E37_79B9_7F4A_7C15);
+            let mut done = 0u64;
+            while done < ops_per_thread as u64 && Instant::now() < deadline {
+                let idx = partitioned_index(&mut rng, cfg.keys, cfg.threads, tid);
+                let roll = rng.next_u64() % 100;
+                if roll < 50 {
+                    let rev = make_revision(tid, done);
+                    tree.put(&key(idx), &value(idx, rev))?;
+                    oracle[idx].store(rev, Ordering::Release);
+                } else if roll < 75 {
+                    verify_one(&tree, &oracle, idx)?;
+                } else if roll < 85 {
+                    tree.delete(&key(idx))?;
+                    oracle[idx].store(0, Ordering::Release);
+                } else if roll < 95 {
+                    scan_small_prefix(&tree, idx)?;
+                } else {
+                    let rev = make_revision(tid, done);
+                    let k = key(idx);
+                    let v = value(idx, rev);
+                    tree.atomic(|batch| batch.put(&k, &v))?;
+                    oracle[idx].store(rev, Ordering::Release);
+                }
+                done += 1;
+            }
+            Ok(done)
+        }));
+    }
+
+    let mut total_ops = 0u64;
+    for handle in handles {
+        total_ops += handle.join().map_err(|_| "worker thread panicked")??;
+    }
+    tree.checkpoint()?;
+    print_stats("normal-pre-reopen", &tree, total_ops)?;
+    drop(tree);
+
+    let reopened = open_tree(cfg)?;
+    verify_oracle(&reopened, &oracle)?;
+    print_stats("normal-post-reopen", &reopened, total_ops)?;
+    Ok(())
+}
+
+fn run_crash_parent(cfg: &Config) -> Result<()> {
+    if !cfg.wal_sync {
+        return Err("crash mode requires --wal-sync true so acked ops are durable".into());
+    }
+    prepare_dir(cfg)?;
+    let ack_path = ack_log_path(&cfg.dir);
+    let deadline = Instant::now() + cfg.duration;
+    let exe = env::current_exe()?;
+    let mut rng = Rng::new(cfg.seed ^ 0xC0FF_EE00_5150_0001);
+    let mut rounds = 0u64;
+
+    while Instant::now() < deadline {
+        let mut child = Command::new(&exe)
+            .arg("--mode")
+            .arg("child")
+            .arg("--dir")
+            .arg(&cfg.dir)
+            .arg("--keys")
+            .arg(cfg.keys.to_string())
+            .arg("--ops")
+            .arg(cfg.ops.to_string())
+            .arg("--buffer-pool")
+            .arg(cfg.buffer_pool.to_string())
+            .arg("--wal-sync")
+            .arg("true")
+            .arg("--seed")
+            .arg((cfg.seed ^ rounds).to_string())
+            .spawn()?;
+        let sleep_for = random_duration(&mut rng, cfg.kill_min, cfg.kill_max);
+        thread::sleep(sleep_for);
+        let _ = child.kill();
+        let _ = child.wait();
+        rounds += 1;
+
+        let expected = load_ack_log(&ack_path)?;
+        let tree = open_tree(cfg)?;
+        verify_ack_entries(&tree, &expected)?;
+        print_stats("crash-reopen", &tree, rounds)?;
+    }
+    Ok(())
+}
+
+fn run_crash_child(cfg: &Config) -> Result<()> {
+    fs::create_dir_all(&cfg.dir)?;
+    let tree = open_tree(cfg)?;
+    let mut ack = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(ack_log_path(&cfg.dir))?;
+    let deadline = Instant::now() + cfg.duration;
+    let mut rng = Rng::new(cfg.seed);
+    let mut done = 0u64;
+
+    while done < cfg.ops as u64 && Instant::now() < deadline {
+        let rev = rng.next_u64().max(1);
+        let key = format!("crash/{:016x}/{done:016x}", cfg.seed);
+        tree.put(key.as_bytes(), &crash_value(rev))?;
+        writeln!(ack, "P {key} {rev}")?;
+        ack.sync_data()?;
+        done += 1;
+    }
+    Ok(())
+}
+
+fn open_tree(cfg: &Config) -> holt::Result<Tree> {
+    let mut tree_cfg = TreeConfig::new(&cfg.dir);
+    tree_cfg.buffer_pool_size = cfg.buffer_pool;
+    tree_cfg.wal_sync = cfg.wal_sync;
+    tree_cfg.checkpoint = CheckpointConfig::default();
+    Tree::open(tree_cfg)
+}
+
+fn prepare_dir(cfg: &Config) -> Result<()> {
+    if cfg.reset && cfg.dir.exists() {
+        let name = cfg
+            .dir
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or_default();
+        if !name.contains("holt-soak") {
+            return Err(format!(
+                "refusing --reset on `{}`; path basename must contain `holt-soak`",
+                cfg.dir.display()
+            )
+            .into());
+        }
+        fs::remove_dir_all(&cfg.dir)?;
+    }
+    fs::create_dir_all(&cfg.dir)?;
+    Ok(())
+}
+
+fn verify_one(tree: &Tree, oracle: &[AtomicU64], idx: usize) -> Result<()> {
+    let expected = oracle[idx].load(Ordering::Acquire);
+    let got = tree.get(&key(idx))?;
+    if expected == 0 {
+        if got.is_some() {
+            return Err(format!("key {idx} exists but oracle says deleted").into());
+        }
+    } else if got.as_deref() != Some(value(idx, expected).as_slice()) {
+        return Err(format!("key {idx} value mismatch").into());
+    }
+    Ok(())
+}
+
+fn verify_oracle(tree: &Tree, oracle: &[AtomicU64]) -> Result<()> {
+    for idx in 0..oracle.len() {
+        verify_one(tree, oracle, idx)?;
+    }
+    Ok(())
+}
+
+fn verify_ack_entries(tree: &Tree, expected: &[(Vec<u8>, u64)]) -> Result<()> {
+    for (key, rev) in expected {
+        let got = tree.get(key)?;
+        if got.as_deref() != Some(crash_value(*rev).as_slice()) {
+            return Err(format!(
+                "acknowledged crash key `{}` lost revision {rev}",
+                String::from_utf8_lossy(key)
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
+fn scan_small_prefix(tree: &Tree, idx: usize) -> Result<()> {
+    let prefix = format!("bucket-{:03}/", idx % 256);
+    let mut seen = 0usize;
+    tree.scan_keys(prefix.as_bytes())
+        .delimiter(b'/')
+        .visit(16, |entry| {
+            match entry {
+                KeyRangeEntryRef::Key { .. } | KeyRangeEntryRef::CommonPrefix(_) => {
+                    seen += 1;
+                }
+                _ => {}
+            }
+            Ok(())
+        })?;
+    std::hint::black_box(seen);
+    Ok(())
+}
+
+fn load_ack_log(path: &Path) -> Result<Vec<(Vec<u8>, u64)>> {
+    let mut expected = Vec::new();
+    let Ok(file) = OpenOptions::new().read(true).open(path) else {
+        return Ok(expected);
+    };
+    for line in BufReader::new(file).lines() {
+        let line = line?;
+        let mut fields = line.split_whitespace();
+        match (fields.next(), fields.next(), fields.next(), fields.next()) {
+            (Some("P"), Some(key), Some(rev), None) => {
+                let rev = parse_u64(rev)?;
+                expected.push((key.as_bytes().to_vec(), rev));
+            }
+            _ => {
+                break;
+            }
+        }
+    }
+    Ok(expected)
+}
+
+fn print_stats(label: &str, tree: &Tree, progress: u64) -> Result<()> {
+    let s = tree.stats()?;
+    let journal_debt = s.journal.map_or(0, |j| j.checkpoint_debt);
+    let pending_work = s.journal.map_or(0, |j| j.pending_work);
+    let ck_failed = s.checkpointer.map_or(0, |c| c.rounds_failed);
+    println!(
+        "{{\"event\":\"stats\",\"label\":\"{label}\",\"progress\":{progress},\
+         \"blobs\":{},\"dirty\":{},\"pending_delete\":{},\"bm_hits\":{},\
+         \"bm_misses\":{},\"route_hits\":{},\"route_misses\":{},\
+         \"wal_pending_work\":{pending_work},\"wal_checkpoint_debt\":{journal_debt},\
+         \"checkpoint_failed\":{ck_failed},\"replay_records\":{},\
+         \"replay_micros\":{}}}",
+        s.blob_count,
+        s.bm_dirty_count,
+        s.bm_pending_delete_count,
+        s.bm_cache_hits,
+        s.bm_cache_misses,
+        s.route_cache.hits,
+        s.route_cache.misses,
+        s.open.wal_replay_records,
+        s.open.wal_replay_micros,
+    );
+    Ok(())
+}
+
+fn partitioned_index(rng: &mut Rng, keys: usize, threads: usize, tid: usize) -> usize {
+    let slots = keys.div_ceil(threads);
+    loop {
+        let idx = tid + threads * ((rng.next_u64() as usize) % slots);
+        if idx < keys {
+            return idx;
+        }
+    }
+}
+
+fn key(idx: usize) -> Vec<u8> {
+    format!(
+        "bucket-{bucket:03}/tenant-{tenant:02}/path/object-{idx:010}.bin",
+        bucket = idx % 256,
+        tenant = idx % 32,
+    )
+    .into_bytes()
+}
+
+fn value(idx: usize, rev: u64) -> Vec<u8> {
+    format!("{{\"idx\":{idx},\"rev\":{rev},\"size\":{}}}", idx * 4096).into_bytes()
+}
+
+fn crash_value(rev: u64) -> Vec<u8> {
+    format!("crash-value:{rev}").into_bytes()
+}
+
+fn make_revision(tid: usize, op: u64) -> u64 {
+    ((tid as u64) << 48) | (op + 1)
+}
+
+fn ack_log_path(dir: &Path) -> PathBuf {
+    dir.join("soak-ack.log")
+}
+
+fn random_duration(rng: &mut Rng, min: Duration, max: Duration) -> Duration {
+    let min_ms = min.as_millis() as u64;
+    let max_ms = max.as_millis() as u64;
+    let span = max_ms.saturating_sub(min_ms).saturating_add(1);
+    Duration::from_millis(min_ms + (rng.next_u64() % span))
+}
+
+fn take(args: &mut impl Iterator<Item = String>, name: &str) -> Result<String> {
+    args.next()
+        .ok_or_else(|| format!("{name} requires a value").into())
+}
+
+fn parse_bool(s: &str) -> Result<bool> {
+    match s {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" => Ok(false),
+        other => Err(format!("invalid bool `{other}`").into()),
+    }
+}
+
+fn parse_u64(s: &str) -> Result<u64> {
+    s.parse::<u64>()
+        .map_err(|e| format!("invalid integer `{s}`: {e}").into())
+}
+
+fn parse_usize(s: &str) -> Result<usize> {
+    s.parse::<usize>()
+        .map_err(|e| format!("invalid integer `{s}`: {e}").into())
+}
+
+fn print_help() {
+    println!(
+        "holt-soak\n\n\
+         Modes:\n\
+           --mode normal    multi-thread read/write/list/reopen validation\n\
+           --mode crash     parent process repeatedly SIGKILLs child writers\n\
+           --mode child     internal crash-test child mode\n\n\
+         Common options:\n\
+           --dir PATH --duration-secs N --keys N --ops N --threads N\n\
+           --buffer-pool N --wal-sync true|false --reset --seed N\n\n\
+         Crash options:\n\
+           --kill-min-ms N --kill-max-ms N\n"
+    );
+}
+
+impl Config {
+    fn clone_for_thread(&self) -> Self {
+        Self {
+            mode: self.mode,
+            dir: self.dir.clone(),
+            duration: self.duration,
+            keys: self.keys,
+            ops: self.ops,
+            threads: self.threads,
+            buffer_pool: self.buffer_pool,
+            wal_sync: self.wal_sync,
+            reset: false,
+            seed: self.seed,
+            kill_min: self.kill_min,
+            kill_max: self.kill_max,
+        }
+    }
+}
+
+struct Rng(u64);
+
+impl Rng {
+    const fn new(seed: u64) -> Self {
+        Self(seed)
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        let mut x = self.0;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.0 = x;
+        x
+    }
+}
