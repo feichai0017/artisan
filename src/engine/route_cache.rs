@@ -37,6 +37,7 @@ pub(crate) struct RouteHit {
 
 #[derive(Debug, Clone)]
 struct RouteEntry {
+    root_version: u64,
     child_guid: BlobGuid,
     child_depth: usize,
 }
@@ -51,7 +52,6 @@ struct RouteEntries {
 /// A tiny associative cache for top-level path routes.
 #[derive(Debug)]
 pub(crate) struct RouteCache {
-    root_version: AtomicU64,
     entries: RwLock<RouteEntries>,
     replace_cursor: AtomicUsize,
     hits: AtomicU64,
@@ -71,7 +71,6 @@ impl RouteCache {
     #[must_use]
     pub(crate) fn new() -> Self {
         Self {
-            root_version: AtomicU64::new(u64::MAX),
             entries: RwLock::new(RouteEntries {
                 map: HashMap::with_capacity(ROUTE_CACHE_CAPACITY),
                 order: Vec::with_capacity(ROUTE_CACHE_CAPACITY),
@@ -103,30 +102,50 @@ impl RouteCache {
     /// root blob version the caller is currently holding stable.
     #[must_use]
     pub(crate) fn lookup(&self, key: SearchKey<'_>, root_version: u64) -> Option<RouteHit> {
-        if self.root_version.load(Ordering::Acquire) != root_version {
-            self.misses.fetch_add(1, Ordering::Relaxed);
-            return None;
-        }
-        let entries = self.entries.read().unwrap();
+        let mut stale_prefix = None;
+        {
+            let entries = self.entries.read().unwrap();
 
-        // Try only prefix lengths that have been observed in learned
-        // routes. Large metadata trees typically settle on a small
-        // number of crossing depths; checking every possible byte
-        // length would turn a cache hit into dozens of failed hash
-        // probes on each update.
-        for &len in &entries.lengths {
-            if let Some(prefix) = key.user_prefix(len) {
-                if let Some(entry) = entries.map.get(prefix) {
-                    self.hits.fetch_add(1, Ordering::Relaxed);
-                    return Some(RouteHit {
-                        child_guid: entry.child_guid,
-                        child_depth: entry.child_depth,
-                    });
+            // Try only prefix lengths that have been observed in learned
+            // routes. Large metadata trees typically settle on a small
+            // number of crossing depths; checking every possible byte
+            // length would turn a cache hit into dozens of failed hash
+            // probes on each update.
+            for &len in &entries.lengths {
+                if let Some(prefix) = key.user_prefix(len) {
+                    if let Some(entry) = entries.map.get(prefix) {
+                        if entry.root_version == root_version {
+                            self.hits.fetch_add(1, Ordering::Relaxed);
+                            return Some(RouteHit {
+                                child_guid: entry.child_guid,
+                                child_depth: entry.child_depth,
+                            });
+                        }
+                        stale_prefix = Some(prefix.to_vec());
+                        break;
+                    }
                 }
             }
         }
+        if let Some(prefix) = stale_prefix {
+            self.remove_stale_prefix(&prefix, root_version);
+        }
         self.misses.fetch_add(1, Ordering::Relaxed);
         None
+    }
+
+    fn remove_stale_prefix(&self, prefix: &[u8], root_version: u64) {
+        let mut entries = self.entries.write().unwrap();
+        let Some(entry) = entries.map.get(prefix) else {
+            return;
+        };
+        if entry.root_version == root_version {
+            return;
+        }
+        entries.map.remove(prefix);
+        entries.order.retain(|known| known.as_slice() != prefix);
+        rebuild_prefix_lengths(&mut entries);
+        self.invalidations.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Learn a root crossing just observed under a stable root read
@@ -148,28 +167,24 @@ impl RouteCache {
         }
 
         let mut entries = self.entries.write().unwrap();
-        if self.root_version.load(Ordering::Relaxed) != root_version {
-            if !entries.map.is_empty() {
-                self.invalidations
-                    .fetch_add(entries.map.len() as u64, Ordering::Relaxed);
-            }
-            entries.map.clear();
-            entries.order.clear();
-            entries.lengths.clear();
-            self.replace_cursor.store(0, Ordering::Relaxed);
-            self.root_version.store(root_version, Ordering::Release);
-        }
         if let Some(entry) = entries.map.get_mut(prefix) {
+            entry.root_version = root_version;
             entry.child_guid = child_guid;
             entry.child_depth = child_depth;
             self.learns.fetch_add(1, Ordering::Relaxed);
             return;
         }
+        if has_dominating_prefix(&entries, prefix, root_version, child_guid) {
+            self.learns.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
 
         let entry = RouteEntry {
+            root_version,
             child_guid,
             child_depth,
         };
+        prune_dominated_prefixes(&mut entries, prefix, root_version, child_guid);
         remember_prefix_len(&mut entries.lengths, prefix.len());
         self.learns.fetch_add(1, Ordering::Relaxed);
         if entries.map.len() < ROUTE_CACHE_CAPACITY {
@@ -184,6 +199,59 @@ impl RouteCache {
         entries.map.insert(new_prefix, entry);
         self.evictions.fetch_add(1, Ordering::Relaxed);
     }
+}
+
+fn has_dominating_prefix(
+    entries: &RouteEntries,
+    prefix: &[u8],
+    root_version: u64,
+    child_guid: BlobGuid,
+) -> bool {
+    for &len in &entries.lengths {
+        if len >= prefix.len() {
+            continue;
+        }
+        if let Some(entry) = entries.map.get(&prefix[..len]) {
+            if entry.root_version == root_version && entry.child_guid == child_guid {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn prune_dominated_prefixes(
+    entries: &mut RouteEntries,
+    prefix: &[u8],
+    root_version: u64,
+    child_guid: BlobGuid,
+) {
+    let mut removed = false;
+    entries.order.retain(|known| {
+        let dominated = known.len() > prefix.len()
+            && known.starts_with(prefix)
+            && entries.map.get(known.as_slice()).is_some_and(|entry| {
+                entry.root_version == root_version && entry.child_guid == child_guid
+            });
+        if dominated {
+            entries.map.remove(known.as_slice());
+            removed = true;
+            false
+        } else {
+            true
+        }
+    });
+    if removed {
+        rebuild_prefix_lengths(entries);
+    }
+}
+
+fn rebuild_prefix_lengths(entries: &mut RouteEntries) {
+    entries.lengths.clear();
+    let mut lens: Vec<_> = entries.map.keys().map(Vec::len).collect();
+    lens.sort_unstable_by(|a, b| b.cmp(a));
+    lens.dedup();
+    entries.lengths = lens;
 }
 
 fn remember_prefix_len(lengths: &mut Vec<usize>, len: usize) {
@@ -223,7 +291,7 @@ mod tests {
     }
 
     #[test]
-    fn new_root_version_drops_old_routes() {
+    fn new_root_version_invalidates_only_stale_route() {
         let cache = RouteCache::new();
         cache.learn(SearchKey::user(b"bucket-01/path/file"), 3, CHILD, 15);
         cache.learn(SearchKey::user(b"bucket-02/path/file"), 4, [9; 16], 15);
@@ -235,6 +303,9 @@ mod tests {
             .lookup(SearchKey::user(b"bucket-02/path/other"), 4)
             .unwrap();
         assert_eq!(hit.child_guid, [9; 16]);
+        let stats = cache.stats();
+        assert_eq!(stats.entries, 1);
+        assert_eq!(stats.invalidations, 1);
     }
 
     #[test]
@@ -243,6 +314,36 @@ mod tests {
         cache.learn(SearchKey::user(b"abc"), 1, CHILD, 4);
 
         assert!(cache.lookup(SearchKey::user(b"abc"), 1).is_none());
+    }
+
+    #[test]
+    fn shorter_route_dominates_same_child_longer_route() {
+        let cache = RouteCache::new();
+        cache.learn(SearchKey::user(b"bucket-00/path/file"), 1, CHILD, 10);
+        cache.learn(SearchKey::user(b"bucket-00/path/deeper/file"), 1, CHILD, 15);
+
+        let stats = cache.stats();
+        assert_eq!(stats.entries, 1);
+        let hit = cache
+            .lookup(SearchKey::user(b"bucket-00/path/deeper/other"), 1)
+            .unwrap();
+        assert_eq!(hit.child_guid, CHILD);
+        assert_eq!(hit.child_depth, 10);
+    }
+
+    #[test]
+    fn shorter_route_prunes_same_child_longer_route() {
+        let cache = RouteCache::new();
+        cache.learn(SearchKey::user(b"bucket-00/path/deeper/file"), 1, CHILD, 15);
+        cache.learn(SearchKey::user(b"bucket-00/path/file"), 1, CHILD, 10);
+
+        let stats = cache.stats();
+        assert_eq!(stats.entries, 1);
+        let hit = cache
+            .lookup(SearchKey::user(b"bucket-00/path/deeper/other"), 1)
+            .unwrap();
+        assert_eq!(hit.child_guid, CHILD);
+        assert_eq!(hit.child_depth, 10);
     }
 
     #[test]
@@ -274,13 +375,15 @@ mod tests {
     }
 
     #[test]
-    fn stats_count_root_version_invalidations() {
+    fn stats_count_stale_route_invalidations() {
         let cache = RouteCache::new();
         cache.learn(SearchKey::user(b"bucket-00/path/file"), 1, CHILD, 15);
-        cache.learn(SearchKey::user(b"bucket-01/path/file"), 2, [8; 16], 15);
+        assert!(cache
+            .lookup(SearchKey::user(b"bucket-00/path/other"), 2)
+            .is_none());
 
         let stats = cache.stats();
-        assert_eq!(stats.entries, 1);
+        assert_eq!(stats.entries, 0);
         assert_eq!(stats.invalidations, 1);
     }
 }
