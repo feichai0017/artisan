@@ -7,11 +7,11 @@
 //! snapshots bytes. This preserves the W2D boundary without
 //! serialising writers against each other.
 
-use super::maintenance_gate::{MaintenanceGate, MaintenanceReadGuard, MaintenanceWriteGuard};
+use super::gate::{Gate, GateReadGuard, GateWriteGuard};
 
 #[derive(Debug)]
 pub(crate) struct CommitGate {
-    gate: MaintenanceGate,
+    gate: Gate,
 }
 
 impl Default for CommitGate {
@@ -23,9 +23,7 @@ impl Default for CommitGate {
 impl CommitGate {
     #[must_use]
     pub(crate) const fn new() -> Self {
-        Self {
-            gate: MaintenanceGate::new(),
-        }
+        Self { gate: Gate::new() }
     }
 
     /// Admit one foreground writer into the publish section.
@@ -52,12 +50,12 @@ impl CommitGate {
 
 #[derive(Debug)]
 pub(crate) struct CommitWriteGuard<'a> {
-    _inner: MaintenanceReadGuard<'a>,
+    _inner: GateReadGuard<'a>,
 }
 
 #[derive(Debug)]
 pub(crate) struct CommitCheckpointGuard<'a> {
-    _inner: MaintenanceWriteGuard<'a>,
+    _inner: GateWriteGuard<'a>,
 }
 
 #[cfg(test)]

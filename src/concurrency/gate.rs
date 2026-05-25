@@ -1,8 +1,10 @@
-//! Lightweight tree-wide maintenance gate.
+//! Shared/exclusive admission gate.
 //!
-//! This is deliberately smaller than `std::sync::RwLock`: foreground
-//! operations only need to block structural maintenance, not each
-//! other. Shared entry is one atomic CAS in the uncontended case.
+//! This is deliberately smaller than `std::sync::RwLock`: callers
+//! only need admission control, not protected data access. Shared
+//! entry is one atomic CAS in the uncontended case; exclusive entry
+//! sets a pending bit before waiting for shared entrants to drain so
+//! new shared entrants cannot starve it.
 
 use std::hint::spin_loop;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -10,27 +12,18 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 const WRITE_BIT: usize = 1usize << (usize::BITS - 1);
 const COUNT_MASK: usize = WRITE_BIT - 1;
 
-/// Tree-wide gate separating foreground traversal from structural
-/// maintenance.
-///
-/// Foreground `get` / `put` / `delete` / range steps enter shared.
-/// `compact` / merge enter exclusive. Setting the high bit before
-/// waiting for readers to drain prevents writer starvation: once a
-/// maintenance pass is pending, new shared entrants spin until it
-/// completes.
 #[derive(Debug)]
-pub(crate) struct MaintenanceGate {
+pub(crate) struct Gate {
     state: AtomicUsize,
 }
 
-impl Default for MaintenanceGate {
+impl Default for Gate {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl MaintenanceGate {
-    /// Create an idle gate.
+impl Gate {
     #[must_use]
     pub(crate) const fn new() -> Self {
         Self {
@@ -38,8 +31,7 @@ impl MaintenanceGate {
         }
     }
 
-    /// Enter the foreground/shared side.
-    pub(crate) fn enter_shared(&self) -> MaintenanceReadGuard<'_> {
+    pub(crate) fn enter_shared(&self) -> GateReadGuard<'_> {
         loop {
             let cur = self.state.load(Ordering::Acquire);
             if cur & WRITE_BIT != 0 || cur & COUNT_MASK == COUNT_MASK {
@@ -51,13 +43,12 @@ impl MaintenanceGate {
                 .compare_exchange_weak(cur, cur + 1, Ordering::Acquire, Ordering::Relaxed)
                 .is_ok()
             {
-                return MaintenanceReadGuard { gate: self };
+                return GateReadGuard { gate: self };
             }
         }
     }
 
-    /// Enter the maintenance/exclusive side.
-    pub(crate) fn enter_exclusive(&self) -> MaintenanceWriteGuard<'_> {
+    pub(crate) fn enter_exclusive(&self) -> GateWriteGuard<'_> {
         loop {
             let cur = self.state.load(Ordering::Acquire);
             if cur & WRITE_BIT != 0 {
@@ -72,7 +63,7 @@ impl MaintenanceGate {
                 while self.state.load(Ordering::Acquire) & COUNT_MASK != 0 {
                     spin_loop();
                 }
-                return MaintenanceWriteGuard { gate: self };
+                return GateWriteGuard { gate: self };
             }
         }
     }
@@ -91,25 +82,23 @@ impl MaintenanceGate {
     }
 }
 
-/// RAII guard for shared foreground traversal.
 #[derive(Debug)]
-pub(crate) struct MaintenanceReadGuard<'a> {
-    gate: &'a MaintenanceGate,
+pub(crate) struct GateReadGuard<'a> {
+    gate: &'a Gate,
 }
 
-impl Drop for MaintenanceReadGuard<'_> {
+impl Drop for GateReadGuard<'_> {
     fn drop(&mut self) {
         self.gate.leave_shared();
     }
 }
 
-/// RAII guard for exclusive structural maintenance.
 #[derive(Debug)]
-pub(crate) struct MaintenanceWriteGuard<'a> {
-    gate: &'a MaintenanceGate,
+pub(crate) struct GateWriteGuard<'a> {
+    gate: &'a Gate,
 }
 
-impl Drop for MaintenanceWriteGuard<'_> {
+impl Drop for GateWriteGuard<'_> {
     fn drop(&mut self) {
         self.gate.leave_exclusive();
     }
@@ -125,7 +114,7 @@ mod tests {
 
     #[test]
     fn exclusive_waits_for_shared_guard() {
-        let gate = Arc::new(MaintenanceGate::new());
+        let gate = Arc::new(Gate::new());
         let shared = gate.enter_shared();
         let worker_gate = Arc::clone(&gate);
         let (started_tx, started_rx) = sync_channel(0);
@@ -145,7 +134,7 @@ mod tests {
 
     #[test]
     fn pending_exclusive_blocks_new_shared_entries() {
-        let gate = Arc::new(MaintenanceGate::new());
+        let gate = Arc::new(Gate::new());
         let shared = gate.enter_shared();
 
         let exclusive_gate = Arc::clone(&gate);

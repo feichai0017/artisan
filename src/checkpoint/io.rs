@@ -261,7 +261,7 @@ fn reports_with_error(
 mod tests {
     use super::*;
     use crate::checkpoint::CheckpointConfig;
-    use crate::concurrency::{CommitGate, MaintenanceGate};
+    use crate::concurrency::{CommitGate, Gate};
     use crate::store::blob_store::{AlignedBlobBuf, BlobStore, MemoryBlobStore};
     use crate::store::BufferManager;
     use crossbeam_channel::bounded;
@@ -339,7 +339,7 @@ mod tests {
             bm: Arc::new(BufferManager::new(store, 8)),
             journal: None,
             commit_gate: Arc::new(CommitGate::new()),
-            maintenance_gate: Arc::new(MaintenanceGate::new()),
+            maintenance_gate: Arc::new(Gate::new()),
             cfg: CheckpointConfig::default(),
             io_tx,
             checkpoint_stop: AtomicBool::new(false),

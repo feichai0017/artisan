@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use super::atomic::{Record, RecordVersion};
 use super::errors::{Error, Result};
-use crate::concurrency::MaintenanceGate;
+use crate::concurrency::Gate;
 use crate::engine::{self, KeyRangeBuilder, RangeBuilder};
 use crate::layout::BlobGuid;
 use crate::store::{BufferManager, CachedBlob};
@@ -23,7 +23,7 @@ pub struct View {
     store: Arc<BufferManager>,
     root_guid: BlobGuid,
     root_pin: Arc<CachedBlob>,
-    maintenance_gate: Arc<MaintenanceGate>,
+    maintenance_gate: Arc<Gate>,
 }
 
 impl View {
@@ -38,7 +38,7 @@ impl View {
             store,
             root_guid,
             root_pin,
-            maintenance_gate: Arc::new(MaintenanceGate::new()),
+            maintenance_gate: Arc::new(Gate::new()),
         }
     }
 

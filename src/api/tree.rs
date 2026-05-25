@@ -20,7 +20,7 @@ use super::errors::{Error, Result};
 use super::stats::OpenStats;
 use super::stats::{BlobStats, CheckpointerStats, JournalStats, RouteCacheStats, TreeStats};
 use super::view::View;
-use crate::concurrency::{CommitGate, EndpointLocks, MaintenanceGate};
+use crate::concurrency::{CommitGate, EndpointLocks, Gate};
 use crate::engine;
 use crate::engine::{KeyRangeBuilder, KeyRangeEntry, RangeBuilder};
 use crate::journal::codec::{
@@ -154,7 +154,7 @@ pub struct Tree {
     /// around folding a child blob back into its parent and queuing
     /// the child for delete. Point reads and single-key writes rely
     /// on parent/child blob latches instead of this tree-wide gate.
-    maintenance_gate: Arc<MaintenanceGate>,
+    maintenance_gate: Arc<Gate>,
     /// Monotonically-increasing sequence stamped on every record.
     /// On open the tree replays the WAL and resumes at
     /// `highest_seq + 1`.
@@ -370,7 +370,7 @@ impl Tree {
 
         // Shared structural gate for foreground writers, manual
         // compact, and the background merge pass.
-        let maintenance_gate = Arc::new(MaintenanceGate::new());
+        let maintenance_gate = Arc::new(Gate::new());
         let commit_gate = Arc::new(CommitGate::new());
 
         // Spawn the background checkpointer if opted-in.

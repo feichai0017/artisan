@@ -82,7 +82,7 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use crate::concurrency::{CommitGate, MaintenanceGate};
+use crate::concurrency::{CommitGate, Gate};
 use crate::journal::group_commit::Journal;
 use crate::store::BufferManager;
 
@@ -181,7 +181,7 @@ pub(super) struct Shared {
     /// the exclusive side so it cannot fold/delete a child blob
     /// while a foreground writer is lock-coupling through that
     /// edge.
-    pub(super) maintenance_gate: Arc<MaintenanceGate>,
+    pub(super) maintenance_gate: Arc<Gate>,
     pub(super) cfg: CheckpointConfig,
 
     /// Submit side of the bounded I/O queue. Cloned by the planner
@@ -227,7 +227,7 @@ impl Checkpointer {
     pub(crate) fn spawn(
         bm: Arc<BufferManager>,
         journal: Option<Arc<Journal>>,
-        maintenance_gate: Arc<MaintenanceGate>,
+        maintenance_gate: Arc<Gate>,
         commit_gate: Arc<CommitGate>,
         cfg: CheckpointConfig,
     ) -> Option<Self> {
@@ -451,8 +451,8 @@ mod tests {
         Arc::new(BufferManager::new(Arc::new(MemoryBlobStore::new()), 8))
     }
 
-    fn maintenance_gate() -> Arc<MaintenanceGate> {
-        Arc::new(MaintenanceGate::new())
+    fn maintenance_gate() -> Arc<Gate> {
+        Arc::new(Gate::new())
     }
 
     fn commit_gate() -> Arc<CommitGate> {

@@ -26,7 +26,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::api::atomic::RecordVersion;
 use crate::api::errors::{Error, Result};
-use crate::concurrency::MaintenanceGate;
+use crate::concurrency::Gate;
 use crate::layout::{BlobGuid, BlobNode, Leaf, NodeType, BLOB_MAX_INLINE, PREFIX_MAX_INLINE};
 use crate::store::{BlobFrameRef, BufferManager, CachedBlob};
 
@@ -293,7 +293,7 @@ pub struct RangeBuilder {
     bm: Arc<BufferManager>,
     root_pin: Arc<CachedBlob>,
     root_guid: BlobGuid,
-    maintenance_gate: Arc<MaintenanceGate>,
+    maintenance_gate: Arc<Gate>,
     prefix: KeyBuf,
     start_after: Option<KeyBuf>,
     delimiter: Option<u8>,
@@ -308,7 +308,7 @@ impl RangeBuilder {
         bm: Arc<BufferManager>,
         root_pin: Arc<CachedBlob>,
         root_guid: BlobGuid,
-        maintenance_gate: Arc<MaintenanceGate>,
+        maintenance_gate: Arc<Gate>,
     ) -> Self {
         Self {
             bm,
@@ -572,7 +572,7 @@ pub struct RangeIter {
     bm: Arc<BufferManager>,
     root_pin: Arc<CachedBlob>,
     root_guid: BlobGuid,
-    maintenance_gate: Arc<MaintenanceGate>,
+    maintenance_gate: Arc<Gate>,
     /// Descent stack. Empty = no init done (if `!initialized`) or
     /// exhausted (if `terminated`).
     stack: Vec<Frame>,
