@@ -77,8 +77,9 @@
 //! | `holt_journal_appends_total`             | counter | `JournalStats::appends`                |
 //! | `holt_journal_batches_total`             | counter | `JournalStats::batches`                |
 //! | `holt_journal_syncs_total`               | counter | `JournalStats::syncs`                  |
-//! | `holt_journal_wal_work`                  | gauge   | `JournalStats::wal_work`               |
-//! | `holt_journal_durable_work`              | gauge   | `JournalStats::durable_work`           |
+//! | `holt_journal_queued_work`               | gauge   | `JournalStats::queued_work`            |
+//! | `holt_journal_written_work`              | gauge   | `JournalStats::written_work`           |
+//! | `holt_journal_flushed_work`              | gauge   | `JournalStats::flushed_work`           |
 //! | `holt_journal_checkpointed_work`         | gauge   | `JournalStats::checkpointed_work`      |
 //! | `holt_journal_pending_work`              | gauge   | `JournalStats::pending_work`           |
 //! | `holt_journal_checkpoint_debt`           | gauge   | `JournalStats::checkpoint_debt`        |
@@ -451,17 +452,24 @@ pub fn render_prometheus(stats: &TreeStats) -> String {
         );
         metric(
             &mut out,
-            "holt_journal_wal_work",
-            "Highest WAL work id published by append paths.",
+            "holt_journal_queued_work",
+            "Highest WAL work id accepted by foreground append paths.",
             "gauge",
-            journal.wal_work,
+            journal.queued_work,
         );
         metric(
             &mut out,
-            "holt_journal_durable_work",
+            "holt_journal_written_work",
+            "Highest WAL work id written by the journal worker.",
+            "gauge",
+            journal.written_work,
+        );
+        metric(
+            &mut out,
+            "holt_journal_flushed_work",
             "Highest WAL work id known durable.",
             "gauge",
-            journal.durable_work,
+            journal.flushed_work,
         );
         metric(
             &mut out,
@@ -638,8 +646,9 @@ mod tests {
                 appends: 20,
                 batches: 5,
                 syncs: 4,
-                wal_work: 30,
-                durable_work: 28,
+                queued_work: 30,
+                written_work: 29,
+                flushed_work: 28,
                 checkpointed_work: 24,
                 pending_work: 2,
                 checkpoint_debt: 6,
@@ -716,8 +725,9 @@ mod tests {
         assert!(out.contains("holt_journal_appends_total 20\n"));
         assert!(out.contains("holt_journal_batches_total 5\n"));
         assert!(out.contains("holt_journal_syncs_total 4\n"));
-        assert!(out.contains("holt_journal_wal_work 30\n"));
-        assert!(out.contains("holt_journal_durable_work 28\n"));
+        assert!(out.contains("holt_journal_queued_work 30\n"));
+        assert!(out.contains("holt_journal_written_work 29\n"));
+        assert!(out.contains("holt_journal_flushed_work 28\n"));
         assert!(out.contains("holt_journal_checkpointed_work 24\n"));
         assert!(out.contains("holt_journal_pending_work 2\n"));
         assert!(out.contains("holt_journal_checkpoint_debt 6\n"));

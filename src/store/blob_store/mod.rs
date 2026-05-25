@@ -45,11 +45,10 @@ use crate::layout::BlobGuid;
 /// # Contract
 /// - `read_blob` / `write_blob` always operate on a full
 ///   `PAGE_SIZE`-byte frame. Partial I/O is not supported.
-/// - `write_blob` is **atomic at the blob level**: either the entire
-///   new image is visible to subsequent reads, or the old image is.
-///   No torn writes (`FileBlobStore` achieves this via O_DIRECT
-///   page-aligned writes on NVMe — physically atomic for ≤ 4 KB,
-///   logically atomic for 512 KB via journal coordination).
+/// - `write_blob` replaces the full frame visible to later
+///   `read_blob` calls after it returns. The trait does not require
+///   power-loss atomicity for a 512 KB frame; Holt's WAL/checkpoint
+///   protocol is the recovery source of truth.
 /// - `flush` blocks until **every** write that returned before the
 ///   call is durable on the underlying medium.
 pub trait BlobStore: Send + Sync {

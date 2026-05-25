@@ -220,7 +220,7 @@ pub(super) fn run_round(shared: &Arc<Shared>, pipeline: &mut Pipeline) -> Result
         let _commit = shared.commit_gate.enter_checkpoint();
         let snap = shared.bm.snapshot_dirty();
         let pending = shared.bm.snapshot_pending_deletes();
-        let wal_up_to = journal.wal_work();
+        let wal_up_to = journal.queued_work();
         let versioned_snap = match shared.bm.snapshot_dirty_versions(&snap) {
             Ok(versioned) => versioned,
             Err(e) => {

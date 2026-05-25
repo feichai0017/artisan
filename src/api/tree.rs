@@ -137,11 +137,11 @@ pub struct Tree {
     /// the root hop. Cross-blob descents still pin children
     /// through the BM as normal.
     root_pin: Arc<CachedBlob>,
-    /// Serialises multi-key operations whose endpoint shards overlap.
-    /// The multi-step `lookup_multi_with(src)` + `erase_multi(src)` +
-    /// `insert_multi(dst)` must not interleave with another rename
-    /// touching either endpoint. Disjoint endpoint pairs can run
-    /// concurrently and still coordinate through per-blob latches.
+    /// Serializes writes that touch the same logical endpoint shard.
+    ///
+    /// Single-key writes lock one shard; rename locks the source and
+    /// destination shards in canonical order. Disjoint endpoints stay
+    /// concurrent and still coordinate through per-blob latches.
     endpoint_locks: Arc<EndpointLocks>,
     /// Parent-validated route cache for path-shaped large trees.
     /// Entries cache prefix anchors at BlobNode crossings and are
@@ -1618,7 +1618,7 @@ impl Tree {
             let _commit = self.commit_gate.enter_checkpoint();
             let snap_dirty = self.store.snapshot_dirty();
             let snap_pending = self.store.snapshot_pending_deletes();
-            let wal_up_to = journal.wal_work();
+            let wal_up_to = journal.queued_work();
             (snap_dirty, snap_pending, Some(wal_up_to))
         } else {
             let snap_dirty = self.store.snapshot_dirty();
@@ -1810,8 +1810,9 @@ impl Tree {
                 appends: s.appends,
                 batches: s.batches,
                 syncs: s.syncs,
-                wal_work: s.wal_work,
-                durable_work: s.durable_work,
+                queued_work: s.queued_work,
+                written_work: s.written_work,
+                flushed_work: s.flushed_work,
                 checkpointed_work: s.checkpointed_work,
                 pending_work: s.pending_work,
                 checkpoint_debt: s.checkpoint_debt,

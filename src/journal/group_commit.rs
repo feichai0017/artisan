@@ -58,7 +58,8 @@ struct WorkerState<'a> {
     record_pool: &'a Mutex<Vec<Vec<u8>>>,
     batches: &'a AtomicU64,
     syncs: &'a AtomicU64,
-    durable_work: &'a AtomicU64,
+    written_work: &'a AtomicU64,
+    flushed_work: &'a AtomicU64,
 }
 
 /// Completion handle for one acknowledged journal append.
@@ -91,15 +92,16 @@ pub(crate) struct Journal {
     syncs: Arc<AtomicU64>,
     record_pool: Arc<Mutex<Vec<Vec<u8>>>>,
     next_work: Arc<AtomicU64>,
-    wal_work: Arc<AtomicU64>,
-    durable_work: Arc<AtomicU64>,
+    queued_work: Arc<AtomicU64>,
+    written_work: Arc<AtomicU64>,
+    flushed_work: Arc<AtomicU64>,
     checkpointed_work: Arc<AtomicU64>,
 }
 
 impl Journal {
     pub(crate) fn open_or_create(path: &std::path::Path, tree_id: u64) -> Result<Self> {
         let writer = WalWriter::open_or_create(path, tree_id)?;
-        let initial_wal_work = u64::from(writer.has_records());
+        let initial_queued_work = u64::from(writer.has_records());
         let writer = Arc::new(Mutex::new(writer));
         let (tx, rx) = bounded::<JournalCommand>(JOURNAL_QUEUE_DEPTH);
         let batches = Arc::new(AtomicU64::new(0));
@@ -108,17 +110,19 @@ impl Journal {
         // they were fsync-durable in the previous process. The
         // first checkpoint after reopen must issue a WAL flush
         // before it makes replayed effects durable in the store.
-        let initial_durable_work = if initial_wal_work == 0 {
+        let initial_flushed_work = if initial_queued_work == 0 {
             0
         } else {
-            initial_wal_work - 1
+            initial_queued_work - 1
         };
         let record_pool = Arc::new(Mutex::new(Vec::new()));
-        let durable_work = Arc::new(AtomicU64::new(initial_durable_work));
+        let written_work = Arc::new(AtomicU64::new(initial_queued_work));
+        let flushed_work = Arc::new(AtomicU64::new(initial_flushed_work));
         let worker_batches = Arc::clone(&batches);
         let worker_syncs = Arc::clone(&syncs);
         let worker_record_pool = Arc::clone(&record_pool);
-        let worker_durable_work = Arc::clone(&durable_work);
+        let worker_written_work = Arc::clone(&written_work);
+        let worker_flushed_work = Arc::clone(&flushed_work);
         let worker_writer = Arc::clone(&writer);
         let handle = thread::Builder::new()
             .name("holt-journal".to_owned())
@@ -129,7 +133,8 @@ impl Journal {
                     worker_batches,
                     worker_syncs,
                     worker_record_pool,
-                    worker_durable_work,
+                    worker_written_work,
+                    worker_flushed_work,
                 );
             })
             .map_err(|_| Error::Internal("OS rejected thread spawn for holt-journal"))?;
@@ -140,9 +145,10 @@ impl Journal {
             batches,
             syncs,
             record_pool,
-            next_work: Arc::new(AtomicU64::new(initial_wal_work)),
-            wal_work: Arc::new(AtomicU64::new(initial_wal_work)),
-            durable_work,
+            next_work: Arc::new(AtomicU64::new(initial_queued_work)),
+            queued_work: Arc::new(AtomicU64::new(initial_queued_work)),
+            written_work,
+            flushed_work,
             checkpointed_work: Arc::new(AtomicU64::new(0)),
         })
     }
@@ -165,7 +171,7 @@ impl Journal {
             })
             .map_err(|_| Error::Internal("journal worker stopped before append"))?;
         self.appends.fetch_add(1, Ordering::Relaxed);
-        self.wal_work.fetch_max(seq, Ordering::Release);
+        self.queued_work.fetch_max(seq, Ordering::Release);
         Ok(rx.map(|rx| JournalAck { rx }))
     }
 
@@ -184,14 +190,14 @@ impl Journal {
         Vec::with_capacity(min_capacity)
     }
 
-    /// Highest WAL work id published by append paths.
-    pub(crate) fn wal_work(&self) -> u64 {
-        self.wal_work.load(Ordering::Acquire)
+    /// Highest WAL work id accepted by foreground append paths.
+    pub(crate) fn queued_work(&self) -> u64 {
+        self.queued_work.load(Ordering::Acquire)
     }
 
     /// Force all WAL records up to `observed` durable.
     pub(crate) fn flush_up_to(&self, observed: u64) -> Result<()> {
-        if observed <= self.durable_work.load(Ordering::Acquire) {
+        if observed <= self.flushed_work.load(Ordering::Acquire) {
             return Ok(());
         }
         let (ack, rx) = bounded(1);
@@ -206,7 +212,7 @@ impl Journal {
 
     /// Reset the WAL to a fresh header-only file after checkpoint.
     pub(crate) fn truncate(&self) -> Result<()> {
-        let observed = self.wal_work.load(Ordering::Acquire);
+        let observed = self.queued_work.load(Ordering::Acquire);
         if observed == self.checkpointed_work.load(Ordering::Acquire) {
             return Ok(());
         }
@@ -220,27 +226,29 @@ impl Journal {
     }
 
     pub(crate) fn needs_checkpoint(&self) -> bool {
-        self.wal_work.load(Ordering::Acquire) != self.checkpointed_work.load(Ordering::Acquire)
+        self.queued_work.load(Ordering::Acquire) != self.checkpointed_work.load(Ordering::Acquire)
     }
 
     #[cfg(test)]
     fn needs_flush(&self) -> bool {
-        self.wal_work.load(Ordering::Acquire) > self.durable_work.load(Ordering::Acquire)
+        self.queued_work.load(Ordering::Acquire) > self.flushed_work.load(Ordering::Acquire)
     }
 
     pub(crate) fn stats(&self) -> JournalStats {
-        let wal_work = self.wal_work.load(Ordering::Acquire);
-        let durable_work = self.durable_work.load(Ordering::Acquire);
+        let queued_work = self.queued_work.load(Ordering::Acquire);
+        let written_work = self.written_work.load(Ordering::Acquire);
+        let flushed_work = self.flushed_work.load(Ordering::Acquire);
         let checkpointed_work = self.checkpointed_work.load(Ordering::Acquire);
         JournalStats {
             appends: self.appends.load(Ordering::Relaxed),
             batches: self.batches.load(Ordering::Relaxed),
             syncs: self.syncs.load(Ordering::Relaxed),
-            wal_work,
-            durable_work,
+            queued_work,
+            written_work,
+            flushed_work,
             checkpointed_work,
-            pending_work: wal_work.saturating_sub(durable_work),
-            checkpoint_debt: wal_work.saturating_sub(checkpointed_work),
+            pending_work: queued_work.saturating_sub(flushed_work),
+            checkpoint_debt: queued_work.saturating_sub(checkpointed_work),
         }
     }
 }
@@ -260,8 +268,9 @@ pub(crate) struct JournalStats {
     pub(crate) appends: u64,
     pub(crate) batches: u64,
     pub(crate) syncs: u64,
-    pub(crate) wal_work: u64,
-    pub(crate) durable_work: u64,
+    pub(crate) queued_work: u64,
+    pub(crate) written_work: u64,
+    pub(crate) flushed_work: u64,
     pub(crate) checkpointed_work: u64,
     pub(crate) pending_work: u64,
     pub(crate) checkpoint_debt: u64,
@@ -277,7 +286,8 @@ fn run_worker(
     batches: Arc<AtomicU64>,
     syncs: Arc<AtomicU64>,
     record_pool: Arc<Mutex<Vec<Vec<u8>>>>,
-    durable_work: Arc<AtomicU64>,
+    written_work: Arc<AtomicU64>,
+    flushed_work: Arc<AtomicU64>,
 ) {
     let mut backlog = VecDeque::new();
     let mut append_batch = Vec::with_capacity(256);
@@ -286,7 +296,8 @@ fn run_worker(
         record_pool: &record_pool,
         batches: &batches,
         syncs: &syncs,
-        durable_work: &durable_work,
+        written_work: &written_work,
+        flushed_work: &flushed_work,
     };
 
     loop {
@@ -325,7 +336,7 @@ fn run_worker(
                     .and_then(|mut writer| writer.flush());
                 if res.is_ok() {
                     syncs.fetch_add(1, Ordering::Relaxed);
-                    durable_work.fetch_max(up_to, Ordering::AcqRel);
+                    flushed_work.fetch_max(up_to, Ordering::AcqRel);
                 }
                 let _ = ack.send(res);
             }
@@ -414,15 +425,20 @@ fn write_append_batch(
         .writer
         .lock()
         .map_err(|_| Error::Internal("journal writer mutex poisoned"))?;
+    let mut written_seq = 0;
     for req in batch {
         writer.append_encoded(&req.bytes)?;
+        written_seq = written_seq.max(req.seq);
+    }
+    if written_seq != 0 {
+        state.written_work.fetch_max(written_seq, Ordering::AcqRel);
     }
 
     if needs_sync {
         writer.flush()?;
         state.syncs.fetch_add(1, Ordering::Relaxed);
         let durable_seq = batch.iter().map(|req| req.seq).max().unwrap_or(0);
-        state.durable_work.fetch_max(durable_seq, Ordering::AcqRel);
+        state.flushed_work.fetch_max(durable_seq, Ordering::AcqRel);
     }
     Ok(())
 }
@@ -467,7 +483,7 @@ mod tests {
         let journal = Journal::open_or_create(&dir.path().join("journal.wal"), 0).unwrap();
 
         assert!(!journal.needs_checkpoint());
-        journal.flush_up_to(journal.wal_work()).unwrap();
+        journal.flush_up_to(journal.queued_work()).unwrap();
         journal.truncate().unwrap();
 
         let stats = journal.stats();
@@ -484,7 +500,7 @@ mod tests {
 
         journal.submit(vec![1, 2, 3, 4], false).unwrap();
         assert!(journal.needs_checkpoint());
-        journal.flush_up_to(journal.wal_work()).unwrap();
+        journal.flush_up_to(journal.queued_work()).unwrap();
         assert!(std::fs::metadata(&path).unwrap().len() > FILE_HEADER_SIZE as u64);
 
         journal.truncate().unwrap();
@@ -495,7 +511,7 @@ mod tests {
         );
 
         let syncs_after_truncate = journal.stats().syncs;
-        journal.flush_up_to(journal.wal_work()).unwrap();
+        journal.flush_up_to(journal.queued_work()).unwrap();
         journal.truncate().unwrap();
         assert_eq!(journal.stats().syncs, syncs_after_truncate);
     }
@@ -514,7 +530,7 @@ mod tests {
         assert!(journal.needs_checkpoint());
         assert!(!journal.needs_flush());
         let syncs_after_append = journal.stats().syncs;
-        journal.flush_up_to(journal.wal_work()).unwrap();
+        journal.flush_up_to(journal.queued_work()).unwrap();
         assert_eq!(journal.stats().syncs, syncs_after_append);
 
         journal.truncate().unwrap();
@@ -530,7 +546,7 @@ mod tests {
         let ack = journal.submit(vec![1, 3, 5, 7], false).unwrap();
         assert!(ack.is_none());
 
-        journal.flush_up_to(journal.wal_work()).unwrap();
+        journal.flush_up_to(journal.queued_work()).unwrap();
         assert!(std::fs::metadata(&path).unwrap().len() > FILE_HEADER_SIZE as u64);
         assert!(!journal.needs_flush());
         assert_eq!(journal.stats().syncs, 1);
@@ -549,7 +565,7 @@ mod tests {
         record.extend_from_slice(&[1; 32]);
 
         journal.submit(record, false).unwrap();
-        journal.flush_up_to(journal.wal_work()).unwrap();
+        journal.flush_up_to(journal.queued_work()).unwrap();
 
         let reused = journal.record_buffer(16);
         assert!(reused.capacity() >= capacity);
@@ -562,14 +578,14 @@ mod tests {
         {
             let journal = Journal::open_or_create(&path, 0).unwrap();
             journal.submit(vec![9, 8, 7, 6], false).unwrap();
-            journal.flush_up_to(journal.wal_work()).unwrap();
+            journal.flush_up_to(journal.queued_work()).unwrap();
             assert!(journal.needs_checkpoint());
         }
 
         let journal = Journal::open_or_create(&path, 0).unwrap();
         assert!(journal.needs_checkpoint());
         assert!(journal.needs_flush());
-        journal.flush_up_to(journal.wal_work()).unwrap();
+        journal.flush_up_to(journal.queued_work()).unwrap();
         assert!(!journal.needs_flush());
         journal.truncate().unwrap();
         assert!(!journal.needs_checkpoint());

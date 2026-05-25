@@ -256,11 +256,13 @@ pub struct JournalStats {
     /// Number of `sync_data` calls issued by WAL flush paths,
     /// including explicit checkpoint barriers.
     pub syncs: u64,
-    /// Highest WAL work id published by append paths.
-    pub wal_work: u64,
+    /// Highest WAL work id accepted by foreground append paths.
+    pub queued_work: u64,
+    /// Highest WAL work id written by the journal worker.
+    pub written_work: u64,
     /// Highest WAL work id known to have passed the WAL durability
     /// boundary.
-    pub durable_work: u64,
+    pub flushed_work: u64,
     /// Highest WAL work id made redundant by a completed checkpoint
     /// truncate.
     pub checkpointed_work: u64,
