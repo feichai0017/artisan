@@ -123,6 +123,8 @@
 mod admission;
 mod cached_blob;
 mod mutation;
+mod residency;
+mod telemetry;
 
 use std::collections::{hash_map::Entry, HashMap};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -140,6 +142,8 @@ pub use cached_blob::{BlobWriteGuard, CachedBlob};
 use mutation::{
     bookkeeping_shard_idx, pop_candidate_batch, CandidateKind, MutationState, BOOKKEEPING_SHARDS,
 };
+use residency::RouteResidency;
+use telemetry::Telemetry;
 
 /// Sentinel seq for dirty / pending-delete entries that originate
 /// from purely structural mutations (compact, merge pass) — they
@@ -191,7 +195,6 @@ pub struct BufferManager {
     store: Arc<dyn BlobStore>,
     alloc_uninit: Arc<dyn Fn() -> AlignedBlobBuf + Send + Sync>,
     capacity: usize,
-    route_resident_budget: usize,
     /// Sharded blob cache. `DashMap` shards by `BlobGuid` so
     /// concurrent `pin` / `get_cached` on different blobs hit
     /// different shards — no single global mutex on the hot read
@@ -205,10 +208,8 @@ pub struct BufferManager {
     /// cannot pollute the point-read admission policy.
     admission: TinyLFU,
     /// Small protected tier for route-anchor blobs learned from
-    /// the route cache. Dirty and pending-delete state still lives
-    /// in `mutation`; this tier only prevents ordinary clean-cache
-    /// pressure from evicting the top of a large path-shaped tree.
-    route_resident: DashMap<BlobGuid, u64>,
+    /// the route cache.
+    route_resident: RouteResidency,
     /// Per-blob mutation bookkeeping, sharded by `BlobGuid`.
     ///
     /// Each shard owns the dirty, flushing, and pending-delete
@@ -236,43 +237,9 @@ pub struct BufferManager {
     /// Uses `Relaxed` ordering throughout — strict happens-before
     /// isn't required, only "more recent stamps look more recent".
     clock: AtomicU64,
-    /// Telemetry counters — incremented on the hot path, read by
-    /// [`crate::Tree::stats`] for observability. All `Relaxed`;
-    /// they're approximate metrics, not synchronisation aids.
-    cache_hits: AtomicU64,
-    cache_misses: AtomicU64,
-    optimistic_restarts: AtomicU64,
-    range_restarts: AtomicU64,
-    walker_ops: AtomicU64,
-    walker_blob_hops: AtomicU64,
-    max_blob_hops: AtomicU64,
-    max_cross_blob_depth: AtomicU64,
-    spillover_count: AtomicU64,
-    merge_count: AtomicU64,
-    route_resident_demotions: AtomicU64,
-    cache_evictions: AtomicU64,
-    eviction_skips_protected: AtomicU64,
-    eviction_skips_route_resident: AtomicU64,
-    admission_protects: AtomicU64,
-}
-
-fn route_resident_budget(capacity: usize) -> usize {
-    if capacity < 4 {
-        0
-    } else {
-        (capacity / 4).min(4096)
-    }
-}
-
-#[inline]
-fn fetch_max_relaxed(atom: &AtomicU64, value: u64) {
-    let mut cur = atom.load(Ordering::Relaxed);
-    while value > cur {
-        match atom.compare_exchange_weak(cur, value, Ordering::Relaxed, Ordering::Relaxed) {
-            Ok(_) => break,
-            Err(actual) => cur = actual,
-        }
-    }
+    /// Hot-path observability counters. These are approximate
+    /// metrics, not synchronization aids.
+    telemetry: Telemetry,
 }
 
 impl BufferManager {
@@ -307,10 +274,9 @@ impl BufferManager {
             store,
             alloc_uninit: Arc::new(alloc_uninit),
             capacity,
-            route_resident_budget: route_resident_budget(capacity),
             cache: DashMap::new(),
             admission: TinyLFU::new(),
-            route_resident: DashMap::new(),
+            route_resident: RouteResidency::new(capacity),
             mutation: std::array::from_fn(|_| Mutex::new(MutationState::default())),
             pending_delete_total: AtomicUsize::new(0),
             compact_candidate_cursor: AtomicUsize::new(0),
@@ -318,21 +284,7 @@ impl BufferManager {
             compact_candidate_total: AtomicUsize::new(0),
             merge_candidate_total: AtomicUsize::new(0),
             clock: AtomicU64::new(1),
-            cache_hits: AtomicU64::new(0),
-            cache_misses: AtomicU64::new(0),
-            optimistic_restarts: AtomicU64::new(0),
-            range_restarts: AtomicU64::new(0),
-            walker_ops: AtomicU64::new(0),
-            walker_blob_hops: AtomicU64::new(0),
-            max_blob_hops: AtomicU64::new(0),
-            max_cross_blob_depth: AtomicU64::new(0),
-            spillover_count: AtomicU64::new(0),
-            merge_count: AtomicU64::new(0),
-            route_resident_demotions: AtomicU64::new(0),
-            cache_evictions: AtomicU64::new(0),
-            eviction_skips_protected: AtomicU64::new(0),
-            eviction_skips_route_resident: AtomicU64::new(0),
-            admission_protects: AtomicU64::new(0),
+            telemetry: Telemetry::default(),
         }
     }
 
@@ -360,64 +312,34 @@ impl BufferManager {
     }
 
     pub(crate) fn route_resident_demotions(&self) -> u64 {
-        self.route_resident_demotions.load(Ordering::Relaxed)
+        self.telemetry.route_resident_demotions()
     }
 
     pub(crate) fn cache_evictions(&self) -> u64 {
-        self.cache_evictions.load(Ordering::Relaxed)
+        self.telemetry.cache_evictions()
     }
 
     pub(crate) fn eviction_skips_protected(&self) -> u64 {
-        self.eviction_skips_protected.load(Ordering::Relaxed)
+        self.telemetry.eviction_skips_protected()
     }
 
     pub(crate) fn eviction_skips_route_resident(&self) -> u64 {
-        self.eviction_skips_route_resident.load(Ordering::Relaxed)
+        self.telemetry.eviction_skips_route_resident()
     }
 
     pub(crate) fn admission_protects(&self) -> u64 {
-        self.admission_protects.load(Ordering::Relaxed)
+        self.telemetry.admission_protects()
     }
 
     pub(crate) fn mark_route_resident(&self, guid: BlobGuid) {
-        if self.route_resident_budget == 0 {
-            return;
-        }
         let tick = self.clock.fetch_add(1, Ordering::Relaxed);
-        if let Some(mut entry) = self.route_resident.get_mut(&guid) {
-            *entry = tick;
-            return;
+        for _ in 0..self.route_resident.mark(guid, tick) {
+            self.telemetry.note_route_resident_demotion();
         }
-        self.route_resident.insert(guid, tick);
-        while self.route_resident.len() > self.route_resident_budget {
-            if !self.demote_oldest_route_resident() {
-                break;
-            }
-        }
-    }
-
-    fn demote_oldest_route_resident(&self) -> bool {
-        let mut victim: Option<(BlobGuid, u64)> = None;
-        for kv in &self.route_resident {
-            let guid = *kv.key();
-            let tick = *kv.value();
-            match victim {
-                None => victim = Some((guid, tick)),
-                Some((_, vmin)) if tick < vmin => victim = Some((guid, tick)),
-                _ => {}
-            }
-        }
-        if let Some((guid, _)) = victim {
-            self.route_resident.remove(&guid);
-            self.route_resident_demotions
-                .fetch_add(1, Ordering::Relaxed);
-            return true;
-        }
-        false
     }
 
     fn is_route_resident(&self, guid: BlobGuid) -> bool {
-        self.route_resident.contains_key(&guid)
+        self.route_resident.contains(guid)
     }
 
     /// Iterate cached `(guid, entry)` pairs under a brief BM-state
@@ -449,15 +371,13 @@ impl BufferManager {
     /// Returns `true` if an entry was actually evicted.
     pub(crate) fn try_evict_cold(&self, guid: BlobGuid) -> bool {
         if self.is_route_resident(guid) {
-            self.eviction_skips_route_resident
-                .fetch_add(1, Ordering::Relaxed);
+            self.telemetry.note_eviction_skip_route_resident();
             return false;
         }
         {
             let state = self.mutation_shard(guid).lock().unwrap();
             if state.is_protected_or_pending(&guid) {
-                self.eviction_skips_protected
-                    .fetch_add(1, Ordering::Relaxed);
+                self.telemetry.note_eviction_skip_protected();
                 return false;
             }
         }
@@ -469,8 +389,7 @@ impl BufferManager {
             .cache
             .remove_if(&guid, |_, entry| {
                 if self.is_route_resident(guid) {
-                    self.eviction_skips_route_resident
-                        .fetch_add(1, Ordering::Relaxed);
+                    self.telemetry.note_eviction_skip_route_resident();
                     return false;
                 }
                 if Arc::strong_count(entry) > 1 {
@@ -479,14 +398,13 @@ impl BufferManager {
                 let state = self.mutation_shard(guid).lock().unwrap();
                 let removable = !state.is_protected_or_pending(&guid);
                 if !removable {
-                    self.eviction_skips_protected
-                        .fetch_add(1, Ordering::Relaxed);
+                    self.telemetry.note_eviction_skip_protected();
                 }
                 removable
             })
             .is_some();
         if removed {
-            self.cache_evictions.fetch_add(1, Ordering::Relaxed);
+            self.telemetry.note_cache_eviction();
         }
         removed
     }
@@ -503,14 +421,14 @@ impl BufferManager {
     /// reads are observability-only.
     #[must_use]
     pub fn cache_hits(&self) -> u64 {
-        self.cache_hits.load(Ordering::Relaxed)
+        self.telemetry.cache_hits()
     }
 
     /// Cumulative cache lookup misses — every miss is followed by
     /// an `inner_store.read_blob` and an `insert_into_cache`.
     #[must_use]
     pub fn cache_misses(&self) -> u64 {
-        self.cache_misses.load(Ordering::Relaxed)
+        self.telemetry.cache_misses()
     }
 
     /// Cumulative optimistic-read restarts. Bumped by the lookup
@@ -519,13 +437,13 @@ impl BufferManager {
     /// and the walk has to restart from the root.
     #[must_use]
     pub fn optimistic_restarts(&self) -> u64 {
-        self.optimistic_restarts.load(Ordering::Relaxed)
+        self.telemetry.optimistic_restarts()
     }
 
     /// Bump the optimistic-restart counter. Called from the
     /// lookup walker on `validate()` failure.
     pub(crate) fn note_optimistic_restart(&self) {
-        self.optimistic_restarts.fetch_add(1, Ordering::Relaxed);
+        self.telemetry.note_optimistic_restart();
     }
 
     /// Cumulative range-iterator cursor restarts. Bumped when a
@@ -534,11 +452,11 @@ impl BufferManager {
     /// lower bound.
     #[must_use]
     pub fn range_restarts(&self) -> u64 {
-        self.range_restarts.load(Ordering::Relaxed)
+        self.telemetry.range_restarts()
     }
 
     pub(crate) fn note_range_restart(&self) {
-        self.range_restarts.fetch_add(1, Ordering::Relaxed);
+        self.telemetry.note_range_restart();
     }
 
     /// Cumulative mutation walker calls (`insert_multi` /
@@ -546,20 +464,20 @@ impl BufferManager {
     /// inner walker invocation, not one count per public API call.
     #[must_use]
     pub fn walker_ops(&self) -> u64 {
-        self.walker_ops.load(Ordering::Relaxed)
+        self.telemetry.walker_ops()
     }
 
     /// Total blob hops across mutation walkers. Divide by
     /// [`Self::walker_ops`] to derive average blob-hop count.
     #[must_use]
     pub fn walker_blob_hops(&self) -> u64 {
-        self.walker_blob_hops.load(Ordering::Relaxed)
+        self.telemetry.walker_blob_hops()
     }
 
     /// Maximum blob hops observed for a single mutation walker call.
     #[must_use]
     pub fn max_blob_hops(&self) -> u64 {
-        self.max_blob_hops.load(Ordering::Relaxed)
+        self.telemetry.max_blob_hops()
     }
 
     /// Largest key-depth at which a mutation walker entered a blob.
@@ -567,40 +485,36 @@ impl BufferManager {
     /// per-node ART-depth trace.
     #[must_use]
     pub fn max_cross_blob_depth(&self) -> u64 {
-        self.max_cross_blob_depth.load(Ordering::Relaxed)
+        self.telemetry.max_cross_blob_depth()
     }
 
     /// Number of successful foreground spillover events.
     #[must_use]
     pub fn spillover_count(&self) -> u64 {
-        self.spillover_count.load(Ordering::Relaxed)
+        self.telemetry.spillover_count()
     }
 
     /// Number of `BlobNode` children folded back into parents by
     /// manual compact or background merge passes.
     #[must_use]
     pub fn merge_count(&self) -> u64 {
-        self.merge_count.load(Ordering::Relaxed)
+        self.telemetry.merge_count()
     }
 
     /// Record one completed mutation walker traversal.
     pub(crate) fn note_walker_blob_hops(&self, hops: u64, max_cross_blob_depth: usize) {
-        self.walker_ops.fetch_add(1, Ordering::Relaxed);
-        self.walker_blob_hops.fetch_add(hops, Ordering::Relaxed);
-        fetch_max_relaxed(&self.max_blob_hops, hops);
-        fetch_max_relaxed(&self.max_cross_blob_depth, max_cross_blob_depth as u64);
+        self.telemetry
+            .note_walker_blob_hops(hops, max_cross_blob_depth);
     }
 
     /// Record one successful spillover.
     pub(crate) fn note_spillover(&self) {
-        self.spillover_count.fetch_add(1, Ordering::Relaxed);
+        self.telemetry.note_spillover();
     }
 
     /// Record child-blob merge events.
     pub(crate) fn note_merges(&self, merged: u64) {
-        if merged != 0 {
-            self.merge_count.fetch_add(merged, Ordering::Relaxed);
-        }
+        self.telemetry.note_merges(merged);
     }
 
     /// Internal: look up `guid` in the cache under a declared
@@ -614,7 +528,7 @@ impl BufferManager {
     fn get_cached_with_access(&self, guid: BlobGuid, access: PinAccess) -> Option<Arc<CachedBlob>> {
         let Some(entry) = self.cache.get(&guid) else {
             if !matches!(access, PinAccess::Silent) {
-                self.cache_misses.fetch_add(1, Ordering::Relaxed);
+                self.telemetry.note_cache_miss();
             }
             if matches!(access, PinAccess::Point) {
                 self.admission.record(guid);
@@ -628,10 +542,10 @@ impl BufferManager {
                 self.admission.record(guid);
                 let tick = self.clock.fetch_add(1, Ordering::Relaxed);
                 arc.last_touched.store(tick, Ordering::Relaxed);
-                self.cache_hits.fetch_add(1, Ordering::Relaxed);
+                self.telemetry.note_cache_hit();
             }
             PinAccess::Scan => {
-                self.cache_hits.fetch_add(1, Ordering::Relaxed);
+                self.telemetry.note_cache_hit();
             }
             PinAccess::Silent => {}
         }
@@ -792,13 +706,11 @@ impl BufferManager {
             }
             let guid = *kv.key();
             if protected_snap.contains(&guid) {
-                self.eviction_skips_protected
-                    .fetch_add(1, Ordering::Relaxed);
+                self.telemetry.note_eviction_skip_protected();
                 continue;
             }
             if self.is_route_resident(guid) {
-                self.eviction_skips_route_resident
-                    .fetch_add(1, Ordering::Relaxed);
+                self.telemetry.note_eviction_skip_route_resident();
                 continue;
             }
             let tick = kv.value().last_touched.load(Ordering::Relaxed);
@@ -822,7 +734,7 @@ impl BufferManager {
             (candidate, victim)
         {
             if victim_guid != candidate_guid && victim_freq > candidate_freq {
-                self.admission_protects.fetch_add(1, Ordering::Relaxed);
+                self.telemetry.note_admission_protect();
                 return false;
             }
         }
@@ -835,8 +747,7 @@ impl BufferManager {
                 .cache
                 .remove_if(&guid, |_, e| {
                     if self.is_route_resident(guid) {
-                        self.eviction_skips_route_resident
-                            .fetch_add(1, Ordering::Relaxed);
+                        self.telemetry.note_eviction_skip_route_resident();
                         return false;
                     }
                     if Arc::strong_count(e) > 1 {
@@ -845,14 +756,13 @@ impl BufferManager {
                     let state = self.mutation_shard(guid).lock().unwrap();
                     let removable = !state.is_protected_or_pending(&guid);
                     if !removable {
-                        self.eviction_skips_protected
-                            .fetch_add(1, Ordering::Relaxed);
+                        self.telemetry.note_eviction_skip_protected();
                     }
                     removable
                 })
                 .is_some();
             if removed {
-                self.cache_evictions.fetch_add(1, Ordering::Relaxed);
+                self.telemetry.note_cache_eviction();
             }
             return removed;
         }
@@ -868,7 +778,7 @@ impl BufferManager {
         if let Some((_, entry)) = self.cache.remove(&guid) {
             entry.clear_dirty_hint();
         }
-        self.route_resident.remove(&guid);
+        self.route_resident.remove(guid);
         let mut state = self.mutation_shard(guid).lock().unwrap();
         state.remove_dirty(&guid);
         let removed = state.remove_maintenance_candidates(&guid);
