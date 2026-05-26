@@ -16,6 +16,7 @@ use super::config::TreeConfig;
 use super::errors::Result;
 use super::stats::OpenStats;
 use super::tree::{ensure_root_blob, replay_wal, Tree, TreeRuntime};
+use super::view::View;
 use crate::concurrency::{CommitGate, Gate};
 use crate::journal::codec::BatchEncoder;
 use crate::journal::group_commit::Journal;
@@ -118,19 +119,7 @@ impl DB {
     pub fn open_tree(&self, name: &str) -> Result<Tree> {
         let tree_id = tree_id_for_name(name.as_bytes());
         let open = self.open_tree_state(tree_id)?;
-        Tree::from_shared(
-            self.cfg.clone(),
-            open.root_guid,
-            tree_id,
-            Arc::clone(&self.store),
-            open.runtime,
-            Arc::clone(&self.maintenance_gate),
-            Arc::clone(&self.next_seq),
-            Arc::clone(&self.commit_gate),
-            self.journal.clone(),
-            self.checkpointer.clone(),
-            self.open_stats,
-        )
+        self.tree_from_state(tree_id, open)
     }
 
     /// Apply mutations across named trees under one WAL record.
@@ -151,6 +140,35 @@ impl DB {
         self.apply_atomic(batch.pending)
     }
 
+    /// Run a read-only transaction over explicit tree/prefix scopes.
+    ///
+    /// Holt captures every listed scope under one DB-wide
+    /// maintenance gate, releases the live DB, then invokes `read`
+    /// with an immutable [`DBView`]. Writes committed after the
+    /// capture are invisible to every captured tree view.
+    ///
+    /// Scopes are explicit to keep the semantic boundary honest:
+    /// `DB` has no catalog enumeration yet, so it cannot infer
+    /// "all trees" without depending on which handles happened to
+    /// be opened in this process.
+    pub fn view<F, R>(&self, scopes: &[(&str, &[u8])], read: F) -> Result<R>
+    where
+        F: FnOnce(&DBView) -> Result<R>,
+    {
+        let view = {
+            let _maintenance = self.maintenance_gate.enter_exclusive();
+            let mut trees = HashMap::with_capacity(scopes.len());
+            for (name, prefix) in scopes {
+                let tree_id = tree_id_for_name(name.as_bytes());
+                let open = self.open_tree_state(tree_id)?;
+                let tree = self.tree_from_state(tree_id, open)?;
+                trees.insert(tree_id, tree.capture_view_unlocked(prefix)?);
+            }
+            DBView { trees }
+        };
+        read(&view)
+    }
+
     fn open_tree_state(&self, tree_id: u64) -> Result<OpenTree> {
         let mut trees = self.trees.lock().unwrap();
         if let Some(open) = trees.get(&tree_id) {
@@ -164,6 +182,22 @@ impl DB {
         };
         trees.insert(tree_id, open.clone());
         Ok(open)
+    }
+
+    fn tree_from_state(&self, tree_id: u64, open: OpenTree) -> Result<Tree> {
+        Tree::from_shared(
+            self.cfg.clone(),
+            open.root_guid,
+            tree_id,
+            Arc::clone(&self.store),
+            open.runtime,
+            Arc::clone(&self.maintenance_gate),
+            Arc::clone(&self.next_seq),
+            Arc::clone(&self.commit_gate),
+            self.journal.clone(),
+            self.checkpointer.clone(),
+            self.open_stats,
+        )
     }
 
     fn apply_atomic(&self, pending: Vec<DBBatchOp>) -> Result<bool> {
@@ -249,6 +283,37 @@ impl DB {
             }
         }
         Ok(true)
+    }
+}
+
+/// Immutable read transaction over one or more named tree scopes.
+///
+/// Created by [`DB::view`]. Each captured tree is exposed as a
+/// normal [`View`], so point lookup and range/list APIs stay the
+/// same as single-tree snapshots.
+#[derive(Clone)]
+pub struct DBView {
+    trees: HashMap<u64, View>,
+}
+
+impl DBView {
+    /// Return the captured view for `name`, if the caller listed it
+    /// in [`DB::view`]'s scope array.
+    #[must_use]
+    pub fn tree(&self, name: &str) -> Option<&View> {
+        self.trees.get(&tree_id_for_name(name.as_bytes()))
+    }
+
+    /// Number of captured named tree views.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.trees.len()
+    }
+
+    /// `true` if no tree scopes were captured.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.trees.is_empty()
     }
 }
 

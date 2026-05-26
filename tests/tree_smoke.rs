@@ -112,6 +112,43 @@ fn db_atomic_commits_and_aborts_across_trees() {
     assert!(lock.get(b"should-not-appear").unwrap().is_none());
 }
 
+#[test]
+fn db_view_captures_explicit_tree_scopes() {
+    let db = DB::open(TreeConfig::memory()).unwrap();
+    let objects = db.open_tree("objects").unwrap();
+    let inodes = db.open_tree("inodes").unwrap();
+
+    objects.put(b"tenant-a/file", b"old-object").unwrap();
+    objects.put(b"tenant-b/file", b"outside-scope").unwrap();
+    inodes.put(b"42", b"old-inode").unwrap();
+
+    let scopes: [(&str, &[u8]); 2] = [("objects", b"tenant-a/"), ("inodes", b"")];
+    db.view(&scopes, |view| {
+        objects.put(b"tenant-a/file", b"new-object")?;
+        objects.put(b"tenant-a/new", b"new-object")?;
+        inodes.put(b"42", b"new-inode")?;
+
+        assert_eq!(view.len(), 2);
+        assert!(view.tree("missing").is_none());
+
+        let object_view = view.tree("objects").unwrap();
+        assert_eq!(
+            object_view.get(b"tenant-a/file")?.as_deref(),
+            Some(&b"old-object"[..])
+        );
+        assert!(object_view.get(b"tenant-a/new")?.is_none());
+        assert!(matches!(
+            object_view.get(b"tenant-b/file"),
+            Err(holt::Error::OutsideViewScope { .. })
+        ));
+
+        let inode_view = view.tree("inodes").unwrap();
+        assert_eq!(inode_view.get(b"42")?.as_deref(), Some(&b"old-inode"[..]));
+        Ok(())
+    })
+    .unwrap();
+}
+
 // ----------------------------------------------------------------
 // Put / Get
 // ----------------------------------------------------------------

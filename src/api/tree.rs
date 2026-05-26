@@ -1430,20 +1430,21 @@ impl Tree {
     }
 
     fn capture_view(&self, prefix: &[u8]) -> Result<View> {
-        let scope = prefix.to_vec();
-        let (snapshot_store, blob_count) = {
-            let _maintenance = self.maintenance_gate.enter_exclusive();
-            let topology =
-                engine::collect_prefix_blob_topology_silent(&self.store, self.root_guid, prefix)?;
-            let snapshot_store = Arc::new(MemoryBlobStore::new());
-            for entry in &topology {
-                let bytes = self.store.snapshot_blob_image(entry.guid)?;
-                snapshot_store.write_blob(entry.guid, &bytes)?;
-            }
-            (snapshot_store, topology.len())
-        };
+        let _maintenance = self.maintenance_gate.enter_exclusive();
+        self.capture_view_unlocked(prefix)
+    }
 
-        let snapshot_bm = Arc::new(BufferManager::new(snapshot_store, blob_count.max(1)));
+    pub(crate) fn capture_view_unlocked(&self, prefix: &[u8]) -> Result<View> {
+        let scope = prefix.to_vec();
+        let topology =
+            engine::collect_prefix_blob_topology_silent(&self.store, self.root_guid, prefix)?;
+        let snapshot_store = Arc::new(MemoryBlobStore::new());
+        for entry in &topology {
+            let bytes = self.store.snapshot_blob_image(entry.guid)?;
+            snapshot_store.write_blob(entry.guid, &bytes)?;
+        }
+
+        let snapshot_bm = Arc::new(BufferManager::new(snapshot_store, topology.len().max(1)));
         let root_pin = snapshot_bm.pin(self.root_guid)?;
         Ok(View::new(scope, snapshot_bm, self.root_guid, root_pin))
     }
