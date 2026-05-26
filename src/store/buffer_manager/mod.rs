@@ -166,6 +166,17 @@ pub(crate) struct WriteThroughEntry {
     pub(crate) guid: BlobGuid,
     pub(crate) bytes: AlignedBlobBuf,
     pub(crate) expected_seq: u64,
+    pub(crate) content_version: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WriteThroughStatus {
+    Written,
+    Stale,
+}
+
+pub(crate) struct WriteThroughBatchReport {
+    pub(crate) statuses: Vec<WriteThroughStatus>,
 }
 
 /// Dirty blob claimed by a checkpoint round before byte cloning.
@@ -932,11 +943,7 @@ impl BufferManager {
                     }
                     continue;
                 }
-                state
-                    .flushing
-                    .entry(guid)
-                    .and_modify(|cur| *cur = (*cur).min(seq))
-                    .or_insert(seq);
+                state.add_flushing(guid);
                 out.insert(guid, seq);
             }
         }
@@ -988,12 +995,10 @@ impl BufferManager {
                 if let Some(entry) = cached {
                     entry.clear_dirty_hint();
                 }
-                state.flushing.remove(&guid);
+                state.remove_one_flushing(&guid);
                 continue;
             }
-            if matches!(state.flushing.get(&guid), Some(cur) if *cur == t) {
-                state.flushing.remove(&guid);
-            }
+            state.remove_one_flushing(&guid);
             state
                 .dirty
                 .entry(guid)
@@ -1009,6 +1014,19 @@ impl BufferManager {
         self.mutation
             .iter()
             .map(|shard| shard.lock().unwrap().dirty.len())
+            .sum()
+    }
+
+    /// Number of blobs currently owned by in-flight checkpoint
+    /// epochs. WAL truncation must wait for this to reach zero:
+    /// a drained dirty entry is no longer in `dirty`, but its
+    /// bytes are not guaranteed durable until the epoch retires
+    /// the corresponding flushing reference.
+    #[must_use]
+    pub(crate) fn flushing_count(&self) -> usize {
+        self.mutation
+            .iter()
+            .map(|shard| shard.lock().unwrap().flushing.values().sum::<usize>())
             .sum()
     }
 
@@ -1276,19 +1294,55 @@ impl BufferManager {
     /// entry. On store error the caller must restore the whole
     /// dirty snapshot; we intentionally retire nothing because the
     /// store contract permits an arbitrary written prefix.
-    pub(crate) fn write_through_batch(&self, entries: &[WriteThroughEntry]) -> Result<()> {
+    pub(crate) fn write_through_batch(
+        &self,
+        entries: &[WriteThroughEntry],
+    ) -> Result<WriteThroughBatchReport> {
         if entries.is_empty() {
-            return Ok(());
+            return Ok(WriteThroughBatchReport {
+                statuses: Vec::new(),
+            });
         }
-        let writes: Vec<_> = entries
+        let mut statuses = vec![WriteThroughStatus::Stale; entries.len()];
+        let write_indices: Vec<_> = entries
             .iter()
-            .map(|entry| (entry.guid, &entry.bytes))
+            .enumerate()
+            .filter_map(|(idx, entry)| match self.write_snapshot_is_current(entry) {
+                Ok(true) => Some(Ok(idx)),
+                Ok(false) => None,
+                Err(e) => Some(Err(e)),
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let writes: Vec<_> = write_indices
+            .iter()
+            .map(|idx| (entries[*idx].guid, &entries[*idx].bytes))
             .collect();
-        self.store.write_blobs_with_data_sync(&writes)?;
-        for entry in entries {
-            self.retire_write_through(entry.guid, entry.expected_seq);
+        if !writes.is_empty() {
+            self.store.write_blobs_with_data_sync(&writes)?;
         }
-        Ok(())
+        for idx in write_indices {
+            let entry = &entries[idx];
+            self.retire_write_through(entry.guid, entry.expected_seq);
+            statuses[idx] = WriteThroughStatus::Written;
+        }
+        for (idx, entry) in entries.iter().enumerate() {
+            if statuses[idx] == WriteThroughStatus::Stale {
+                self.retire_write_through(entry.guid, entry.expected_seq);
+            }
+        }
+        Ok(WriteThroughBatchReport { statuses })
+    }
+
+    fn write_snapshot_is_current(&self, entry: &WriteThroughEntry) -> Result<bool> {
+        let Some(version) = entry.content_version else {
+            return Ok(true);
+        };
+        let Some(cached) = self.get_cached_with_access(entry.guid, PinAccess::Silent) else {
+            return Err(Error::Internal(
+                "write_through_batch: flushing entry lost cache image",
+            ));
+        };
+        Ok(cached.validate_content_version(version))
     }
 
     fn retire_write_through(&self, guid: BlobGuid, expected_seq: u64) {
@@ -1304,9 +1358,7 @@ impl BufferManager {
                 }
             }
         }
-        if matches!(state.flushing.get(&guid), Some(seq) if *seq == expected_seq) {
-            state.flushing.remove(&guid);
-        }
+        state.remove_one_flushing(&guid);
         let still_dirty = state.dirty.contains_key(&guid) || state.flushing.contains_key(&guid);
         drop(state);
         if !still_dirty {
@@ -2159,6 +2211,7 @@ mod tests {
             guid,
             bytes,
             expected_seq: 42,
+            content_version: None,
         }])
         .unwrap();
         assert!(
@@ -2196,6 +2249,123 @@ mod tests {
             .unwrap()
             .expect("current version should clone");
         assert_eq!(bytes.as_slice()[123], 0xEE);
+    }
+
+    #[test]
+    fn write_through_rejects_stale_snapshot_bytes() {
+        let inner: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
+        let guid = [0x57; 16];
+        inner.write_blob(guid, &make_buf(0)).unwrap();
+        let bm = BufferManager::new(inner.clone(), 1);
+        let pin = bm.pin(guid).unwrap();
+
+        {
+            let mut guard = pin.write();
+            guard.as_mut_slice()[123] = 0x11;
+        }
+        bm.mark_dirty_cached(guid, 10, pin.as_ref());
+        let snap = bm.snapshot_dirty();
+        let versioned = bm.snapshot_dirty_versions(&snap).unwrap();
+        let stale_version = versioned[0].content_version;
+        let stale_bytes = bm
+            .snapshot_bytes_if_version(guid, stale_version)
+            .unwrap()
+            .expect("snapshot bytes should clone while version still matches");
+
+        {
+            let mut guard = pin.write();
+            guard.as_mut_slice()[123] = 0xEE;
+        }
+        bm.mark_dirty_cached(guid, 20, pin.as_ref());
+
+        let report = bm
+            .write_through_batch(&[WriteThroughEntry {
+                guid,
+                bytes: stale_bytes,
+                expected_seq: 10,
+                content_version: Some(stale_version),
+            }])
+            .unwrap();
+        assert_eq!(report.statuses, vec![WriteThroughStatus::Stale]);
+        assert_eq!(
+            bm.snapshot_dirty()[&guid],
+            20,
+            "newer writer entry must survive stale write-through retirement",
+        );
+
+        let mut stored = AlignedBlobBuf::zeroed();
+        inner.read_blob(guid, &mut stored).unwrap();
+        assert_eq!(
+            stored.as_slice()[123],
+            0,
+            "stale checkpoint bytes must not overwrite the store"
+        );
+    }
+
+    #[test]
+    fn overlapping_checkpoint_epochs_keep_cache_image_protected() {
+        let inner: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
+        let guid = [0x58; 16];
+        inner.write_blob(guid, &make_buf(0)).unwrap();
+        let bm = BufferManager::new(inner, 1);
+        let pin = bm.pin(guid).unwrap();
+
+        {
+            let mut guard = pin.write();
+            guard.as_mut_slice()[123] = 0x11;
+        }
+        bm.mark_dirty_cached(guid, 10, pin.as_ref());
+        let first = bm.snapshot_dirty();
+        assert_eq!(bm.flushing_count(), 1);
+        let first_version = bm.snapshot_dirty_versions(&first).unwrap()[0].content_version;
+        let first_bytes = bm
+            .snapshot_bytes_if_version(guid, first_version)
+            .unwrap()
+            .unwrap();
+
+        {
+            let mut guard = pin.write();
+            guard.as_mut_slice()[123] = 0x22;
+        }
+        bm.mark_dirty_cached(guid, 20, pin.as_ref());
+        let second = bm.snapshot_dirty();
+        assert_eq!(bm.flushing_count(), 2);
+        let second_version = bm.snapshot_dirty_versions(&second).unwrap()[0].content_version;
+        let second_bytes = bm
+            .snapshot_bytes_if_version(guid, second_version)
+            .unwrap()
+            .unwrap();
+        drop(pin);
+
+        let first_report = bm
+            .write_through_batch(&[WriteThroughEntry {
+                guid,
+                bytes: first_bytes,
+                expected_seq: 10,
+                content_version: Some(first_version),
+            }])
+            .unwrap();
+        assert_eq!(first_report.statuses, vec![WriteThroughStatus::Stale]);
+        assert!(
+            !bm.try_evict_cold(guid),
+            "second in-flight epoch must keep the blob cached after first retire",
+        );
+        assert_eq!(bm.flushing_count(), 1);
+
+        let second_report = bm
+            .write_through_batch(&[WriteThroughEntry {
+                guid,
+                bytes: second_bytes,
+                expected_seq: 20,
+                content_version: Some(second_version),
+            }])
+            .unwrap();
+        assert_eq!(second_report.statuses, vec![WriteThroughStatus::Written]);
+        assert!(
+            bm.try_evict_cold(guid),
+            "last in-flight epoch can release eviction protection",
+        );
+        assert_eq!(bm.flushing_count(), 0);
     }
 
     #[test]
@@ -2251,6 +2421,7 @@ mod tests {
             guid: [0xAA; 16],
             bytes: snap_bytes,
             expected_seq: 50,
+            content_version: None,
         }])
         .unwrap();
         assert_eq!(
@@ -2280,6 +2451,7 @@ mod tests {
             guid: [0xA5; 16],
             bytes: snap_bytes,
             expected_seq: STRUCTURAL_SEQ,
+            content_version: None,
         }])
         .unwrap();
         assert_eq!(
@@ -2309,6 +2481,7 @@ mod tests {
             guid: [0xBB; 16],
             bytes: snap_bytes,
             expected_seq: 42,
+            content_version: None,
         }])
         .unwrap();
         assert_eq!(bm.dirty_count(), 0);
@@ -2337,6 +2510,7 @@ mod tests {
                 guid: *guid,
                 bytes: bm.snapshot_bytes(*guid).unwrap(),
                 expected_seq: *expected_seq,
+                content_version: None,
             })
             .collect();
         bm.write_through_batch(&entries).unwrap();
@@ -2371,6 +2545,7 @@ mod tests {
                 guid: *guid,
                 bytes: bm.snapshot_bytes(*guid).unwrap(),
                 expected_seq: *expected_seq,
+                content_version: None,
             })
             .collect();
         bm.write_through_batch(&entries).unwrap();
@@ -2457,6 +2632,7 @@ mod tests {
             guid: new_guid,
             bytes,
             expected_seq: snap[&new_guid],
+            content_version: None,
         }])
         .unwrap();
         bm.flush_inner().unwrap();

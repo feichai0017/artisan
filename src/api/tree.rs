@@ -46,7 +46,7 @@ const SHAPE_OVERFULL_CHILD_FILL_PER_MILLE: u32 = 850;
 
 type BatchOverlay = HashMap<Vec<u8>, Option<Record>>;
 type CheckpointMap = HashMap<BlobGuid, u64>;
-type CheckpointBytes = Vec<(BlobGuid, u64, AlignedBlobBuf)>;
+type CheckpointBytes = Vec<(BlobGuid, u64, u64, AlignedBlobBuf)>;
 
 struct DirtyWriteOutcome {
     wrote_any: bool,
@@ -1440,6 +1440,7 @@ impl Tree {
                     guid,
                     bytes,
                     expected_seq,
+                    content_version: None,
                 });
             } else {
                 failed.insert(guid, expected_seq);
@@ -1599,7 +1600,9 @@ impl Tree {
                 .store
                 .snapshot_bytes_if_version(entry.guid, entry.content_version)?
             {
-                Some(bytes) => snap_bytes.push((entry.guid, entry.expected_seq, bytes)),
+                Some(bytes) => {
+                    snap_bytes.push((entry.guid, entry.expected_seq, entry.content_version, bytes));
+                }
                 None => return Ok(None),
             }
         }
@@ -1614,27 +1617,33 @@ impl Tree {
         Vec<DirtySnapshotEntry>,
         Option<u64>,
     )> {
-        let (snap_dirty, snap_pending, wal_up_to) = if let Some(journal) = &self.journal {
+        if let Some(journal) = &self.journal {
             let _commit = self.commit_gate.enter_checkpoint();
             let snap_dirty = self.store.snapshot_dirty();
             let snap_pending = self.store.snapshot_pending_deletes();
             let wal_up_to = journal.queued_work();
-            (snap_dirty, snap_pending, Some(wal_up_to))
+            match self.store.snapshot_dirty_versions(&snap_dirty) {
+                Ok(versioned_snap) => {
+                    Ok((snap_dirty, snap_pending, versioned_snap, Some(wal_up_to)))
+                }
+                Err(e) => {
+                    self.store.restore_pending_deletes(snap_pending);
+                    self.store.restore_dirty(snap_dirty);
+                    Err(e)
+                }
+            }
         } else {
             let snap_dirty = self.store.snapshot_dirty();
             let snap_pending = self.store.snapshot_pending_deletes();
-            (snap_dirty, snap_pending, None)
-        };
-
-        let versioned_snap = match self.store.snapshot_dirty_versions(&snap_dirty) {
-            Ok(versioned) => versioned,
-            Err(e) => {
-                self.store.restore_pending_deletes(snap_pending);
-                self.store.restore_dirty(snap_dirty);
-                return Err(e);
+            match self.store.snapshot_dirty_versions(&snap_dirty) {
+                Ok(versioned_snap) => Ok((snap_dirty, snap_pending, versioned_snap, None)),
+                Err(e) => {
+                    self.store.restore_pending_deletes(snap_pending);
+                    self.store.restore_dirty(snap_dirty);
+                    Err(e)
+                }
             }
-        };
-        Ok((snap_dirty, snap_pending, versioned_snap, wal_up_to))
+        }
     }
 
     fn finish_checkpoint_snapshot(
@@ -1688,11 +1697,14 @@ impl Tree {
     fn write_checkpoint_bytes(&self, snap_bytes: CheckpointBytes) -> DirtyWriteOutcome {
         let entries: Vec<_> = snap_bytes
             .into_iter()
-            .map(|(guid, expected_seq, bytes)| WriteThroughEntry {
-                guid,
-                bytes,
-                expected_seq,
-            })
+            .map(
+                |(guid, expected_seq, content_version, bytes)| WriteThroughEntry {
+                    guid,
+                    bytes,
+                    expected_seq,
+                    content_version: Some(content_version),
+                },
+            )
             .collect();
         let mut failed = CheckpointMap::new();
         let mut first_err = None;
@@ -1753,7 +1765,10 @@ impl Tree {
         if let Some(journal) = &self.journal {
             if journal.needs_checkpoint() {
                 let _commit = self.commit_gate.enter_checkpoint();
-                if self.store.dirty_count() == 0 && self.store.pending_delete_count() == 0 {
+                if self.store.dirty_count() == 0
+                    && self.store.flushing_count() == 0
+                    && self.store.pending_delete_count() == 0
+                {
                     journal.truncate()?;
                 }
             }

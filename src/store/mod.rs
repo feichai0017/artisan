@@ -16,6 +16,6 @@ mod buffer_manager;
 
 pub use blob_frame::{AllocError, BlobFrame, BlobFrameRef, FreeError};
 pub(crate) use buffer_manager::{
-    BlobWriteGuard, DirtySnapshotEntry, WriteThroughEntry, STRUCTURAL_SEQ,
+    BlobWriteGuard, DirtySnapshotEntry, WriteThroughEntry, WriteThroughStatus, STRUCTURAL_SEQ,
 };
 pub use buffer_manager::{BufferManager, CachedBlob};

@@ -59,7 +59,7 @@ struct PendingEpoch {
     pending: HashMap<BlobGuid, u64>,
 }
 
-type ClonedDirtyBytes = Vec<(BlobGuid, u64, AlignedBlobBuf)>;
+type ClonedDirtyBytes = Vec<(BlobGuid, u64, u64, AlignedBlobBuf)>;
 
 impl Pipeline {
     pub(super) fn new(max_in_flight: usize) -> Self {
@@ -153,7 +153,10 @@ impl Pipeline {
             return Ok(());
         }
         let _commit = shared.commit_gate.enter_checkpoint();
-        if shared.bm.dirty_count() == 0 && shared.bm.pending_delete_count() == 0 {
+        if shared.bm.dirty_count() == 0
+            && shared.bm.flushing_count() == 0
+            && shared.bm.pending_delete_count() == 0
+        {
             journal.truncate()?;
             use std::sync::atomic::Ordering;
             shared.truncates.fetch_add(1, Ordering::Relaxed);
@@ -329,10 +332,11 @@ pub(super) fn run_round(shared: &Arc<Shared>, pipeline: &mut Pipeline) -> Result
     // or future snapshot rounds.
     let entries: Vec<_> = snap_bytes
         .into_iter()
-        .map(|(guid, seq, bytes)| WriteThroughEntry {
+        .map(|(guid, seq, content_version, bytes)| WriteThroughEntry {
             guid,
             bytes,
             expected_seq: seq,
+            content_version: Some(content_version),
         })
         .collect();
     let pending_for_recovery = pending.clone();
@@ -389,7 +393,9 @@ fn clone_versioned_dirty(
             .bm
             .snapshot_bytes_if_version(entry.guid, entry.content_version)?
         {
-            Some(bytes) => snap_bytes.push((entry.guid, entry.expected_seq, bytes)),
+            Some(bytes) => {
+                snap_bytes.push((entry.guid, entry.expected_seq, entry.content_version, bytes));
+            }
             None => {
                 stale.insert(entry.guid, entry.expected_seq);
             }

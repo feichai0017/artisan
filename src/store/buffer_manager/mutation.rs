@@ -10,10 +10,11 @@ pub(super) const BOOKKEEPING_SHARDS: usize = 64;
 pub(super) struct MutationState {
     /// New dirty entries not yet claimed by a checkpoint round.
     pub(super) dirty: HashMap<BlobGuid, u64>,
-    /// Dirty entries drained by a checkpoint round whose cached
-    /// image still has to survive until checkpoint write-through
-    /// completes.
-    pub(super) flushing: HashMap<BlobGuid, u64>,
+    /// Number of checkpoint epochs that still own a cloned or
+    /// clone-pending image of this blob. Multi-epoch checkpoint
+    /// pipelining can have the same blob in more than one in-flight
+    /// epoch, so this is a reference count rather than a single seq.
+    pub(super) flushing: HashMap<BlobGuid, usize>,
     /// Blobs unlinked from the tree but not yet deleted from the
     /// store manifest because WAL/checkpoint ordering still owns
     /// them.
@@ -42,6 +43,19 @@ impl MutationState {
     pub(super) fn remove_dirty(&mut self, guid: &BlobGuid) {
         self.dirty.remove(guid);
         self.flushing.remove(guid);
+    }
+
+    pub(super) fn add_flushing(&mut self, guid: BlobGuid) {
+        *self.flushing.entry(guid).or_insert(0) += 1;
+    }
+
+    pub(super) fn remove_one_flushing(&mut self, guid: &BlobGuid) {
+        if let Some(count) = self.flushing.get_mut(guid) {
+            *count -= 1;
+            if *count == 0 {
+                self.flushing.remove(guid);
+            }
+        }
     }
 
     pub(super) fn remove_maintenance_candidates(&mut self, guid: &BlobGuid) -> (bool, bool) {

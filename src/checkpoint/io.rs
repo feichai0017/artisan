@@ -30,7 +30,7 @@ use std::time::Duration;
 use crate::api::errors::{Error, Result};
 use crate::engine;
 use crate::layout::BlobGuid;
-use crate::store::{BlobFrameRef, WriteThroughEntry};
+use crate::store::{BlobFrameRef, WriteThroughEntry, WriteThroughStatus};
 
 use super::Shared;
 
@@ -298,20 +298,34 @@ fn write_entries_in_dependency_order(
                     .expect("unflushed batch entry owns its write")
             })
             .collect();
-        shared.bm.write_through_batch(&wave_entries)?;
+        let report = shared.bm.write_through_batch(&wave_entries)?;
         shared.bm.flush_inner()?;
 
-        for idx in wave {
+        let mut saw_stale = false;
+        for (idx, status) in wave.into_iter().zip(report.statuses) {
             let entry = &mut entries[idx];
-            entry.flushed = true;
-            dirty_flushed_by_epoch[entry.epoch_idx] += 1;
-            if let Some(count) = remaining_by_guid.get_mut(&entry.guid) {
-                *count -= 1;
-                if *count == 0 {
-                    remaining_by_guid.remove(&entry.guid);
+            match status {
+                WriteThroughStatus::Written => {
+                    entry.flushed = true;
+                    dirty_flushed_by_epoch[entry.epoch_idx] += 1;
+                    if let Some(count) = remaining_by_guid.get_mut(&entry.guid) {
+                        *count -= 1;
+                        if *count == 0 {
+                            remaining_by_guid.remove(&entry.guid);
+                        }
+                    }
+                    durable_this_batch.insert(entry.guid);
+                }
+                WriteThroughStatus::Stale => {
+                    saw_stale = true;
                 }
             }
-            durable_this_batch.insert(entry.guid);
+        }
+        if saw_stale {
+            return Ok(BatchWriteReport {
+                dirty_flushed_by_epoch,
+                deferred: true,
+            });
         }
     }
 }
@@ -564,6 +578,7 @@ mod tests {
                 guid,
                 bytes: buf,
                 expected_seq: u64::from(byte),
+                content_version: None,
             }],
             pending: HashMap::new(),
         }
@@ -599,6 +614,7 @@ mod tests {
             guid,
             bytes,
             expected_seq: seq,
+            content_version: None,
         }
     }
 
@@ -672,6 +688,53 @@ mod tests {
         assert_eq!(store.write_batches.load(Ordering::Acquire), 1);
         assert_eq!(store.flushes.load(Ordering::Acquire), 1);
         assert_eq!(shared.bm.dirty_count(), 1);
+    }
+
+    #[test]
+    fn stale_dirty_write_defers_pending_deletes() {
+        let store = Arc::new(CountingBatchStore::new());
+        let shared = test_shared(Arc::clone(&store));
+        let parent = [0xD3; 16];
+        let child = [0xD4; 16];
+        let old_parent = parent_blob(parent, child);
+        store.inner.write_blob(parent, &old_parent).unwrap();
+        store
+            .inner
+            .write_blob(child, &child_blob(child, 9))
+            .unwrap();
+
+        let pin = shared.bm.pin(parent).unwrap();
+        let old_version = pin.content_version();
+        {
+            let mut guard = pin.write();
+            guard.as_mut_slice()[100] = 0xEE;
+        }
+        drop(pin);
+
+        let mut pending = HashMap::new();
+        pending.insert(child, 77);
+        let mut epochs = vec![CheckpointEpoch {
+            entries: vec![WriteThroughEntry {
+                guid: parent,
+                bytes: old_parent,
+                expected_seq: 77,
+                content_version: Some(old_version),
+            }],
+            pending,
+        }];
+
+        let reports = commit_epoch_batch(&shared, &mut epochs);
+
+        assert_eq!(reports.len(), 1);
+        assert!(reports[0].result.is_ok());
+        assert_eq!(reports[0].dirty_flushed, 0);
+        assert_eq!(reports[0].applied_deletes, 0);
+        assert_eq!(shared.bm.dirty_count(), 1);
+        assert_eq!(shared.bm.pending_delete_count(), 1);
+        assert!(
+            store.inner.has_blob(child).unwrap(),
+            "child delete must wait until parent write is durable"
+        );
     }
 
     #[test]
