@@ -615,30 +615,32 @@ impl DB {
     }
 
     fn group_batch_ops(&self, pending: Vec<DBBatchOp>) -> Result<Vec<DBBatchGroup>> {
-        let mut groups = Vec::<DBBatchGroup>::new();
+        let mut groups: Vec<DBBatchGroup> = Vec::new();
+        let mut group_by_name: HashMap<String, usize> =
+            HashMap::with_capacity(pending.len().min(16));
         for item in pending {
-            self.push_batch_op(&mut groups, item)?;
-        }
-        Ok(groups)
-    }
+            let DBBatchOp { tree_name, op } = item;
+            if let Some(&group_idx) = group_by_name.get(tree_name.as_str()) {
+                groups[group_idx].ops.push(op);
+                continue;
+            }
 
-    fn push_batch_op(&self, groups: &mut Vec<DBBatchGroup>, item: DBBatchOp) -> Result<()> {
-        let name_bytes = validate_tree_name(&item.tree_name)?;
-        let tree_id = self
-            .catalog_lookup_live(name_bytes)?
-            .ok_or_else(|| Error::TreeNotFound {
-                name: item.tree_name.clone(),
-            })?;
-        let open = self.open_tree_state(tree_id)?;
-        match groups.iter_mut().find(|group| group.tree_id == tree_id) {
-            Some(group) => group.ops.push(item.op),
-            None => groups.push(DBBatchGroup {
+            let name_bytes = validate_tree_name(&tree_name)?;
+            let tree_id =
+                self.catalog_lookup_live(name_bytes)?
+                    .ok_or_else(|| Error::TreeNotFound {
+                        name: tree_name.clone(),
+                    })?;
+            let open = self.open_tree_state(tree_id)?;
+            let group_idx = groups.len();
+            group_by_name.insert(tree_name, group_idx);
+            groups.push(DBBatchGroup {
                 tree_id,
                 tree: self.tree_from_state(tree_id, open)?,
-                ops: vec![item.op],
-            }),
+                ops: vec![op],
+            });
         }
-        Ok(())
+        Ok(groups)
     }
 
     fn preflight_batch_groups(groups: &[DBBatchGroup], base_seq: u64) -> Result<bool> {

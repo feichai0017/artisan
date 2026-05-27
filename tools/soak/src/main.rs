@@ -20,7 +20,9 @@ enum Mode {
     Normal,
     DbNormal,
     Crash,
+    DbCrash,
     Child,
+    DbChild,
 }
 
 #[derive(Debug)]
@@ -64,7 +66,9 @@ impl Config {
                         "normal" => Mode::Normal,
                         "db" | "db-normal" => Mode::DbNormal,
                         "crash" => Mode::Crash,
+                        "db-crash" => Mode::DbCrash,
                         "child" | "crash-child" => Mode::Child,
+                        "db-child" | "db-crash-child" => Mode::DbChild,
                         other => return Err(format!("unknown --mode `{other}`").into()),
                     };
                 }
@@ -120,7 +124,9 @@ fn run() -> Result<()> {
         Mode::Normal => run_normal(&cfg),
         Mode::DbNormal => run_db_normal(&cfg),
         Mode::Crash => run_crash_parent(&cfg),
+        Mode::DbCrash => run_db_crash_parent(&cfg),
         Mode::Child => run_crash_child(&cfg),
+        Mode::DbChild => run_db_crash_child(&cfg),
     }
 }
 
@@ -324,6 +330,80 @@ fn run_crash_child(cfg: &Config) -> Result<()> {
     Ok(())
 }
 
+fn run_db_crash_parent(cfg: &Config) -> Result<()> {
+    if !cfg.wal_sync {
+        return Err(
+            "db-crash mode requires --wal-sync true so acked transactions are durable".into(),
+        );
+    }
+    prepare_dir(cfg)?;
+    let ack_path = db_ack_log_path(&cfg.dir);
+    let deadline = Instant::now() + cfg.duration;
+    let exe = env::current_exe()?;
+    let mut rng = Rng::new(cfg.seed ^ 0xD8C4_A5ED_500A_0001);
+    let mut rounds = 0u64;
+
+    while Instant::now() < deadline {
+        let mut child = Command::new(&exe)
+            .arg("--mode")
+            .arg("db-child")
+            .arg("--dir")
+            .arg(&cfg.dir)
+            .arg("--keys")
+            .arg(cfg.keys.to_string())
+            .arg("--ops")
+            .arg(cfg.ops.to_string())
+            .arg("--buffer-pool")
+            .arg(cfg.buffer_pool.to_string())
+            .arg("--wal-sync")
+            .arg("true")
+            .arg("--seed")
+            .arg((cfg.seed ^ rounds).to_string())
+            .spawn()?;
+        let sleep_for = random_duration(&mut rng, cfg.kill_min, cfg.kill_max);
+        thread::sleep(sleep_for);
+        let _ = child.kill();
+        let _ = child.wait();
+        rounds += 1;
+
+        let expected = load_db_ack_log(&ack_path)?;
+        let db = open_db(cfg)?;
+        verify_db_ack_entries(&db, &expected)?;
+        print_db_stats("db-crash-reopen", &db, rounds);
+    }
+    Ok(())
+}
+
+fn run_db_crash_child(cfg: &Config) -> Result<()> {
+    fs::create_dir_all(&cfg.dir)?;
+    let db = open_db(cfg)?;
+    db.open_or_create_tree("objects")?;
+    db.open_or_create_tree("inodes")?;
+    let mut ack = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(db_ack_log_path(&cfg.dir))?;
+    let deadline = Instant::now() + cfg.duration;
+    let mut rng = Rng::new(cfg.seed);
+    let mut done = 0u64;
+
+    while done < cfg.ops as u64 && Instant::now() < deadline {
+        let object_rev = rng.next_u64().max(1);
+        let inode_rev = rng.next_u64().max(1);
+        let key = format!("db-crash/{:016x}/{done:016x}", cfg.seed);
+        let object_value = crash_value(object_rev);
+        let inode_value = crash_value(inode_rev);
+        db.atomic(|batch| {
+            batch.put("objects", key.as_bytes(), &object_value);
+            batch.put("inodes", key.as_bytes(), &inode_value);
+        })?;
+        writeln!(ack, "D {key} {object_rev} {inode_rev}")?;
+        ack.sync_data()?;
+        done += 1;
+    }
+    Ok(())
+}
+
 fn open_tree(cfg: &Config) -> holt::Result<Tree> {
     let mut tree_cfg = TreeConfig::new(&cfg.dir);
     tree_cfg.buffer_pool_size = cfg.buffer_pool;
@@ -425,6 +505,33 @@ fn verify_ack_entries(tree: &Tree, expected: &[(Vec<u8>, u64)]) -> Result<()> {
     Ok(())
 }
 
+fn verify_db_ack_entries(db: &DB, expected: &[(Vec<u8>, u64, u64)]) -> Result<()> {
+    if expected.is_empty() {
+        return Ok(());
+    }
+    let objects = db.open_tree("objects")?;
+    let inodes = db.open_tree("inodes")?;
+    for (key, object_rev, inode_rev) in expected {
+        let object = objects.get(key)?;
+        if object.as_deref() != Some(crash_value(*object_rev).as_slice()) {
+            return Err(format!(
+                "acknowledged DB object key `{}` lost revision {object_rev}",
+                String::from_utf8_lossy(key)
+            )
+            .into());
+        }
+        let inode = inodes.get(key)?;
+        if inode.as_deref() != Some(crash_value(*inode_rev).as_slice()) {
+            return Err(format!(
+                "acknowledged DB inode key `{}` lost revision {inode_rev}",
+                String::from_utf8_lossy(key)
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
 fn scan_small_prefix(tree: &Tree, idx: usize) -> Result<()> {
     let prefix = format!("bucket-{:03}/", idx % 256);
     let mut seen = 0usize;
@@ -485,6 +592,34 @@ fn load_ack_log(path: &Path) -> Result<Vec<(Vec<u8>, u64)>> {
             (Some("P"), Some(key), Some(rev), None) => {
                 let rev = parse_u64(rev)?;
                 expected.push((key.as_bytes().to_vec(), rev));
+            }
+            _ => {
+                break;
+            }
+        }
+    }
+    Ok(expected)
+}
+
+fn load_db_ack_log(path: &Path) -> Result<Vec<(Vec<u8>, u64, u64)>> {
+    let mut expected = Vec::new();
+    let Ok(file) = OpenOptions::new().read(true).open(path) else {
+        return Ok(expected);
+    };
+    for line in BufReader::new(file).lines() {
+        let line = line?;
+        let mut fields = line.split_whitespace();
+        match (
+            fields.next(),
+            fields.next(),
+            fields.next(),
+            fields.next(),
+            fields.next(),
+        ) {
+            (Some("D"), Some(key), Some(object_rev), Some(inode_rev), None) => {
+                let object_rev = parse_u64(object_rev)?;
+                let inode_rev = parse_u64(inode_rev)?;
+                expected.push((key.as_bytes().to_vec(), object_rev, inode_rev));
             }
             _ => {
                 break;
@@ -578,6 +713,10 @@ fn ack_log_path(dir: &Path) -> PathBuf {
     dir.join("soak-ack.log")
 }
 
+fn db_ack_log_path(dir: &Path) -> PathBuf {
+    dir.join("soak-db-ack.log")
+}
+
 fn random_duration(rng: &mut Rng, min: Duration, max: Duration) -> Duration {
     let min_ms = min.as_millis() as u64;
     let max_ms = max.as_millis() as u64;
@@ -615,6 +754,7 @@ fn print_help() {
            --mode normal    multi-thread read/write/list/reopen validation\n\
            --mode db-normal multi-tree DB atomic/view/reopen validation\n\
            --mode crash     parent process repeatedly SIGKILLs child writers\n\
+           --mode db-crash  parent process SIGKILLs cross-tree DB atomic writers\n\
            --mode child     internal crash-test child mode\n\n\
          Common options:\n\
            --dir PATH --duration-secs N --keys N --ops N --threads N\n\

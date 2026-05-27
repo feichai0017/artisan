@@ -9,6 +9,24 @@ fine-grained per-commit history is in `git log`.
 
 ## [Unreleased]
 
+### Added
+
+- Added DB-specific crash soak coverage. The new `holt-soak
+  --mode db-crash` repeatedly kills cross-tree `DB::atomic` writers
+  and verifies that every fsynced acknowledged transaction replays
+  all of its tree mutations after reopen.
+- Added a Verus model for the DB catalog state machine: live trees are
+  the only visible catalog entries, dropped trees stay hidden until
+  finalized, and user tree-id allocation remains monotonic while
+  skipping the reserved catalog id.
+
+### Changed
+
+- Optimized `DB::atomic` batch grouping with a per-batch tree-name
+  resolution cache. Repeated operations for the same named tree now
+  avoid repeated catalog lookups, tree-state opens, and linear group
+  scans before taking the ordered mutation gates.
+
 ## [0.4.0] — 2026-05-25
 
 ### Added

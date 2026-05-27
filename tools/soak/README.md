@@ -14,6 +14,9 @@ the parent workspace.
 - `crash`: parent process repeatedly starts a child writer, kills it
   with `SIGKILL`, reopens the tree, and verifies every operation the
   child acknowledged in `soak-ack.log`.
+- `db-crash`: same kill/reopen protocol as `crash`, but each
+  acknowledged operation is one cross-tree `DB::atomic` transaction
+  recorded in `soak-db-ack.log`.
 - `child`: internal mode used by `crash`.
 
 ## Quick Smoke
@@ -66,6 +69,24 @@ cargo run --manifest-path tools/soak/Cargo.toml --locked -- \
   --kill-max-ms 5000
 ```
 
+The DB crash campaign uses the same rule, but verifies that each
+acknowledged cross-tree atomic transaction replays all of its tree
+mutations:
+
+```sh
+cargo run --manifest-path tools/soak/Cargo.toml --locked -- \
+  --mode db-crash \
+  --dir target/holt-soak-db-crash \
+  --reset \
+  --duration-secs 21600 \
+  --keys 100000 \
+  --ops 1000000 \
+  --buffer-pool 64 \
+  --wal-sync true \
+  --kill-min-ms 100 \
+  --kill-max-ms 5000
+```
+
 The tool emits JSON lines with cache, WAL, checkpoint, route-cache, and
 reopen-replay counters. CI runs only a short `normal` smoke; longer
 normal/crash campaigns belong in nightly or release-gate runs.
@@ -74,8 +95,8 @@ normal/crash campaigns belong in nightly or release-gate runs.
 
 - PR CI: build the harness and run short `normal` and `db-normal`
   smokes so API or stats drift is caught quickly.
-- Nightly: run `normal`, `db-normal`, `crash`, checkpoint failpoints,
-  WAL integration, and a longer fuzz campaign from
+- Nightly: run `normal`, `db-normal`, `crash`, `db-crash`,
+  checkpoint failpoints, WAL integration, and a longer fuzz campaign from
   `.github/workflows/nightly.yml`.
 - Release gate: run `normal` for several hours on the target platform,
   then run `crash` with `wal_sync=true`; keep the JSON output so replay

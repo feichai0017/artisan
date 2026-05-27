@@ -30,4 +30,6 @@ The current model covers:
 - leaf split structure: optional Prefix plus a valid two-child Node4 branch;
 - delimiter rollup bounds for S3-style `CommonPrefix` emission;
 - Holt's virtual `0x00` user-key terminator;
-- the 8-byte leaf extent alignment rule.
+- the 8-byte leaf extent alignment rule;
+- DB catalog create/drop/finalize visibility transitions;
+- DB tree-id allocation monotonicity and reserved catalog-id skipping.

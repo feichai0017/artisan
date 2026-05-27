@@ -139,6 +139,31 @@ jobs:
             --kill-min-ms 50 \
             --kill-max-ms 2000
 
+  soak-db-crash:
+    name: DB crash soak
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: holt-soak db-crash
+        run: |
+          cargo run --manifest-path tools/soak/Cargo.toml --locked -- \
+            --mode db-crash \
+            --dir target/holt-soak-db-crash-nightly \
+            --reset \
+            --duration-secs "$SOAK_SECONDS" \
+            --keys 100000 \
+            --ops 1000000 \
+            --buffer-pool 64 \
+            --wal-sync true \
+            --kill-min-ms 50 \
+            --kill-max-ms 2000
+
   soak-db-normal:
     name: DB normal soak
     runs-on: ubuntu-latest

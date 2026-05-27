@@ -531,4 +531,130 @@ pub proof fn lemma_leaf_extent_is_8_byte_aligned(key_len: nat, value_len: nat)
 {
 }
 
+pub enum CatalogState {
+    Missing,
+    Live,
+    Dropping,
+}
+
+pub open spec fn catalog_tree_id() -> nat {
+    7525352749515538433nat
+}
+
+pub open spec fn valid_user_tree_id(tree_id: nat) -> bool {
+    tree_id > 0 && tree_id != catalog_tree_id()
+}
+
+pub open spec fn db_tree_visible(state: CatalogState) -> bool {
+    match state {
+        CatalogState::Live => true,
+        CatalogState::Missing => false,
+        CatalogState::Dropping => false,
+    }
+}
+
+pub open spec fn can_create_tree(state: CatalogState) -> bool {
+    match state {
+        CatalogState::Missing => true,
+        CatalogState::Live => false,
+        CatalogState::Dropping => false,
+    }
+}
+
+pub open spec fn can_drop_tree(state: CatalogState) -> bool {
+    match state {
+        CatalogState::Live => true,
+        CatalogState::Missing => false,
+        CatalogState::Dropping => false,
+    }
+}
+
+pub open spec fn can_finalize_tree(state: CatalogState) -> bool {
+    match state {
+        CatalogState::Dropping => true,
+        CatalogState::Missing => false,
+        CatalogState::Live => false,
+    }
+}
+
+pub open spec fn create_tree_state(state: CatalogState) -> CatalogState {
+    match state {
+        CatalogState::Missing => CatalogState::Live,
+        CatalogState::Live => state,
+        CatalogState::Dropping => state,
+    }
+}
+
+pub open spec fn drop_tree_state(state: CatalogState) -> CatalogState {
+    match state {
+        CatalogState::Live => CatalogState::Dropping,
+        CatalogState::Missing => state,
+        CatalogState::Dropping => state,
+    }
+}
+
+pub open spec fn finalize_tree_state(state: CatalogState) -> CatalogState {
+    match state {
+        CatalogState::Dropping => CatalogState::Missing,
+        CatalogState::Missing => state,
+        CatalogState::Live => state,
+    }
+}
+
+pub open spec fn next_allocated_tree_id_spec(tree_id: nat) -> nat {
+    if tree_id + 1 == catalog_tree_id() {
+        tree_id + 2
+    } else {
+        tree_id + 1
+    }
+}
+
+pub proof fn lemma_create_makes_tree_visible(state: CatalogState)
+    requires
+        can_create_tree(state),
+    ensures
+        db_tree_visible(create_tree_state(state)),
+{
+}
+
+pub proof fn lemma_drop_hides_tree_from_catalog(state: CatalogState)
+    requires
+        can_drop_tree(state),
+    ensures
+        !db_tree_visible(drop_tree_state(state)),
+        can_finalize_tree(drop_tree_state(state)),
+{
+}
+
+pub proof fn lemma_finalize_keeps_tree_hidden(state: CatalogState)
+    requires
+        can_finalize_tree(state),
+    ensures
+        !db_tree_visible(finalize_tree_state(state)),
+        can_create_tree(finalize_tree_state(state)),
+{
+}
+
+pub proof fn lemma_non_live_states_are_not_visible(state: CatalogState)
+    requires
+        !can_drop_tree(state),
+    ensures
+        !db_tree_visible(state),
+{
+}
+
+pub proof fn lemma_next_tree_id_is_monotonic(tree_id: nat)
+    ensures
+        next_allocated_tree_id_spec(tree_id) > tree_id,
+{
+}
+
+pub proof fn lemma_next_tree_id_skips_catalog_id(tree_id: nat)
+    requires
+        valid_user_tree_id(tree_id),
+    ensures
+        valid_user_tree_id(next_allocated_tree_id_spec(tree_id)),
+{
+}
+
 } // verus!

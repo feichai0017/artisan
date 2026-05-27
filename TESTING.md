@@ -29,6 +29,7 @@ Run on every push and pull request:
 | `soak-normal` | Multi-thread lifecycle soak across async WAL, sync WAL, and constrained buffer-pool cases |
 | `soak-db-normal` | Multi-thread named-tree DB lifecycle soak with cross-tree atomic batches, DB views, checkpoint, and reopen |
 | `soak-crash` | Repeated `SIGKILL` with `wal_sync=true`; every acknowledged write must survive reopen |
+| `soak-db-crash` | Repeated `SIGKILL` with `wal_sync=true`; every acknowledged cross-tree DB atomic transaction must survive replay as a whole |
 | `fuzz-long` | Time-bounded libFuzzer campaigns over the single-tree and multi-tree DB models |
 | `verified-model` | Manual Verus run for ART shape specs when a Verus binary is available |
 
@@ -67,8 +68,8 @@ per-tree `BTreeMap` oracle. The model covers:
 Normal mode checks single-tree multi-threaded mixed operations,
 checkpoint, reopen, and final oracle equality. `db-normal` repeats the
 lifecycle check through named trees, cross-tree atomic batches, and DB
-views. Crash mode checks durability only for writes that Holt
-acknowledged and the child recorded in the fsynced ack log.
+views. Crash modes check durability only for writes or transactions that
+Holt acknowledged and the child recorded in the fsynced ack log.
 
 Recommended release gate:
 
@@ -88,6 +89,12 @@ cargo run --manifest-path tools/soak/Cargo.toml --locked -- \
   --duration-secs 21600 --keys 100000 --ops 2000000 \
   --buffer-pool 64 --wal-sync true \
   --kill-min-ms 50 --kill-max-ms 5000
+
+cargo run --manifest-path tools/soak/Cargo.toml --locked -- \
+  --mode db-crash --dir target/holt-soak-db-crash-release --reset \
+  --duration-secs 21600 --keys 100000 --ops 2000000 \
+  --buffer-pool 64 --wal-sync true \
+  --kill-min-ms 50 --kill-max-ms 5000
 ```
 
 ## Verified Model
@@ -102,6 +109,8 @@ cargo run --manifest-path tools/soak/Cargo.toml --locked -- \
 - delimiter rollup bounds;
 - virtual user-key terminator;
 - leaf extent alignment.
+- DB catalog state transitions for create/drop/finalize visibility;
+- DB tree id allocation monotonicity and reserved catalog-id skipping.
 
 Run it manually:
 
